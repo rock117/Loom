@@ -22,7 +22,7 @@ pub struct WorkspaceView {
     sidebar_width: f32,
     resizing_sidebar: bool,
     show_settings: bool,
-    status_message: Option<String>,
+    status_message: Option<SharedString>,
     restore_profiles: Vec<uuid::Uuid>,
     _subscriptions: Vec<Subscription>,
 }
@@ -44,8 +44,8 @@ impl WorkspaceView {
 
         let tabs = cx.new(|_cx| TabManager::new(font_size));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
-        let tab_bar = cx.new(|_cx| TabBar::new(tabs.clone()));
-        let terminal_pane = cx.new(|_cx| TerminalPane::new(tabs.clone()));
+        let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
+        let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
 
         let mut view = Self {
@@ -192,10 +192,11 @@ impl WorkspaceView {
                         match export_workspace_to(&path, &ws) {
                             Ok(()) => {
                                 this.status_message =
-                                    Some(format!("Exported to {}", path.display()));
+                                    Some(format!("Exported to {}", path.display()).into());
                             }
                             Err(err) => {
-                                this.status_message = Some(format!("Export failed: {err:#}"));
+                                this.status_message =
+                                    Some(format!("Export failed: {err:#}").into());
                             }
                         }
                     }
@@ -232,10 +233,11 @@ impl WorkspaceView {
                                 });
                                 this.show_settings = false;
                                 this.status_message =
-                                    Some(format!("Imported from {}", path.display()));
+                                    Some(format!("Imported from {}", path.display()).into());
                             }
                             Err(err) => {
-                                this.status_message = Some(format!("Import failed: {err:#}"));
+                                this.status_message =
+                                    Some(format!("Import failed: {err:#}").into());
                             }
                         }
                     }

@@ -74,12 +74,14 @@ Passwords and key passphrases are kept in memory only and are never written to d
 
 ```
 src/
-  app.rs              # Application entry
-  model/              # Workspace, profiles, persistence
-  session/            # Local PTY and SSH backends
-  ui/                 # Sidebar, tabs, terminal pane, dialogs
-  shared/             # Theme, actions, paths
+  app.rs                 # Application entry / key bindings
+  model.rs + model/       # Workspace, profiles, persistence
+  session.rs + session/  # Local PTY (SSH stub)
+  shared.rs + shared/    # Theme, actions, paths
+  ui.rs + ui/            # Sidebar, tabs, settings, widgets
 ```
+
+GPUI code follows the skills under `~/.agents/skills` (entities observe, Stateful `.id()` + click handlers, no `mod.rs`, SharedString, explicit error logging).
 
 ## Roadmap
 

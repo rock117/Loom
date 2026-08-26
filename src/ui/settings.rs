@@ -2,6 +2,7 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::shared::theme;
+use crate::ui::widgets::AccentButton;
 use crate::ui::workspace_store::WorkspaceStore;
 
 #[derive(Clone, Debug)]
@@ -17,15 +18,18 @@ pub struct SettingsPanel {
     focus_handle: FocusHandle,
     editing_shell: bool,
     editing_font: bool,
+    _observe_store: Subscription,
 }
 
 impl SettingsPanel {
     pub fn new(store: Entity<WorkspaceStore>, cx: &mut Context<Self>) -> Self {
+        let _observe_store = cx.observe(&store, |_this, _store, cx| cx.notify());
         Self {
             store,
             focus_handle: cx.focus_handle(),
             editing_shell: false,
             editing_font: false,
+            _observe_store,
         }
     }
 
@@ -171,9 +175,13 @@ impl Render for SettingsPanel {
                                     .text_color(theme::TEXT)
                                     .child("Settings"),
                             )
-                            .child(Self::row_button("settings-close", "Close", cx, |_, _, cx| {
-                                cx.emit(SettingsEvent::Close);
-                            })),
+                            .child(AccentButton::new(
+                                "settings-close",
+                                "Close",
+                                cx.listener(|_, _, _, cx| {
+                                    cx.emit(SettingsEvent::Close);
+                                }),
+                            )),
                     )
                     .child(
                         div()

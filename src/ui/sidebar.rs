@@ -3,20 +3,24 @@ use gpui::*;
 use uuid::Uuid;
 
 use crate::shared::theme;
+use crate::ui::widgets::IconButton;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
     search_focused: bool,
+    _observe_store: Subscription,
 }
 
 impl Sidebar {
     pub fn new(store: Entity<WorkspaceStore>, cx: &mut Context<Self>) -> Self {
+        let _observe_store = cx.observe(&store, |_this, _store, cx| cx.notify());
         Self {
             store,
             focus_handle: cx.focus_handle(),
             search_focused: false,
+            _observe_store,
         }
     }
 
@@ -93,16 +97,8 @@ impl Render for Sidebar {
                         });
                     }))
                     .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded(px(4.0))
-                            .bg(theme::PANEL_BG)
-                            .border_1()
-                            .border_color(theme::BORDER)
-                            .text_color(theme::TEXT_MUTED)
-                            .text_sm()
-                            .child("+ SSH (soon)"),
+                        IconButton::new("btn-ssh-soon", "+ SSH (soon)", |_, _, _| {})
+                            .muted(true),
                     ),
             )
             .child(

@@ -1,3 +1,5 @@
+//! Workspace persistence and profile models.
+
 pub mod persist;
 pub mod profile;
 pub mod workspace;

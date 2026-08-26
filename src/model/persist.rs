@@ -34,7 +34,9 @@ pub fn load_workspace() -> WorkspaceFile {
         Err(err) => {
             eprintln!("loom: workspace load failed ({err}); using defaults");
             let bak = path.with_extension("json.bak");
-            let _ = fs::copy(&path, &bak);
+            if let Err(copy_error) = fs::copy(&path, &bak) {
+                eprintln!("loom: failed to backup corrupt workspace: {copy_error}");
+            }
             WorkspaceFile::default_workspace()
         }
     }

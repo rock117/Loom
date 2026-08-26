@@ -48,14 +48,18 @@ impl LocalPty {
         })
     }
 
-    pub fn resize_callback(master: Arc<Mutex<Box<dyn MasterPty + Send>>>) -> impl Fn(usize, usize) + Send + Sync + 'static {
+    pub fn resize_callback(
+        master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    ) -> impl Fn(usize, usize) + Send + Sync + 'static {
         move |cols: usize, rows: usize| {
-            let _ = master.lock().resize(PtySize {
+            if let Err(error) = master.lock().resize(PtySize {
                 cols: cols as u16,
                 rows: rows as u16,
                 pixel_width: 0,
                 pixel_height: 0,
-            });
+            }) {
+                eprintln!("loom: pty resize failed: {error}");
+            }
         }
     }
 }

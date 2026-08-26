@@ -7,11 +7,16 @@ use crate::ui::tab_manager::TabManager;
 
 pub struct TerminalPane {
     pub tabs: Entity<TabManager>,
+    _observe_tabs: Subscription,
 }
 
 impl TerminalPane {
-    pub fn new(tabs: Entity<TabManager>) -> Self {
-        Self { tabs }
+    pub fn new(tabs: Entity<TabManager>, cx: &mut Context<Self>) -> Self {
+        let _observe_tabs = cx.observe(&tabs, |_this, _tabs, cx| cx.notify());
+        Self {
+            tabs,
+            _observe_tabs,
+        }
     }
 }
 
@@ -31,6 +36,7 @@ impl Render for TerminalPane {
                     .flex_1()
                     .items_center()
                     .justify_center()
+                    .flex()
                     .flex_col()
                     .gap_2()
                     .child(

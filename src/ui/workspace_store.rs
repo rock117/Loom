@@ -44,9 +44,15 @@ impl WorkspaceStore {
     }
 
     pub fn persist_now(&mut self) {
-        let _ = save_workspace(&self.workspace);
-        let _ = save_ui_state(&self.ui_state);
-        let _ = save_settings(&self.settings);
+        if let Err(error) = save_workspace(&self.workspace) {
+            eprintln!("loom: failed to save workspace: {error:#}");
+        }
+        if let Err(error) = save_ui_state(&self.ui_state) {
+            eprintln!("loom: failed to save ui state: {error:#}");
+        }
+        if let Err(error) = save_settings(&self.settings) {
+            eprintln!("loom: failed to save settings: {error:#}");
+        }
         self.dirty = false;
     }
 
