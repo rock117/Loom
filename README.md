@@ -41,6 +41,7 @@ Debug:
 cargo run
 ```
 
+On Windows, the window/taskbar icon is embedded from `assets/icons/loom.ico` via `resources/windows/loom.rc` (resource ID 1, which GPUI loads).
 ## Data locations
 
 On Windows (under `%APPDATA%/Loom/`):

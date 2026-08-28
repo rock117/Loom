@@ -19,6 +19,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
 # Default for `cargo build` / `cargo run` — keep target/ lean.
 [profile.dev]
 opt-level = 1

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Soft tool-like corner (was 96) -->
+  <rect width="512" height="512" rx="72" fill="#1E2A3A"/>
+
+  <!-- L: longer horizontal for clearer letterform at small sizes -->
+  <rect x="88" y="296" width="200" height="36" rx="6" fill="#2DD4BF"/>
+
+  <!-- L stem: starts lower so it reads as L, not T/cross -->
+  <rect x="88" y="152" width="36" height="180" rx="6" fill="#2DD4BF"/>
+
+  <!-- Terminal block cursor (short bar), not a vanishing dot -->
+  <rect x="292" y="152" width="22" height="48" rx="4" fill="#2DD4BF"/>
+</svg>
