@@ -85,7 +85,9 @@ src/
 
 GPUI code follows the skills under `~/.agents/skills` (entities observe, Stateful `.id()` + click handlers, no `mod.rs`, SharedString, explicit error logging).
 
-Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.  
+Design trade-offs and accepted decisions: **[docs/DECISIONS.md](docs/DECISIONS.md)**.  
+Agent / contributor principles: **[AGENTS.md](AGENTS.md)**.
 
 ## Roadmap
 
