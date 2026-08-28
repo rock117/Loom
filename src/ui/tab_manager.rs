@@ -3,10 +3,12 @@ use std::sync::Arc;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use portable_pty::ChildKiller;
 use uuid::Uuid;
 
 use crate::model::{ConnectionState, Profile, ProfileKind};
-use crate::session::local::{LocalPty, resolve_shell};
+use crate::platform;
+use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::shared::theme;
 use crate::ui::workspace_store::WorkspaceStore;
 
@@ -18,6 +20,7 @@ pub struct TabSession {
     pub status_message: String,
     pub terminal: Option<Entity<TerminalView>>,
     pub pty_master: Option<Arc<parking_lot::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    pub pty_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
 }
 
 pub struct TabManager {
@@ -58,6 +61,7 @@ impl TabManager {
                 status_message: "SSH is not enabled yet".into(),
                 terminal: None,
                 pty_master: None,
+                pty_killer: None,
             };
             let id = tab.id;
             self.tabs.push(tab);
@@ -82,6 +86,7 @@ impl TabManager {
                     status_message: format!("{err:#}"),
                     terminal: None,
                     pty_master: None,
+                    pty_killer: None,
                 };
                 let id = tab.id;
                 self.tabs.push(tab);
@@ -106,23 +111,39 @@ impl TabManager {
         let shell = resolve_shell(configured);
         let pty = LocalPty::spawn(&shell, cwd.as_deref())?;
         let master = pty.master.clone();
+        let killer = pty.killer;
         let resize = LocalPty::resize_callback(master.clone());
 
-        let config = terminal_config(self.font_size, font_family);
+        let family = if font_family.trim().is_empty() {
+            platform::monospace_font_family()
+        } else {
+            font_family
+        };
+        let config = terminal_config(self.font_size, family);
         let terminal = cx.new(|cx| {
-            TerminalView::new(pty.writer, pty.reader, config, cx)
-                .with_resize_callback(resize)
+            TerminalView::new(pty.writer, pty.reader, config, cx).with_resize_callback(resize)
         });
         terminal.read(cx).focus_handle().focus(window);
+
+        let cwd_label = cwd
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or_else(|| LocalPty::default_cwd().map(|p| p.display().to_string()))
+            .unwrap_or_else(|| ".".into());
+        let shell_short = std::path::Path::new(&shell)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&shell);
 
         Ok(TabSession {
             id: Uuid::new_v4(),
             profile_id: profile.id,
             title: profile.name.clone(),
             state: ConnectionState::Connected,
-            status_message: format!("local · {shell}"),
+            status_message: format!("{shell_short} · {cwd_label}"),
             terminal: Some(terminal),
             pty_master: Some(master),
+            pty_killer: Some(killer),
         })
     }
 
@@ -153,8 +174,11 @@ impl TabManager {
             return;
         };
 
+        let old_master = self.tabs[idx].pty_master.take();
+        let old_killer = self.tabs[idx].pty_killer.take();
         self.tabs[idx].terminal = None;
-        self.tabs[idx].pty_master = None;
+        teardown_pty(old_killer, old_master);
+
         self.tabs[idx].state = ConnectionState::Connecting;
         self.tabs[idx].status_message = "reconnecting…".into();
 
@@ -189,13 +213,27 @@ impl TabManager {
         let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
-        self.tabs.remove(pos);
+        let tab = self.tabs.remove(pos);
+        let master = tab.pty_master;
+        let killer = tab.pty_killer;
+        drop(tab.terminal);
+        teardown_pty(killer, master);
+
         self.active = if self.tabs.is_empty() {
             None
         } else {
             Some(self.tabs[pos.min(self.tabs.len() - 1)].id)
         };
         cx.notify();
+    }
+
+    pub fn teardown_all(&mut self) {
+        let tabs = std::mem::take(&mut self.tabs);
+        self.active = None;
+        for tab in tabs {
+            drop(tab.terminal);
+            teardown_pty(tab.pty_killer, tab.pty_master);
+        }
     }
 
     pub fn select_tab(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -244,7 +282,10 @@ impl TabManager {
         let profile = store.read(cx).workspace.find_profile(profile_id).cloned();
         let (default_shell, font_family) = {
             let s = store.read(cx);
-            (s.settings.default_shell.clone(), s.settings.font_family.clone())
+            (
+                s.settings.default_shell.clone(),
+                s.settings.font_family.clone(),
+            )
         };
         if let Some(profile) = profile {
             self.open_profile(
@@ -299,55 +340,50 @@ impl TabManager {
     }
 }
 
+impl Drop for TabManager {
+    fn drop(&mut self) {
+        self.teardown_all();
+    }
+}
+
 fn terminal_config(font_size: f32, font_family: &str) -> TerminalConfig {
     let colors = ColorPalette::builder()
         .background(0x1A, 0x1A, 0x1C)
         .foreground(0xE8, 0xE6, 0xE3)
         .cursor(0xE8, 0xE6, 0xE3)
-        .black(0x10, 0x10, 0x10)
-        .red(0xEF, 0xA6, 0xA2)
-        .green(0x80, 0xC9, 0x90)
-        .yellow(0xA6, 0x94, 0x60)
-        .blue(0xA3, 0xB8, 0xEF)
-        .magenta(0xE6, 0xA3, 0xDC)
-        .cyan(0x50, 0xCA, 0xCD)
-        .white(0x80, 0x80, 0x80)
-        .bright_black(0x39, 0x41, 0x4E)
-        .bright_red(0xE0, 0xAF, 0x85)
-        .bright_green(0x5A, 0xCC, 0xAF)
-        .bright_yellow(0xC8, 0xC8, 0x74)
-        .bright_blue(0xCC, 0xAC, 0xED)
-        .bright_magenta(0xF2, 0xA1, 0xC2)
-        .bright_cyan(0x74, 0xC3, 0xE4)
-        .bright_white(0xC0, 0xC0, 0xC0)
+        .black(0x0C, 0x0C, 0x0C)
+        .red(0xC5, 0x0F, 0x1F)
+        .green(0x13, 0xA1, 0x0E)
+        .yellow(0xC1, 0x9C, 0x00)
+        .blue(0x00, 0x37, 0xDA)
+        .magenta(0x88, 0x17, 0x98)
+        .cyan(0x3A, 0x96, 0xDD)
+        .white(0xCC, 0xCC, 0xCC)
+        .bright_black(0x76, 0x76, 0x76)
+        .bright_red(0xE7, 0x48, 0x56)
+        .bright_green(0x16, 0xC6, 0x0C)
+        .bright_yellow(0xF9, 0xF1, 0xA5)
+        .bright_blue(0x3B, 0x78, 0xFF)
+        .bright_magenta(0xB4, 0x00, 0x9E)
+        .bright_cyan(0x61, 0xD6, 0xD6)
+        .bright_white(0xF2, 0xF2, 0xF2)
         .build();
 
-    let family = if font_family.trim().is_empty() {
-        if cfg!(windows) {
-            "Cascadia Mono"
-        } else {
-            "monospace"
-        }
-    } else {
-        font_family
-    };
-
     TerminalConfig {
-        font_family: family.into(),
+        font_family: font_family.into(),
         font_size: px(font_size),
         cols: 80,
         rows: 24,
         scrollback: 10_000,
-        line_height_multiplier: 1.15,
-        padding: Edges::all(px(8.0)),
+        line_height_multiplier: 1.2,
+        padding: Edges::all(px(theme::SPACE_2)),
         colors,
     }
 }
 
-/// Small helper used by status strip colors.
 pub fn state_color(state: ConnectionState) -> Hsla {
     match state {
-        ConnectionState::Connected => theme::ACCENT,
+        ConnectionState::Connected => theme::SUCCESS,
         ConnectionState::Connecting => theme::TEXT_MUTED,
         ConnectionState::Failed => theme::DANGER,
         ConnectionState::Disconnected | ConnectionState::Idle => theme::TEXT_MUTED,

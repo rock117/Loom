@@ -31,5 +31,7 @@ actions!(
         ExportWorkspace,
         /// Import workspace JSON (replaces current).
         ImportWorkspace,
+        /// Quit the application.
+        QuitApp,
     ]
 );

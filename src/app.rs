@@ -22,7 +22,21 @@ pub fn run() {
             KeyBinding::new("ctrl-=", ZoomIn, Some("Loom")),
             KeyBinding::new("ctrl--", ZoomOut, Some("Loom")),
             KeyBinding::new("ctrl-0", ZoomReset, Some("Loom")),
+            // Ctrl+Q quits; leave Ctrl+C for the shell.
+            KeyBinding::new("ctrl-q", QuitApp, Some("Loom")),
         ]);
+
+        cx.on_action(|_: &QuitApp, cx| {
+            cx.quit();
+        });
+
+        // When the last window closes, exit the process (GPUI does not auto-quit).
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         cx.spawn(async move |cx| {
             cx.open_window(
@@ -38,9 +52,7 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |_window, cx| {
-                    cx.new(|cx| WorkspaceView::new(_window, cx))
-                },
+                |_window, cx| cx.new(|cx| WorkspaceView::new(_window, cx)),
             )?;
             Ok::<_, anyhow::Error>(())
         })

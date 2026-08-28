@@ -130,11 +130,7 @@ impl Default for SettingsFile {
         Self {
             version: 1,
             default_shell: None,
-            font_family: if cfg!(windows) {
-                "Cascadia Mono".into()
-            } else {
-                "monospace".into()
-            },
+            font_family: crate::platform::monospace_font_family().into(),
             font_size: 14.0,
         }
     }

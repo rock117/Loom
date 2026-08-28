@@ -1,19 +1,26 @@
+//! Local PTY session helpers (portable-pty). Child/killer kept for clean teardown.
+
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
-/// Spawn a local shell in a PTY and return reader/writer plus resize handle.
+use crate::platform;
+
+/// Spawn a local shell in a PTY and return reader/writer plus resize/teardown handles.
 pub struct LocalPty {
     pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
+    pub killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
 impl LocalPty {
-    pub fn spawn(shell: &str, cwd: Option<&std::path::Path>) -> Result<Self> {
+    pub fn spawn(shell: &str, cwd: Option<&Path>) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -27,15 +34,30 @@ impl LocalPty {
         let mut cmd = CommandBuilder::new(shell);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        if let Some(cwd) = cwd {
-            cmd.cwd(cwd);
+
+        let resolved_cwd = cwd
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(ref dir) = resolved_cwd {
+            cmd.cwd(dir);
         }
 
-        let _child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .with_context(|| format!("spawn shell `{shell}`"))?;
         drop(pair.slave);
+
+        let killer = child.clone_killer();
+        // Keep the Child alive on a background wait thread so Drop does not
+        // block the UI; killer is used for explicit teardown.
+        thread::Builder::new()
+            .name("pty-child-wait".into())
+            .spawn(move || {
+                let mut child = child;
+                let _ = child.wait();
+            })
+            .context("spawn pty wait thread")?;
 
         let writer = pair.master.take_writer().context("pty writer")?;
         let reader = pair.master.try_clone_reader().context("pty reader")?;
@@ -45,7 +67,12 @@ impl LocalPty {
             master,
             reader,
             writer,
+            killer,
         })
+    }
+
+    pub fn default_cwd() -> Option<PathBuf> {
+        std::env::current_dir().ok()
     }
 
     pub fn resize_callback(
@@ -66,35 +93,21 @@ impl LocalPty {
 
 /// Resolve default shell executable for this platform.
 pub fn resolve_shell(configured: Option<&str>) -> String {
-    if let Some(shell) = configured {
-        if !shell.is_empty() {
-            return shell.to_string();
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        for candidate in ["pwsh", "powershell", "cmd"] {
-            if which_exists(candidate) {
-                return candidate.to_string();
-            }
-        }
-        "cmd".to_string()
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
-    }
+    platform::resolve_shell(configured)
 }
 
-#[cfg(windows)]
-fn which_exists(name: &str) -> bool {
-    std::process::Command::new("where")
-        .arg(name)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+/// Tear down a ConPTY/session off the UI thread (kill then drop master).
+pub fn teardown_pty(
+    killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    master: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
+) {
+    thread::Builder::new()
+        .name("pty-teardown".into())
+        .spawn(move || {
+            if let Some(mut killer) = killer {
+                let _ = killer.kill();
+            }
+            drop(master);
+        })
+        .ok();
 }

@@ -33,7 +33,11 @@ impl WorkspaceView {
         let font_size = store.read(cx).ui_state.font_size.max(
             store.read(cx).settings.font_size,
         );
-        let sidebar_width = store.read(cx).ui_state.sidebar_width.clamp(180.0, 480.0);
+        let sidebar_width = store
+            .read(cx)
+            .ui_state
+            .sidebar_width
+            .clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX);
         let restore_profiles: Vec<uuid::Uuid> = store
             .read(cx)
             .ui_state
@@ -265,7 +269,9 @@ impl Render for WorkspaceView {
 
         div()
             .key_context("Loom")
-            .track_focus(&self.focus_handle)
+            // Do not track_focus on the root — that steals keyboard focus from the
+            // terminal. App shortcuts still dispatch via key_context while a child
+            // (terminal / sidebar) holds focus.
             .size_full()
             .flex()
             .relative()
@@ -311,6 +317,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ImportWorkspace, _, cx| {
                 this.import_workspace(cx);
             }))
+            .on_action(cx.listener(|_this, _: &QuitApp, _, cx| {
+                cx.quit();
+            }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
                 let size = this.tabs.read(cx).font_size + 1.0;
                 this.tabs.update(cx, |m, cx| m.set_font_size(size, cx));
@@ -354,7 +363,11 @@ impl Render for WorkspaceView {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.resizing_sidebar {
-                    this.sidebar_width = event.position.x.clamp(px(180.0), px(480.0)).into();
+                    this.sidebar_width = event
+                        .position
+                        .x
+                        .clamp(px(theme::SIDEBAR_MIN), px(theme::SIDEBAR_MAX))
+                        .into();
                     cx.notify();
                 }
             }))

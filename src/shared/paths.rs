@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
+use crate::platform;
+
 pub fn loom_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("Loom")
+    platform::config_dir()
 }
 
 pub fn workspace_path() -> PathBuf {

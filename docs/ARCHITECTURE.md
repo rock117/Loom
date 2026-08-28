@@ -1,0 +1,181 @@
+# Loom architecture
+
+This document captures the target architecture for Loom: learn from [Zed](https://github.com/zed-industries/zed)’s **ideas and structure**, implement our own code under **MIT**, ship **Windows first**, and keep clean abstractions for **macOS / Linux** later.
+
+It is a design guide, not a license to copy Zed source. Do not paste Zed crates or GPL-covered files into this tree.
+
+## Goals
+
+| Goal | Meaning |
+|------|---------|
+| UI quality | Visual rhythm close to Zed (spacing, contrast, typography, restrained chrome) |
+| Terminal feel | Snappy input/output like Zed’s terminal (GPU text, not a soft CPU bitmap) |
+| Product shape | Postman-style client: left **profiles/groups**, right **multi-tab shells** |
+| Commercial-friendly | Keep **MIT**; study Zed, do not vendor its GPL code |
+| Portability | Windows implementation first; `platform` traits ready for macOS / Linux |
+
+Non-goals for this phase: becoming a mini-IDE, embedding Zed’s `project_panel` / `workspace` stack, switching UI frameworks again.
+
+## What to learn from Zed (mapping)
+
+| Zed concept | Loom counterpart |
+|-------------|------------------|
+| `terminal` — PTY + VT grid | `src/terminal/` — `alacritty_terminal` + `portable-pty` |
+| `terminal_view` — GPUI element paints cells | `TerminalView` + `TerminalElement` via GPUI `text_system` |
+| `workspace` + panels | Lightweight `WorkspaceView`: sidebar + tabs + terminal |
+| `ui` + `theme` | Own `theme` tokens + small widgets (list row, button) |
+| Platform crates (`gpui_windows`, …) | `src/platform/` — traits + `windows` impl, macOS/Linux stubs |
+
+Key terminal idea (same class as Zed, not the same files):
+
+```
+PTY bytes → VT / grid (alacritty_terminal)
+         → TerminalElement paint (GPUI shape_line / glyphs)
+         → focus + keystrokes → PTY write
+```
+
+Answer terminal queries (e.g. CSI `6 n` / `Event::PtyWrite`) or shells such as PowerShell will stall without a prompt.
+
+## Module layout (target)
+
+```
+src/
+  main.rs
+  app.rs                      # App lifecycle, global keybindings, quit
+  platform/
+    mod.rs                    # Traits: paths, default shell, font families, …
+    windows.rs                # Current focus
+    macos.rs                  # Stub / cfg
+    linux.rs                  # Stub / cfg
+  model/                      # workspace.json, profiles, settings (keep)
+  terminal/
+    mod.rs
+    session.rs                # Spawn, resize, read/write, teardown
+    grid.rs                   # Thin wrap over alacritty Term
+    input.rs                  # Keystroke → bytes (Zed-like try_keystroke idea)
+  ui/
+    theme.rs                  # Zed-inspired palette, type scale, spacing
+    workspace_view.rs
+    sidebar.rs                # Profiles/groups (not a file tree)
+    tab_bar.rs
+    tab_manager.rs
+    terminal_view.rs          # Entity, focus, lifecycle
+    terminal_element.rs       # Paint grid with GPUI text system
+    settings.rs
+    widgets.rs
+  session/                    # May merge into terminal/ over time
+  shared/                     # Actions, paths helpers
+```
+
+Prefer flat `foo.rs` modules (no unnecessary `mod.rs` nests) where it matches existing Loom/GPUI skills; `platform/` and `terminal/` directories are fine when they grow.
+
+## Platform abstraction (minimum)
+
+Implement fully on Windows; other OSes compile with stubs or minimal defaults.
+
+| API | Windows | Later |
+|-----|---------|--------|
+| `config_dir()` | `%APPDATA%/Loom` | `~/Library/Application Support/Loom`, `~/.config/loom` |
+| `default_shell()` | pwsh → powershell → cmd | `$SHELL`, `/bin/zsh`, etc. |
+| `monospace_font_family()` | Cascadia Mono / Consolas | Menlo / DejaVu Sans Mono |
+| PTY | `portable-pty` (already cross-platform) | same crate |
+
+Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should not sprinkle Win32 calls.
+
+## UI / product rules
+
+- **Left nav** = connection profiles and groups (Loom’s product). Do not adopt Zed’s disk worktree panel as the primary nav.
+- Optionally later: a separate lightweight folder browser; not required for v1 polish.
+- Visual system: dark layered surfaces, soft selection fills, hairline dividers, consistent type scale — inspired by Zed screenshots/behavior, expressed as our tokens in `theme.rs`.
+
+## Terminal rendering rules
+
+- Prefer **GPUI text system** painting of the cell grid (Zed-style path).
+- Avoid long-term reliance on CPU bitmap → `Image` stretch (blurry on HiDPI).
+- Treat `gpui-terminal` as transitional; replace with in-house `TerminalElement` when ready.
+- Multi-tab: each tab owns a session; closing a tab must not block the UI thread (careful kill / drop order for ConPTY on Windows).
+- App shortcuts (`Ctrl+T` / `Ctrl+W` / `Ctrl+Q`, …) must not steal shell chords such as `Ctrl+C`.
+
+## Implementation phases
+
+### Phase 1 — Stabilize on current GPUI shell
+
+- Fix focus, typing, tab close, window quit, shortcuts.
+- Keep Postman layout and `model` persistence.
+- Read Zed `terminal_view` design notes for input/focus ideas only.
+
+### Phase 2 — Theme pass
+
+- Introduce explicit theme tokens aligned with Zed-like density/contrast.
+- Restyle sidebar, tabs, empty states, settings chrome.
+
+### Phase 3 — In-house terminal pipeline
+
+- `terminal/session` + grid + `PtyWrite` handling.
+- `TerminalElement` paint via `text_system`.
+- Wire tabs to the new view; retire `gpui-terminal` when parity is enough.
+
+### Phase 4 — Windows polish
+
+- Resize, scrollback feel, IME/paste paths, reconnect, status line.
+- ConPTY teardown and process exit hygiene.
+
+### Phase 5 — macOS / Linux
+
+- Fill `platform/macos.rs` and `platform/linux.rs`.
+- Same UI/terminal code paths; fix font and shell defaults only.
+
+## Success criteria (Windows)
+
+- New shell shows a real prompt and correct cwd; typing works after open/click.
+- Terminal glyphs look sharp at common DPI scales (100% / 125% / 150%).
+- Heavy output (e.g. large `ls` / `Get-ChildItem`) stays usable without multi-second UI freezes.
+- Multiple tabs open/close reliably; closing the window exits the process cleanly.
+- `platform` stubs exist so non-Windows cfg does not require deleting the abstraction.
+
+## Relationship to the current tree
+
+Keep:
+
+- `model/` persistence (`workspace.json`, `ui_state.json`, `settings.json`)
+- Postman-style IA (groups, profiles, multi-tab)
+- crates.io **GPUI** (unless a future decision explicitly vendors Zed’s GPUI)
+
+Evolve:
+
+- `ui/terminal_pane.rs` + `gpui-terminal` → custom `terminal_view` / `terminal_element`
+- `shared/theme.rs` → richer tokens
+- Add `platform/` and first-class `terminal/` modules
+
+## License
+
+Loom remains **MIT**. Contributors must not copy GPL-covered Zed (or other) source into this repository. Architecture and UX inspiration are welcome; implementations must be original.
+
+## References (read-only)
+
+Local Zed checkout (example): `C:\rock\coding\code\opensource\rust\zed`
+
+Useful areas to **read for ideas** (do not copy):
+
+- `crates/terminal_view/README.md` — input paths, builder/subscribe pattern
+- `crates/terminal_view/src/terminal_element.rs` — grid paint approach
+- `crates/terminal/` — PTY / event-loop boundaries
+- Zed UI theme usage — visual density and contrast (observe behavior, reimplement tokens)
+
+---
+
+When implementing, prefer small vertical slices (theme → one working terminal tab → multi-tab) over a big-bang rewrite.
+
+## Implementation progress
+
+Started on the GPUI tree (post Slint rollback):
+
+- [x] `platform/` — Windows + macOS/Linux stubs (`config_dir`, `default_shell`, `monospace_font_family`)
+- [x] Theme tokens expanded in `shared/theme.rs` (Zed-inspired, original values)
+- [x] PTY spawn keeps child killer; default cwd; background teardown on tab close / `TabManager` drop
+- [x] App quit: `Ctrl+Q`, `on_window_closed` → `cx.quit()` (Ctrl+C left for the shell)
+- [x] Root `WorkspaceView` no longer `track_focus` (avoids stealing terminal focus)
+- [x] `terminal/` scaffold (`input`, `session` handles) for the future GPUI `TerminalElement` path
+- [ ] Replace `gpui-terminal` with in-house grid paint via GPUI `text_system`
+- [ ] Full visual pass on sidebar/tabs using new spacing/radius tokens
+- [ ] macOS / Linux runtime validation
