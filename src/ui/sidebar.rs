@@ -1,16 +1,23 @@
+//! Profiles sidebar — Zed project-panel inspired density (original styling).
+
 use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
 use crate::shared::theme;
-use crate::ui::widgets::IconButton;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
     search_focused: bool,
+    /// Right-click context menu for a profile (Zed-style; actions not always-visible).
+    context_menu: Option<ContextMenuState>,
     _observe_store: Subscription,
+}
+
+struct ContextMenuState {
+    profile_id: Uuid,
 }
 
 impl Sidebar {
@@ -20,37 +27,77 @@ impl Sidebar {
             store,
             focus_handle: cx.focus_handle(),
             search_focused: false,
+            context_menu: None,
             _observe_store,
         }
     }
 
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.search_focused = true;
+        self.context_menu = None;
         self.focus_handle.focus(window);
         cx.notify();
     }
 
-    fn toolbar_button(
+    fn ghost_icon(
         &self,
         id: impl Into<ElementId>,
         label: &'static str,
+        muted: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
-            .px_2()
-            .py_1()
+            .px(px(theme::SPACE_1 + 2.0))
+            .py(px(2.0))
             .rounded(px(theme::RADIUS_SM))
-            .bg(theme::PANEL_BG)
-            .border_1()
-            .border_color(theme::BORDER)
-            .text_color(theme::TEXT)
+            .text_xs()
+            .font_family("Segoe UI")
+            .text_color(if muted {
+                theme::TEXT_DISABLED
+            } else {
+                theme::TEXT_MUTED
+            })
+            .cursor_pointer()
+            .hover(|s| {
+                s.bg(theme::HOVER).text_color(if muted {
+                    theme::TEXT_MUTED
+                } else {
+                    theme::TEXT
+                })
+            })
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.context_menu = None;
+                on_click(this, window, cx);
+            }))
+    }
+
+    fn menu_item(
+        &self,
+        id: impl Into<ElementId>,
+        label: &'static str,
+        danger: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w_full()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
             .text_sm()
+            .text_color(if danger { theme::DANGER } else { theme::TEXT })
             .cursor_pointer()
             .hover(|s| s.bg(theme::HOVER))
             .child(label)
-            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                on_click(this, window, cx);
+                this.context_menu = None;
+                cx.notify();
+            }))
     }
 }
 
@@ -73,58 +120,87 @@ impl Render for Sidebar {
             .iter()
             .map(|g| (g.id, g.name.clone()))
             .collect();
+        let context_menu = self.context_menu.as_ref().map(|m| m.profile_id);
 
         div()
             .track_focus(&self.focus_handle)
+            .relative()
             .flex()
             .flex_col()
             .h_full()
             .w_full()
             .bg(theme::SIDEBAR_BG)
             .border_r_1()
-            .border_color(theme::BORDER)
+            .border_color(theme::BORDER_SUBTLE)
+            .text_sm()
+            // Header: title + compact actions (Zed panel header density)
             .child(
                 div()
                     .flex()
-                    .gap(px(theme::SPACE_1))
-                    .p(px(theme::SPACE_2))
-                    .child(self.toolbar_button("btn-group", "+ Group", cx, |this, _, cx| {
-                        this.store.update(cx, |s, cx| s.add_group(cx));
-                    }))
-                    .child(self.toolbar_button("btn-shell", "+ Shell", cx, |this, _, cx| {
-                        this.store.update(cx, |s, cx| {
-                            s.add_local_profile(cx);
-                        });
-                    }))
+                    .items_center()
+                    .justify_between()
+                    .h(px(32.0))
+                    .px(px(theme::SPACE_2))
                     .child(
-                        IconButton::new("btn-ssh-soon", "+ SSH (soon)", |_, _, _| {})
-                            .muted(true),
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::TEXT_MUTED)
+                            .child("Profiles"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(2.0))
+                            .child(self.ghost_icon("btn-group", "+", false, cx, |this, _, cx| {
+                                this.store.update(cx, |s, cx| s.add_group(cx));
+                            }))
+                            .child(self.ghost_icon("btn-shell", ">_", false, cx, |this, _, cx| {
+                                this.store.update(cx, |s, cx| {
+                                    s.add_local_profile(cx);
+                                });
+                            }))
+                            .child(self.ghost_icon("btn-ssh", "SSH", true, cx, |_, _, _| {}))
+                            .child(self.ghost_icon("btn-settings", "⚙", false, cx, |_, _, cx| {
+                                cx.emit(SidebarEvent::OpenSettings);
+                            })),
                     ),
             )
+            // Filter — understated, no heavy chrome
             .child(
                 div()
                     .id("sidebar-search")
                     .mx(px(theme::SPACE_2))
-                    .mb(px(theme::SPACE_2))
+                    .mb(px(theme::SPACE_1))
                     .px(px(theme::SPACE_2))
                     .py(px(theme::SPACE_1))
                     .rounded(px(theme::RADIUS_SM))
-                    .bg(theme::PANEL_BG)
+                    .bg(if self.search_focused {
+                        theme::ELEVATED
+                    } else {
+                        theme::SIDEBAR_BG
+                    })
                     .border_1()
                     .border_color(if self.search_focused {
-                        theme::ACCENT
-                    } else {
                         theme::BORDER
+                    } else {
+                        theme::BORDER_SUBTLE
                     })
-                    .text_color(theme::TEXT)
-                    .text_sm()
+                    .text_xs()
+                    .text_color(if search.is_empty() && !self.search_focused {
+                        theme::TEXT_DISABLED
+                    } else {
+                        theme::TEXT
+                    })
                     .child(if search.is_empty() && !self.search_focused {
-                        SharedString::from("Search profiles…")
+                        SharedString::from("Filter…")
                     } else {
                         SharedString::from(search.clone())
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.search_focused = true;
+                        this.context_menu = None;
                         this.focus_handle.focus(window);
                         cx.notify();
                     }))
@@ -159,38 +235,47 @@ impl Render for Sidebar {
                         }
                     })),
             )
+            // Tree
             .child(
                 div()
+                    .id("sidebar-tree")
                     .flex_1()
-                    .overflow_hidden()
-                    .px_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(theme::SPACE_1))
+                    .pb(px(theme::SPACE_2))
                     .children(groups.into_iter().map(|(gid, gname, collapsed, profiles)| {
                         let selected_group = selection == Selection::Group(gid);
                         div()
-                            .mb_1()
+                            .mb(px(2.0))
                             .child(
                                 div()
                                     .id(SharedString::from(format!("group-{gid}")))
                                     .flex()
                                     .items_center()
-                                    .gap_1()
-                                    .px_2()
-                                    .py_1()
+                                    .gap(px(theme::SPACE_1))
+                                    .h(px(24.0))
+                                    .px(px(theme::SPACE_1))
                                     .rounded(px(theme::RADIUS_SM))
-                                    .when(selected_group, |d| d.bg(theme::ACCENT_SOFT))
+                                    .when(selected_group, |d| d.bg(theme::SELECTION))
                                     .hover(|s| s.bg(theme::HOVER))
                                     .cursor_pointer()
                                     .child(
                                         div()
-                                            .text_color(theme::TEXT_MUTED)
+                                            .w(px(12.0))
                                             .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
                                             .child(if collapsed { "▸" } else { "▾" }),
                                     )
                                     .child(
                                         div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
                                             .text_color(theme::TEXT)
-                                            .text_sm()
-                                            .font_weight(FontWeight::SEMIBOLD)
                                             .child(if renaming.is_some() && selected_group {
                                                 format!("{}|", renaming.clone().unwrap_or_default())
                                             } else {
@@ -198,6 +283,7 @@ impl Render for Sidebar {
                                             }),
                                     )
                                     .on_click(cx.listener(move |this, _event: &ClickEvent, _, cx| {
+                                        this.context_menu = None;
                                         this.store.update(cx, |s, cx| {
                                             s.select_group(gid, cx);
                                             s.toggle_group(gid, cx);
@@ -213,115 +299,186 @@ impl Render for Sidebar {
                                     } else {
                                         profile.name.clone()
                                     };
-                                    let summary = profile.kind.summary();
                                     div()
                                         .id(SharedString::from(format!("profile-{pid}")))
-                                        .ml_3()
-                                        .px_2()
-                                        .py_1()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme::SPACE_1))
+                                        .h(px(24.0))
+                                        .pl(px(theme::SPACE_4))
+                                        .pr(px(theme::SPACE_1))
                                         .rounded(px(theme::RADIUS_SM))
-                                        .when(selected, |d| d.bg(theme::ACCENT_SOFT))
+                                        .when(selected, |d| d.bg(theme::SELECTION))
                                         .hover(|s| s.bg(theme::HOVER))
                                         .cursor_pointer()
                                         .child(
                                             div()
-                                                .text_color(theme::TEXT)
-                                                .text_sm()
-                                                .child(label),
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .child("›"),
                                         )
                                         .child(
                                             div()
-                                                .text_color(theme::TEXT_MUTED)
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
                                                 .text_xs()
-                                                .child(summary),
+                                                .text_color(theme::TEXT)
+                                                .child(label),
                                         )
-                                        .on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-                                            this.store.update(cx, |s, cx| s.select_profile(pid, cx));
-                                            if event.click_count() >= 2 {
-                                                cx.emit(SidebarEvent::OpenProfile(pid));
-                                            }
-                                        }))
+                                        .on_click(cx.listener(
+                                            move |this, event: &ClickEvent, _window, cx| {
+                                                this.context_menu = None;
+                                                this.store.update(cx, |s, cx| {
+                                                    s.select_profile(pid, cx)
+                                                });
+                                                if event.click_count() >= 2 {
+                                                    cx.emit(SidebarEvent::OpenProfile(pid));
+                                                }
+                                            },
+                                        ))
                                         .on_mouse_down(
                                             MouseButton::Right,
                                             cx.listener(move |this, _, _, cx| {
-                                                this.store.update(cx, |s, cx| s.select_profile(pid, cx));
-                                                cx.emit(SidebarEvent::ShowProfileMenu(pid));
+                                                this.store.update(cx, |s, cx| {
+                                                    s.select_profile(pid, cx)
+                                                });
+                                                this.context_menu =
+                                                    Some(ContextMenuState { profile_id: pid });
+                                                cx.notify();
                                             }),
                                         )
                                 }))
                             })
                     })),
             )
+            // Hint footer — shortcuts instead of button wall
             .child(
                 div()
-                    .p_2()
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_1))
                     .border_t_1()
-                    .border_color(theme::BORDER)
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .child(self.toolbar_button("btn-open", "Open", cx, |this, _, cx| {
-                        if let Selection::Profile(id) = this.store.read(cx).selection {
-                            cx.emit(SidebarEvent::OpenProfile(id));
-                        }
-                    }))
-                    .child(self.toolbar_button("btn-rename", "Rename", cx, |this, _, cx| {
-                        this.store.update(cx, |s, cx| s.begin_rename(cx));
-                    }))
-                    .child(self.toolbar_button("btn-dup", "Dup", cx, |this, _, cx| {
-                        if let Selection::Profile(id) = this.store.read(cx).selection {
+                    .border_color(theme::BORDER_SUBTLE)
+                    .text_xs()
+                    .text_color(theme::TEXT_DISABLED)
+                    .child("↵ open · F2 rename · Del · right-click"),
+            )
+            // Context menu overlay
+            .when_some(context_menu, |this, pid| {
+                let moves = other_groups.clone();
+                this.child(
+                    div()
+                        .absolute()
+                        .bottom(px(28.0))
+                        .left(px(theme::SPACE_2))
+                        .right(px(theme::SPACE_2))
+                        .p(px(theme::SPACE_1))
+                        .rounded(px(theme::RADIUS))
+                        .bg(theme::ELEVATED)
+                        .border_1()
+                        .border_color(theme::BORDER)
+                        .shadow_md()
+                        .child(self.menu_item("ctx-open", "Open", false, cx, move |_, _, cx| {
+                            cx.emit(SidebarEvent::OpenProfile(pid));
+                        }))
+                        .child(self.menu_item("ctx-rename", "Rename", false, cx, |this, _, cx| {
+                            this.store.update(cx, |s, cx| s.begin_rename(cx));
+                        }))
+                        .child(self.menu_item("ctx-dup", "Duplicate", false, cx, move |this, _, cx| {
                             this.store.update(cx, |s, cx| {
-                                s.duplicate_profile(id, cx);
+                                s.duplicate_profile(pid, cx);
                             });
-                        }
-                    }))
-                    .child(self.toolbar_button("btn-del", "Delete", cx, |this, _, cx| {
-                        this.store.update(cx, |s, cx| s.delete_selection(cx));
-                    }))
-                    .child(self.toolbar_button("btn-settings", "Settings", cx, |_, _, cx| {
-                        cx.emit(SidebarEvent::OpenSettings);
-                    }))
-                    .children(other_groups.into_iter().take(3).map(|(gid, name)| {
-                        let label = format!("→ {name}");
-                        div()
-                            .id(SharedString::from(format!("move-{gid}")))
-                            .px_2()
-                            .py_1()
-                            .rounded(px(theme::RADIUS_SM))
-                            .bg(theme::PANEL_BG)
-                            .border_1()
-                            .border_color(theme::BORDER)
-                            .text_color(theme::TEXT_MUTED)
-                            .text_xs()
-                            .cursor_pointer()
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Selection::Profile(pid) = this.store.read(cx).selection {
+                        }))
+                        .children(moves.into_iter().take(4).map(|(gid, name)| {
+                            let label: SharedString = format!("Move → {name}").into();
+                            div()
+                                .id(SharedString::from(format!("ctx-move-{gid}")))
+                                .w_full()
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_sm()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _, _, cx| {
                                     this.store.update(cx, |s, cx| {
                                         s.move_profile_to_group(pid, gid, cx);
                                     });
-                                }
-                            }))
-                    })),
+                                    this.context_menu = None;
+                                    cx.notify();
+                                }))
+                        }))
+                        .child(div().h(px(1.0)).my(px(theme::SPACE_1)).bg(theme::BORDER_SUBTLE))
+                        .child(self.menu_item("ctx-del", "Delete", true, cx, |this, _, cx| {
+                            this.store.update(cx, |s, cx| s.delete_selection(cx));
+                        }))
+                        .child(self.menu_item("ctx-dismiss", "Close", false, cx, |_, _, _| {})),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    // Clicking empty chrome dismisses the menu (items stop propagation via their handlers).
+                    if this.context_menu.is_some() {
+                        // Don't clear here — child clicks fire first; Esc / menu actions clear.
+                        cx.notify();
+                    }
+                }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                let key = &event.keystroke.key;
                 let renaming = this.store.read(cx).rename_buffer.is_some();
-                if !renaming {
+
+                if key == "escape" {
+                    if this.context_menu.is_some() {
+                        this.context_menu = None;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if this.search_focused {
+                        this.search_focused = false;
+                        this.store.update(cx, |s, cx| s.set_search(String::new(), cx));
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
+
+                if renaming {
+                    if key == "enter" {
+                        this.store.update(cx, |s, cx| s.commit_rename(cx));
+                        cx.stop_propagation();
+                    } else if key == "escape" {
+                        this.store.update(cx, |s, cx| s.cancel_rename(cx));
+                        cx.stop_propagation();
+                    } else if key == "backspace" {
+                        this.store.update(cx, |s, cx| s.pop_rename_char(cx));
+                        cx.stop_propagation();
+                    } else if let Some(ch) = key.chars().next() {
+                        if key.len() == 1 {
+                            this.store.update(cx, |s, cx| s.push_rename_char(ch, cx));
+                            cx.stop_propagation();
+                        }
+                    }
                     return;
                 }
-                let key = &event.keystroke.key;
-                if key == "enter" {
-                    this.store.update(cx, |s, cx| s.commit_rename(cx));
+
+                if this.search_focused {
+                    return;
+                }
+
+                // Delete selection (profile/group) when not renaming.
+                if key == "delete" || key == "backspace" {
+                    this.store.update(cx, |s, cx| s.delete_selection(cx));
+                    this.context_menu = None;
                     cx.stop_propagation();
-                } else if key == "escape" {
-                    this.store.update(cx, |s, cx| s.cancel_rename(cx));
-                    cx.stop_propagation();
-                } else if key == "backspace" {
-                    this.store.update(cx, |s, cx| s.pop_rename_char(cx));
-                    cx.stop_propagation();
-                } else if let Some(ch) = key.chars().next() {
-                    if key.len() == 1 {
-                        this.store.update(cx, |s, cx| s.push_rename_char(ch, cx));
+                } else if key == "enter" {
+                    if let Selection::Profile(id) = this.store.read(cx).selection {
+                        cx.emit(SidebarEvent::OpenProfile(id));
                         cx.stop_propagation();
                     }
                 }
@@ -332,6 +489,7 @@ impl Render for Sidebar {
 #[derive(Clone, Debug)]
 pub enum SidebarEvent {
     OpenProfile(Uuid),
+    #[allow(dead_code)]
     ShowProfileMenu(Uuid),
     OpenSettings,
 }

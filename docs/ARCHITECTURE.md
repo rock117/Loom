@@ -180,6 +180,7 @@ Started on the GPUI tree (post Slint rollback):
 - [x] Root `WorkspaceView` no longer `track_focus` (avoids stealing terminal focus)
 - [x] In-house `terminal/gpui_emu` (adapted MIT gpui-terminal + `PtyWrite` fix); drop crates.io `gpui-terminal`
 - [x] Theme spacing/radius tokens applied to sidebar, tab bar, terminal status chrome
+- [x] Sidebar restyle (Zed project-panel density: compact tree, ghost actions, context menu)
 - [x] Terminal reply events + paste (`ColorRequest`, `TextAreaSizeRequest`, clipboard, Ctrl+V)
 - [x] Mouse selection + auto-copy on release; Ctrl+C copies when selected; right-click paste
 - [ ] Scrollback polish
