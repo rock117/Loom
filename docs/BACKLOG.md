@@ -1,0 +1,69 @@
+# Loom backlog (icebox)
+
+**Priority: lowest.** These are ideas only — **do not implement** unless the user **explicitly** asks for a named item (e.g. “做 SSH” / “实现主题切换”).  
+Passing mentions, “继续 roadmap”、日常 bugfix、或 Agent 自作主张 **都不算** 授权。
+
+Not a decision log. Technical choices go in [DECISIONS.md](./DECISIONS.md). Target architecture goes in [ARCHITECTURE.md](./ARCHITECTURE.md).
+
+Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. This file is the long-horizon icebox.
+
+---
+
+## Product (connection client)
+
+| ID | Idea | Notes |
+|----|------|--------|
+| P1 | **SSH / bastion** | Keys, password, agent; multi-hop later. Natural fit for profiles. |
+| P2 | **Session templates** | One action opens a defined set of tabs (e.g. API + DB + logs). |
+| P3 | **Profile env / startup** | Per-profile env vars, cwd, init command / script. |
+| P4 | **Tab layouts / splits** | Split panes (H/V), drag to rearrange. |
+| P5 | **Command bookmarks / snippets** | Saved commands; insert into the active shell. |
+
+## Terminal UX
+
+| ID | Idea | Notes |
+|----|------|--------|
+| T1 | **Scrollback + output search** | History buffer; Ctrl+F (or similar) over grid/output. |
+| T2 | **Selection polish** | Double-click word, triple-click line, optional block select. |
+| T3 | **Link detection** | Clickable paths / URLs in output. |
+| T4 | **Notifications** | Long-running command done, bell, disconnect toasts. |
+
+## Appearance
+
+| ID | Idea | Notes |
+|----|------|--------|
+| A1 | **Theme system** | Built-in packs + user theme (e.g. JSON); wire UI + terminal palette. Prefer before plugins. |
+| A2 | **Accessibility themes** | High-contrast / larger UI variants (can ship with A1). |
+
+## Platform & shell
+
+| ID | Idea | Notes |
+|----|------|--------|
+| S1 | **System tray / launch at login** | Background-friendly desktop behavior. |
+| S2 | **Multi-window / multi-workspace** | Separate windows or workspace switcher. |
+| S3 | **macOS / Linux polish** | Beyond stubs: fonts, default shells, packaging. |
+
+## Extensibility
+
+| ID | Idea | Notes |
+|----|------|--------|
+| E1 | **Plugin mechanism** | Do **after** core (SSH, scrollback/search, themes) is stable. |
+
+### Plugin scope (when E1 is ordered)
+
+**Good candidates:** themes, status-bar fragments, snippets, custom profile kinds.  
+**Avoid initially:** arbitrary PTY byte-stream hooks (security and stability risk).
+
+---
+
+## Explicitly out of this icebox (for now)
+
+Workflow / collaboration ideas (shared history DB, session “recording for notes”, social share packs, etc.) are **not** tracked here unless product direction changes.
+
+---
+
+## How to promote an item
+
+1. User names the ID or feature clearly.  
+2. Optionally add a short section to `DECISIONS.md` if the approach has real trade-offs.  
+3. Move or check off work under `ARCHITECTURE.md` progress / phases — not by silently starting icebox work.

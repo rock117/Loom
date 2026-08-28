@@ -4,7 +4,8 @@ This document captures the target architecture for Loom: learn from [Zed](https:
 
 It is a design guide, not a license to copy Zed source. Do not paste Zed crates or GPL-covered files into this tree.
 
-For **why we chose X over Y**, see [DECISIONS.md](./DECISIONS.md).
+For **why we chose X over Y**, see [DECISIONS.md](./DECISIONS.md).  
+For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals
 

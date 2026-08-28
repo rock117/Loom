@@ -87,6 +87,7 @@ GPUI code follows the skills under `~/.agents/skills` (entities observe, Statefu
 
 Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.  
 Design trade-offs and accepted decisions: **[docs/DECISIONS.md](docs/DECISIONS.md)**.  
+Low-priority icebox features (explicit order only): **[docs/BACKLOG.md](docs/BACKLOG.md)**.  
 Agent / contributor principles: **[AGENTS.md](AGENTS.md)**.
 
 ## Roadmap
