@@ -122,3 +122,7 @@ pub const SPACE_4: f32 = 16.0;
 pub const SIDEBAR_MIN: f32 = 180.0;
 pub const SIDEBAR_MAX: f32 = 480.0;
 pub const RADIUS: f32 = 6.0;
+pub const RADIUS_SM: f32 = 4.0;
+pub const TAB_BAR_HEIGHT: f32 = 36.0;
+pub const STATUS_BAR_PAD_X: f32 = 12.0;
+pub const STATUS_BAR_PAD_Y: f32 = 4.0;

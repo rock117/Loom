@@ -390,6 +390,16 @@ impl ColorPalette {
     pub fn cursor(&self) -> Hsla {
         self.cursor
     }
+
+    /// RGB for OSC color replies when the term has no override at `index`.
+    pub fn rgb_at_index(&self, index: usize) -> Rgb {
+        let hsla = if index < self.extended_colors.len() {
+            self.extended_colors[index]
+        } else {
+            self.foreground
+        };
+        hsla_to_rgb(hsla)
+    }
 }
 
 /// Converts an RGB color to GPUI's Hsla color format.
@@ -440,6 +450,33 @@ fn rgb_to_hsla(rgb: Rgb) -> Hsla {
         s,
         l,
         a: 1.0, // Full opacity
+    }
+}
+
+fn hsla_to_rgb(hsla: Hsla) -> Rgb {
+    let h = hsla.h * 360.0;
+    let s = hsla.s;
+    let l = hsla.l;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = if h < 60.0 {
+        (c, x, 0.0)
+    } else if h < 120.0 {
+        (x, c, 0.0)
+    } else if h < 180.0 {
+        (0.0, c, x)
+    } else if h < 240.0 {
+        (0.0, x, c)
+    } else if h < 300.0 {
+        (x, 0.0, c)
+    } else {
+        (c, 0.0, x)
+    };
+    Rgb {
+        r: ((r + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        g: ((g + m) * 255.0).round().clamp(0.0, 255.0) as u8,
+        b: ((b + m) * 255.0).round().clamp(0.0, 255.0) as u8,
     }
 }
 

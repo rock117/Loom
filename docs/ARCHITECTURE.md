@@ -115,7 +115,8 @@ Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should no
 
 - [x] `terminal/gpui_emu` (alacritty grid + GPUI paint) with `PtyWrite` writeback.
 - [x] Tabs wired to in-house `TerminalView`; `gpui-terminal` dependency removed.
-- Polish: scrollback, selection, IME/paste, ColorRequest / TextAreaSizeRequest.
+- [x] Ordered reply writebacks: `PtyWrite`, `ColorRequest`, `TextAreaSizeRequest`, clipboard load/store; Ctrl+V / Shift+Insert paste.
+- Polish: scrollback, selection, IME.
 
 ### Phase 4 — Windows polish
 
@@ -178,6 +179,7 @@ Started on the GPUI tree (post Slint rollback):
 - [x] App quit: `Ctrl+Q`, `on_window_closed` → `cx.quit()` (Ctrl+C left for the shell)
 - [x] Root `WorkspaceView` no longer `track_focus` (avoids stealing terminal focus)
 - [x] In-house `terminal/gpui_emu` (adapted MIT gpui-terminal + `PtyWrite` fix); drop crates.io `gpui-terminal`
-- [ ] Full visual pass on sidebar/tabs using new spacing/radius tokens
-- [ ] Scrollback / selection / clipboard paste polish
+- [x] Theme spacing/radius tokens applied to sidebar, tab bar, terminal status chrome
+- [x] Terminal reply events + paste (`ColorRequest`, `TextAreaSizeRequest`, clipboard, Ctrl+V)
+- [ ] Scrollback / mouse selection polish
 - [ ] macOS / Linux runtime validation

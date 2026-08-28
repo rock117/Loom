@@ -85,7 +85,8 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 | License story | External MIT crate | MIT tree + attribution |
 
 **Consequences / follow-ups:**
-- Still thin vs Zed: implement or harden `ColorRequest`, `TextAreaSizeRequest`, clipboard load, scrollback, selection as needed  
+- Still thin vs Zed: scrollback, selection, IME as needed  
+- Reply-class events (`ColorRequest`, `TextAreaSizeRequest`, clipboard) are queued and drained **in order** after `process_bytes` (same channel as `PtyWrite`) so OSC/CSI replies do not reorder  
 - Upstream `gpui-terminal` fixes will not flow in automatically  
 - Revisit only if maintenance cost outweighs control (document here if reconsidered)
 

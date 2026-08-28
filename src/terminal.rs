@@ -7,4 +7,3 @@ pub mod gpui_emu;
 pub mod session;
 
 pub use gpui_emu::{ColorPalette, TerminalConfig, TerminalView};
-pub use session::TerminalSessionHandles;

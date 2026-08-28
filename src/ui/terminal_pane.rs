@@ -38,7 +38,7 @@ impl Render for TerminalPane {
                     .justify_center()
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(px(theme::SPACE_2))
                     .child(
                         div()
                             .text_lg()
@@ -68,11 +68,11 @@ impl Render for TerminalPane {
                                 .flex()
                                 .items_center()
                                 .justify_between()
-                                .px_3()
-                                .py_1()
+                                .px(px(theme::STATUS_BAR_PAD_X))
+                                .py(px(theme::STATUS_BAR_PAD_Y))
                                 .bg(theme::PANEL_BG)
                                 .border_b_1()
-                                .border_color(theme::BORDER)
+                                .border_color(theme::BORDER_SUBTLE)
                                 .child(
                                     div()
                                         .text_xs()
@@ -89,9 +89,9 @@ impl Render for TerminalPane {
                                         d.child(
                                             div()
                                                 .id("reconnect-btn")
-                                                .px_2()
-                                                .py_1()
-                                                .rounded(px(4.0))
+                                                .px(px(theme::SPACE_2))
+                                                .py(px(theme::SPACE_1))
+                                                .rounded(px(theme::RADIUS_SM))
                                                 .bg(theme::ACCENT)
                                                 .text_color(rgb(0xffffff))
                                                 .text_xs()
@@ -112,7 +112,7 @@ impl Render for TerminalPane {
                                 .into_any_element(),
                             None => div()
                                 .flex_1()
-                                .p_4()
+                                .p(px(theme::SPACE_4))
                                 .text_color(theme::TEXT_MUTED)
                                 .child(msg)
                                 .into_any_element(),

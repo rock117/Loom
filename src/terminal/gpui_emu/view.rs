@@ -455,13 +455,13 @@ impl TerminalView {
         // Clone event_tx for the reader task to send Exit event when PTY closes
         let exit_event_tx = event_tx.clone();
 
-        // Wrap stdin writer in Arc<Mutex> for thread-safe access (and PtyWrite writeback)
+        // Wrap stdin writer in Arc<Mutex> for thread-safe access
         let stdin_writer = Arc::new(parking_lot::Mutex::new(
             Box::new(stdin_writer) as Box<dyn Write + Send>
         ));
 
-        // Create event proxy for alacritty (PtyWrite writes synchronously to stdin)
-        let event_proxy = GpuiEventProxy::new(event_tx, stdin_writer.clone());
+        // Events are queued so reply writebacks stay ordered after process_bytes.
+        let event_proxy = GpuiEventProxy::new(event_tx);
 
         // Create terminal state
         let state = TerminalState::new(config.cols, config.rows, event_proxy);
@@ -498,6 +498,7 @@ impl TerminalView {
                         // Process bytes and notify the view
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
+                            view.dispatch_pending_events(None, cx);
                             cx.notify();
                         });
                         if result.is_err() {
@@ -715,7 +716,7 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -723,10 +724,19 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let paste = (mods.control && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"));
+        if paste {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                self.paste_text(&text);
+            }
+            return;
+        }
+
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
-            let mut writer = self.stdin_writer.lock();
-            let _ = writer.write_all(&bytes);
-            let _ = writer.flush();
+            self.write_to_pty(&bytes);
         }
     }
 
@@ -793,41 +803,96 @@ impl TerminalView {
 
     /// Process pending terminal events.
     ///
-    /// This method drains all available events from the event receiver
-    /// and handles them appropriately. Note: bytes are processed in the
-    /// async reader task, not here.
+    /// Called after `process_bytes` (no window) and again during render (with window)
+    /// so reply writebacks stay ordered and UI callbacks still run.
     fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Process terminal events (from alacritty event proxy)
+        self.dispatch_pending_events(Some(window), cx);
+    }
+
+    fn dispatch_pending_events(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                TerminalEvent::Wakeup => {
-                    // Terminal has new content - already handled by async task
-                }
+                TerminalEvent::Wakeup => {}
                 TerminalEvent::Bell => {
-                    if let Some(ref callback) = self.bell_callback {
-                        callback(window, cx);
+                    if let Some(callback) = self.bell_callback.as_ref() {
+                        if let Some(window) = window.as_mut() {
+                            callback(window, cx);
+                        }
                     }
                 }
                 TerminalEvent::Title(title) => {
-                    if let Some(ref callback) = self.title_callback {
-                        callback(window, cx, &title);
+                    if let Some(callback) = self.title_callback.as_ref() {
+                        if let Some(window) = window.as_mut() {
+                            callback(window, cx, &title);
+                        }
                     }
                 }
                 TerminalEvent::ClipboardStore(text) => {
-                    if let Some(ref callback) = self.clipboard_store_callback {
-                        callback(window, cx, &text);
+                    if let Some(callback) = self.clipboard_store_callback.as_ref() {
+                        if let Some(window) = window.as_mut() {
+                            callback(window, cx, &text);
+                        }
+                    } else {
+                        cx.write_to_clipboard(ClipboardItem::new_string(text));
                     }
                 }
-                TerminalEvent::ClipboardLoad => {
-                    // Terminal wants to load data from clipboard
-                    // TODO: Implement clipboard integration
+                TerminalEvent::ClipboardLoad(format) => {
+                    let payload = match cx.read_from_clipboard().and_then(|item| item.text()) {
+                        Some(text) => format(&text),
+                        None => format(""),
+                    };
+                    self.write_to_pty(payload.as_bytes());
+                }
+                TerminalEvent::PtyWrite(data) => {
+                    self.write_to_pty(data.as_bytes());
+                }
+                TerminalEvent::ColorRequest(index, format) => {
+                    let color = self
+                        .state
+                        .with_term(|term| term.colors()[index])
+                        .unwrap_or_else(|| self.config.colors.rgb_at_index(index));
+                    self.write_to_pty(format(color).as_bytes());
+                }
+                TerminalEvent::TextAreaSizeRequest(format) => {
+                    let font_px: f32 = self.config.font_size.into();
+                    let cell_h = font_px * self.config.line_height_multiplier;
+                    let cell_w = font_px * 0.6;
+                    let size = alacritty_terminal::event::WindowSize {
+                        num_lines: self.state.rows() as u16,
+                        num_cols: self.state.cols() as u16,
+                        cell_width: cell_w.max(1.0) as u16,
+                        cell_height: cell_h.max(1.0) as u16,
+                    };
+                    self.write_to_pty(format(size).as_bytes());
                 }
                 TerminalEvent::Exit => {
-                    if let Some(ref callback) = self.exit_callback {
-                        callback(window, cx);
+                    if let Some(callback) = self.exit_callback.as_ref() {
+                        if let Some(window) = window.as_mut() {
+                            callback(window, cx);
+                        }
                     }
                 }
             }
+        }
+    }
+
+    fn write_to_pty(&self, bytes: &[u8]) {
+        let mut writer = self.stdin_writer.lock();
+        let _ = writer.write_all(bytes);
+        let _ = writer.flush();
+    }
+
+    fn paste_text(&mut self, text: &str) {
+        use alacritty_terminal::term::TermMode;
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
+            let mut buf = Vec::with_capacity(normalized.len() + 16);
+            buf.extend_from_slice(b"\x1b[200~");
+            buf.extend(normalized.bytes().filter(|&b| b != 0x1b));
+            buf.extend_from_slice(b"\x1b[201~");
+            self.write_to_pty(&buf);
+        } else {
+            self.write_to_pty(normalized.as_bytes());
         }
     }
 
