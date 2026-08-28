@@ -181,5 +181,6 @@ Started on the GPUI tree (post Slint rollback):
 - [x] In-house `terminal/gpui_emu` (adapted MIT gpui-terminal + `PtyWrite` fix); drop crates.io `gpui-terminal`
 - [x] Theme spacing/radius tokens applied to sidebar, tab bar, terminal status chrome
 - [x] Terminal reply events + paste (`ColorRequest`, `TextAreaSizeRequest`, clipboard, Ctrl+V)
-- [ ] Scrollback / mouse selection polish
+- [x] Mouse selection + auto-copy on release; Ctrl+C copies when selected; right-click paste
+- [ ] Scrollback polish
 - [ ] macOS / Linux runtime validation

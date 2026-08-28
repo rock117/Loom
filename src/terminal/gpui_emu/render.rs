@@ -481,6 +481,14 @@ impl TerminalRenderer {
             y: bounds.origin.y + padding.top,
         };
 
+        let selection_range = term.selection.as_ref().and_then(|s| s.to_range(term));
+        let selection_bg = Hsla {
+            h: 0.58,
+            s: 0.40,
+            l: 0.32,
+            a: 1.0,
+        };
+
         // Iterate over visible lines
         for line_idx in 0..num_lines {
             let line = Line(line_idx as i32);
@@ -523,6 +531,58 @@ impl TerminalRenderer {
                     transparent_black(),
                     Default::default(),
                 ));
+            }
+
+            // Selection highlight (over cell backgrounds, under glyphs)
+            if let Some(range) = selection_range {
+                let mut sel_start = None;
+                let mut sel_end = None;
+                for col_idx in 0..num_cols {
+                    let point = AlacPoint::new(line, Column(col_idx));
+                    if range.contains(point) {
+                        if sel_start.is_none() {
+                            sel_start = Some(col_idx);
+                        }
+                        sel_end = Some(col_idx + 1);
+                    } else if let (Some(start), Some(end)) = (sel_start.take(), sel_end.take()) {
+                        let x = origin.x + self.cell_width * (start as f32);
+                        let y = origin.y + self.cell_height * (line_idx as f32);
+                        let width = self.cell_width * ((end - start) as f32);
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point { x, y },
+                                size: Size {
+                                    width,
+                                    height: self.cell_height,
+                                },
+                            },
+                            px(0.0),
+                            selection_bg,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
+                if let (Some(start), Some(end)) = (sel_start, sel_end) {
+                    let x = origin.x + self.cell_width * (start as f32);
+                    let y = origin.y + self.cell_height * (line_idx as f32);
+                    let width = self.cell_width * ((end - start) as f32);
+                    window.paint_quad(quad(
+                        Bounds {
+                            origin: Point { x, y },
+                            size: Size {
+                                width,
+                                height: self.cell_height,
+                            },
+                        },
+                        px(0.0),
+                        selection_bg,
+                        Edges::<Pixels>::default(),
+                        transparent_black(),
+                        Default::default(),
+                    ));
+                }
             }
 
             // Calculate vertical offset to center text in cell

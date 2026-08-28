@@ -360,6 +360,12 @@ impl TerminalState {
         self.rows
     }
 
+    /// Sync stored dimensions after the underlying `Term` was resized elsewhere.
+    pub fn set_dimensions(&mut self, cols: usize, rows: usize) {
+        self.cols = cols;
+        self.rows = rows;
+    }
+
     /// Get a cloned reference to the underlying terminal Arc.
     ///
     /// This allows sharing the terminal state across multiple threads or components.

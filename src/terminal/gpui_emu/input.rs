@@ -189,6 +189,11 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     if keystroke.modifiers.control {
         let key = keystroke.key.as_str();
 
+        // Paste is handled by TerminalView (Ctrl+V / Ctrl+Shift+V); do not emit SYN (0x16).
+        if key.eq_ignore_ascii_case("v") {
+            return None;
+        }
+
         // Ctrl+A through Ctrl+Z map to 0x01 through 0x1a
         if key.len() == 1 {
             let ch = key.chars().next().unwrap();

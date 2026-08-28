@@ -411,6 +411,12 @@ pub struct TerminalView {
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+
+    /// True while the left button is dragging a selection.
+    selecting: bool,
+
+    /// Last painted terminal bounds (window space) for hit-testing.
+    last_bounds: Bounds<Pixels>,
 }
 
 impl TerminalView {
@@ -533,6 +539,8 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            selecting: false,
+            last_bounds: Bounds::default(),
         }
     }
 
@@ -724,19 +732,46 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
+        if self.is_paste_keystroke(&event.keystroke) {
+            self.paste_from_clipboard(cx);
+            return;
+        }
+
+        // With an active selection, Ctrl+C copies (Windows Terminal style) instead of SIGINT.
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
-        let paste = (mods.control && key.eq_ignore_ascii_case("v"))
-            || (mods.shift && key.eq_ignore_ascii_case("insert"));
-        if paste {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                self.paste_text(&text);
-            }
+        if mods.control
+            && !mods.alt
+            && key.eq_ignore_ascii_case("c")
+            && self.copy_selection_to_clipboard(cx)
+        {
+            return;
+        }
+        // Ctrl+Shift+C always copies when possible.
+        if mods.control && mods.shift && key.eq_ignore_ascii_case("c") {
+            self.copy_selection_to_clipboard(cx);
             return;
         }
 
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            self.state.with_term_mut(|term| term.selection = None);
             self.write_to_pty(&bytes);
+        }
+    }
+
+    fn is_paste_keystroke(&self, keystroke: &Keystroke) -> bool {
+        let key = keystroke.key.as_str();
+        let mods = &keystroke.modifiers;
+        // Windows Terminal-style: Ctrl+Shift+V; also Ctrl+V and Shift+Insert.
+        (mods.control && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"))
+    }
+
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            if !text.is_empty() {
+                self.paste_text(&text);
+            }
         }
     }
 
@@ -745,46 +780,131 @@ impl TerminalView {
     /// Currently a placeholder for future mouse selection and interaction support.
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
         cx.notify();
 
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
+        if event.button == MouseButton::Right {
+            self.paste_from_clipboard(cx);
+            return;
+        }
+
+        if event.button != MouseButton::Left {
+            return;
+        }
+
+        let Some((point, side)) = self.cell_at(event.position) else {
+            return;
+        };
+
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        self.selecting = true;
+        self.state.with_term_mut(|term| {
+            term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+        });
+        cx.notify();
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
     fn on_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
+        event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+
+        if let Some((point, side)) = self.cell_at(event.position) {
+            self.state.with_term_mut(|term| {
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.update(point, side);
+                    selection.include_all();
+                }
+            });
+        } else {
+            self.state.with_term_mut(|term| {
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.include_all();
+                }
+            });
+        }
+
+        // Auto-copy on select (Windows console style).
+        self.copy_selection_to_clipboard(cx);
+        cx.notify();
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        if !self.selecting {
+            return;
+        }
+        let Some((point, side)) = self.cell_at(event.position) else {
+            return;
+        };
+        self.state.with_term_mut(|term| {
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, side);
+            }
+        });
+        cx.notify();
+    }
+
+    fn cell_at(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)> {
+        use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+
+        let cell_w: f32 = self.renderer.cell_width.into();
+        let cell_h: f32 = self.renderer.cell_height.into();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+
+        let origin_x = self.last_bounds.origin.x + self.config.padding.left;
+        let origin_y = self.last_bounds.origin.y + self.config.padding.top;
+        let rel_x: f32 = (position.x - origin_x).into();
+        let rel_y: f32 = (position.y - origin_y).into();
+        if rel_x < 0.0 || rel_y < 0.0 {
+            return None;
+        }
+
+        let (cols, rows) = (self.state.cols().max(1), self.state.rows().max(1));
+        let col = ((rel_x / cell_w) as usize).min(cols.saturating_sub(1));
+        let row = ((rel_y / cell_h) as usize).min(rows.saturating_sub(1));
+        let side = if (rel_x % cell_w) < cell_w * 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+
+        // Match the viewport Line indices used by TerminalRenderer::paint.
+        Some((AlacPoint::new(Line(row as i32), Column(col)), side))
+    }
+
+    fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let text = self
+            .state
+            .with_term(|term| term.selection_to_string())
+            .filter(|s| !s.is_empty());
+        let Some(text) = text else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
     }
 
     /// Handle scroll events.
@@ -982,9 +1102,10 @@ impl Render for TerminalView {
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
-        let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
+        let view = cx.entity();
+        let view_paint = view.clone();
 
         div()
             .size_full()
@@ -992,18 +1113,23 @@ impl Render for TerminalView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
                 canvas(
-                    move |bounds, _window, _cx| bounds,
+                    move |bounds, window, cx| {
+                        view.update(cx, |this, _cx| {
+                            this.renderer.measure_cell(window);
+                            this.last_bounds = bounds;
+                        });
+                        bounds
+                    },
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
 
-                        // Measure actual cell dimensions from the font
-                        let mut measured_renderer = renderer.clone();
-                        measured_renderer.measure_cell(window);
+                        let measured_renderer = view_paint.read(cx).renderer.clone();
 
                         // Calculate available space after padding
                         let available_width: f32 =
@@ -1016,7 +1142,6 @@ impl Render for TerminalView {
                         let cols = ((available_width / cell_width_f32) as usize).max(1);
                         let rows = ((available_height / cell_height_f32) as usize).max(1);
 
-                        // Helper struct implementing Dimensions for resize
                         struct TermSize {
                             cols: usize,
                             rows: usize,
@@ -1042,19 +1167,22 @@ impl Render for TerminalView {
                             }
                         }
 
-                        // Resize terminal if dimensions changed
                         let mut term = state_arc.lock();
                         let current_cols = term.columns();
                         let current_rows = term.screen_lines();
                         if cols != current_cols || rows != current_rows {
-                            // Notify the PTY about the resize
                             if let Some(ref callback) = resize_callback {
                                 callback(cols, rows);
                             }
                             term.resize(TermSize { cols, rows });
+                            // Keep TerminalState.cols/rows aligned for hit-testing.
+                            drop(term);
+                            view_paint.update(cx, |this, _| {
+                                this.state.set_dimensions(cols, rows);
+                            });
+                            term = state_arc.lock();
                         }
 
-                        // Paint the terminal with measured dimensions
                         measured_renderer.paint(bounds, padding, &term, window, cx);
                     },
                 )
