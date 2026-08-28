@@ -92,7 +92,7 @@ Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should no
 
 - Prefer **GPUI text system** painting of the cell grid (Zed-style path).
 - Avoid long-term reliance on CPU bitmap → `Image` stretch (blurry on HiDPI).
-- Treat `gpui-terminal` as transitional; replace with in-house `TerminalElement` when ready.
+- In-house terminal (`terminal/gpui_emu`) paints via GPUI `text_system`; always handle `Event::PtyWrite`.
 - Multi-tab: each tab owns a session; closing a tab must not block the UI thread (careful kill / drop order for ConPTY on Windows).
 - App shortcuts (`Ctrl+T` / `Ctrl+W` / `Ctrl+Q`, …) must not steal shell chords such as `Ctrl+C`.
 
@@ -111,9 +111,9 @@ Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should no
 
 ### Phase 3 — In-house terminal pipeline
 
-- `terminal/session` + grid + `PtyWrite` handling.
-- `TerminalElement` paint via `text_system`.
-- Wire tabs to the new view; retire `gpui-terminal` when parity is enough.
+- [x] `terminal/gpui_emu` (alacritty grid + GPUI paint) with `PtyWrite` writeback.
+- [x] Tabs wired to in-house `TerminalView`; `gpui-terminal` dependency removed.
+- Polish: scrollback, selection, IME/paste, ColorRequest / TextAreaSizeRequest.
 
 ### Phase 4 — Windows polish
 
@@ -143,7 +143,7 @@ Keep:
 
 Evolve:
 
-- `ui/terminal_pane.rs` + `gpui-terminal` → custom `terminal_view` / `terminal_element`
+- `ui/terminal_pane.rs` + in-house `terminal/gpui_emu` (further `TerminalElement` polish)
 - `shared/theme.rs` → richer tokens
 - Add `platform/` and first-class `terminal/` modules
 
@@ -175,7 +175,7 @@ Started on the GPUI tree (post Slint rollback):
 - [x] PTY spawn keeps child killer; default cwd; background teardown on tab close / `TabManager` drop
 - [x] App quit: `Ctrl+Q`, `on_window_closed` → `cx.quit()` (Ctrl+C left for the shell)
 - [x] Root `WorkspaceView` no longer `track_focus` (avoids stealing terminal focus)
-- [x] `terminal/` scaffold (`input`, `session` handles) for the future GPUI `TerminalElement` path
-- [ ] Replace `gpui-terminal` with in-house grid paint via GPUI `text_system`
+- [x] In-house `terminal/gpui_emu` (adapted MIT gpui-terminal + `PtyWrite` fix); drop crates.io `gpui-terminal`
 - [ ] Full visual pass on sidebar/tabs using new spacing/radius tokens
+- [ ] Scrollback / selection / clipboard paste polish
 - [ ] macOS / Linux runtime validation

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::*;
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use crate::terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::ChildKiller;
 use uuid::Uuid;
 

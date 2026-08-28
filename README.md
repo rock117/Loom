@@ -9,7 +9,7 @@ A desktop terminal client built with [GPUI](https://gpui.rs): local shell and SS
 - **Profiles**: create, rename, duplicate, move between groups, delete
 - **Groups**: create, rename, delete; workspace auto-saves to disk
 - **Sessions**: open from a profile, duplicate tab, reconnect when disconnected
-- **Local shell** (priority): via `portable-pty` + `gpui-terminal` (Windows: pwsh / PowerShell / cmd)
+- **Local shell** (priority): via `portable-pty` + in-house alacritty/GPUI terminal (Windows: pwsh / PowerShell / cmd)
 - **SSH** (later): planned via `russh`; not in the current implementation focus
 
 ## Layout

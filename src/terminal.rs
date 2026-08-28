@@ -1,12 +1,10 @@
-//! Terminal subsystem scaffold (Zed-inspired pipeline; implementation grows over time).
+//! Terminal subsystem: alacritty grid + GPUI paint (MIT path; not Zed GPL).
 //!
-//! Target flow:
-//!   PTY bytes → VT grid → GPUI TerminalElement paint → keystrokes → PTY write
-//!
-//! Today tabs still use `gpui-terminal` for rendering; session helpers here own
-//! PTY lifecycle improvements shared with that path.
+//! Adapted from gpui-terminal (MIT OR Apache-2.0) with Loom PTY lifecycle and
+//! `PtyWrite` writeback so shells that query cursor position (e.g. PowerShell) do not stall.
 
-pub mod input;
+pub mod gpui_emu;
 pub mod session;
 
+pub use gpui_emu::{ColorPalette, TerminalConfig, TerminalView};
 pub use session::TerminalSessionHandles;
