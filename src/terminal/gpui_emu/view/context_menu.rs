@@ -26,6 +26,10 @@ impl TerminalView {
         cx.notify();
     }
 
+    pub fn working_directory(&self) -> Option<PathBuf> {
+        self.working_directory.clone()
+    }
+
     /// Prefer live process cwd (local), else keep OSC / spawn cwd.
     pub(super) fn refresh_working_directory(&mut self) {
         if let Some(pid) = self.shell_pid {

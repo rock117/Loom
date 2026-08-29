@@ -27,6 +27,8 @@ actions!(
         ToggleSettings,
         /// Show or hide the profiles sidebar (Zed project-panel toggle).
         ToggleSidebar,
+        /// Show or hide the right context panel (snippets / files / info).
+        ToggleContextPanel,
         /// Export workspace JSON via file dialog.
         ExportWorkspace,
         /// Import workspace JSON (replaces current).

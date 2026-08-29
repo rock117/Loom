@@ -18,6 +18,10 @@ pub fn settings_path() -> PathBuf {
     loom_dir().join("settings.json")
 }
 
+pub fn snippets_path() -> PathBuf {
+    loom_dir().join("snippets.json")
+}
+
 pub fn known_hosts_path() -> PathBuf {
     loom_dir().join("known_hosts.json")
 }

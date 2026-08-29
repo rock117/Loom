@@ -42,6 +42,8 @@ pub struct SshSessionHandles {
     pub resize: Arc<dyn Fn(usize, usize) + Send + Sync>,
     /// Drop or send to request disconnect (best-effort).
     pub shutdown: Sender<()>,
+    /// Same-session SFTP (opens subsystem channel on first use).
+    pub sftp: crate::session::sftp::SftpHandle,
 }
 
 struct ChannelReader {
@@ -93,7 +95,7 @@ impl Write for ChannelWriter {
     }
 }
 
-struct ClientHandler {
+pub(crate) struct ClientHandler {
     host: String,
     port: u16,
 }
@@ -123,6 +125,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let (resize_tx, resize_rx) = flume::unbounded::<(u32, u32)>();
     let (shutdown_tx, shutdown_rx) = flume::bounded::<()>(1);
     let (ready_tx, ready_rx) = flume::bounded::<Result<()>>(1);
+    let (sftp_handle, sftp_rx) = crate::session::sftp::channel_pair();
 
     let host = params.host.clone();
     let port = params.port;
@@ -158,6 +161,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                     stdout_tx.clone(),
                     resize_rx,
                     shutdown_rx,
+                    sftp_rx,
                     &ready_tx,
                 )
                 .await
@@ -193,6 +197,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
         writer: Box::new(ChannelWriter { tx: stdin_tx }),
         resize,
         shutdown: shutdown_tx,
+        sftp: sftp_handle,
     })
 }
 
@@ -207,6 +212,7 @@ async fn run_session(
     stdout_tx: Sender<Vec<u8>>,
     resize_rx: Receiver<(u32, u32)>,
     shutdown_rx: Receiver<()>,
+    sftp_rx: Receiver<crate::session::sftp::SftpRequest>,
     ready_tx: &Sender<Result<()>>,
 ) -> Result<()> {
     let config = Arc::new(client::Config {
@@ -241,6 +247,13 @@ async fn run_session(
         .request_shell(true)
         .await
         .context("request shell")?;
+
+    // Share Handle via Arc so SFTP can open another channel while the shell runs.
+    let session = Arc::new(session);
+    tokio::spawn(crate::session::sftp::run_sftp_worker(
+        Arc::clone(&session),
+        sftp_rx,
+    ));
 
     if ready_tx.send(Ok(())).is_err() {
         return Ok(());

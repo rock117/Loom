@@ -103,6 +103,12 @@ pub struct UiStateFile {
     /// When false, the profiles sidebar is hidden (Zed-style toggle).
     #[serde(default = "default_sidebar_visible")]
     pub sidebar_visible: bool,
+    /// Right context panel width (snippets / files / info).
+    #[serde(default = "default_context_panel_width")]
+    pub context_panel_width: f32,
+    /// When false, the context panel is hidden.
+    #[serde(default = "default_context_panel_visible")]
+    pub context_panel_visible: bool,
     pub font_size: f32,
     pub open_tabs: Vec<OpenTabRef>,
     pub active_tab_index: usize,
@@ -112,12 +118,22 @@ fn default_sidebar_visible() -> bool {
     true
 }
 
+fn default_context_panel_width() -> f32 {
+    280.0
+}
+
+fn default_context_panel_visible() -> bool {
+    false
+}
+
 impl Default for UiStateFile {
     fn default() -> Self {
         Self {
             version: 1,
             sidebar_width: 240.0,
             sidebar_visible: true,
+            context_panel_width: 280.0,
+            context_panel_visible: false,
             font_size: 14.0,
             open_tabs: Vec::new(),
             active_tab_index: 0,

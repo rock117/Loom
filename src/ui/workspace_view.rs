@@ -4,6 +4,7 @@ use gpui::*;
 use crate::model::{export_workspace_to, import_workspace_from};
 use crate::shared::actions::*;
 use crate::shared::theme;
+use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
 use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
 use crate::ui::settings::{SettingsEvent, SettingsPanel};
 use crate::ui::sidebar::{Sidebar, SidebarEvent};
@@ -14,6 +15,11 @@ use crate::ui::tab_manager::TabManager;
 use crate::ui::terminal_pane::TerminalPane;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
+struct ContextResizeDrag {
+    start_x: f32,
+    start_width: f32,
+}
+
 pub struct WorkspaceView {
     focus_handle: FocusHandle,
     store: Entity<WorkspaceStore>,
@@ -21,6 +27,7 @@ pub struct WorkspaceView {
     sidebar: Entity<Sidebar>,
     tab_bar: Entity<TabBar>,
     terminal_pane: Entity<TerminalPane>,
+    context_panel: Entity<ContextPanel>,
     status_bar: Entity<StatusBar>,
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
@@ -28,6 +35,9 @@ pub struct WorkspaceView {
     sidebar_width: f32,
     sidebar_visible: bool,
     resizing_sidebar: bool,
+    context_panel_width: f32,
+    context_panel_visible: bool,
+    context_resize: Option<ContextResizeDrag>,
     show_settings: bool,
     show_ssh_form: bool,
     restore_profiles: Vec<uuid::Uuid>,
@@ -46,6 +56,12 @@ impl WorkspaceView {
             .sidebar_width
             .clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX);
         let sidebar_visible = store.read(cx).ui_state.sidebar_visible;
+        let context_panel_width = store
+            .read(cx)
+            .ui_state
+            .context_panel_width
+            .clamp(theme::CONTEXT_PANEL_MIN, theme::CONTEXT_PANEL_MAX);
+        let context_panel_visible = store.read(cx).ui_state.context_panel_visible;
         let restore_profiles: Vec<uuid::Uuid> = store
             .read(cx)
             .ui_state
@@ -59,6 +75,7 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
+        let context_panel = cx.new(|cx| ContextPanel::new(store.clone(), tabs.clone(), cx));
         let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
@@ -70,6 +87,7 @@ impl WorkspaceView {
             sidebar: sidebar.clone(),
             tab_bar: tab_bar.clone(),
             terminal_pane: terminal_pane.clone(),
+            context_panel: context_panel.clone(),
             status_bar: status_bar.clone(),
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
@@ -77,6 +95,9 @@ impl WorkspaceView {
             sidebar_width,
             sidebar_visible,
             resizing_sidebar: false,
+            context_panel_width,
+            context_panel_visible,
+            context_resize: None,
             show_settings: false,
             show_ssh_form: false,
             restore_profiles,
@@ -212,6 +233,19 @@ impl WorkspaceView {
                 }
                 StatusBarEvent::ToggleSidebar => {
                     this.toggle_sidebar(window, cx);
+                }
+                StatusBarEvent::ToggleContextPanel => {
+                    this.toggle_context_panel(cx);
+                }
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
+            &context_panel,
+            window,
+            |this, _, event, _window, cx| match event {
+                ContextPanelEvent::None => {
+                    let _ = cx;
                 }
             },
         ));
@@ -379,6 +413,8 @@ impl WorkspaceView {
     fn persist_tabs(&mut self, cx: &mut Context<Self>) {
         let sidebar_width = self.sidebar_width;
         let sidebar_visible = self.sidebar_visible;
+        let context_panel_width = self.context_panel_width;
+        let context_panel_visible = self.context_panel_visible;
         let (tabs, active, font_size) = {
             let manager = self.tabs.read(cx);
             let (tabs, active) = manager.snapshot_for_persist();
@@ -387,6 +423,8 @@ impl WorkspaceView {
         self.store.update(cx, |s, _cx| {
             s.ui_state.sidebar_width = sidebar_width;
             s.ui_state.sidebar_visible = sidebar_visible;
+            s.ui_state.context_panel_width = context_panel_width;
+            s.ui_state.context_panel_visible = context_panel_visible;
             s.ui_state.font_size = font_size;
             s.settings.font_size = font_size;
             s.sync_open_tabs(&tabs, active);
@@ -413,6 +451,17 @@ impl WorkspaceView {
         {
             term.read(cx).focus_handle().focus(window);
         }
+        cx.notify();
+    }
+
+    fn toggle_context_panel(&mut self, cx: &mut Context<Self>) {
+        self.context_panel_visible = !self.context_panel_visible;
+        let visible = self.context_panel_visible;
+        self.store.update(cx, |s, cx| {
+            s.ui_state.context_panel_visible = visible;
+            s.persist_now();
+            cx.notify();
+        });
         cx.notify();
     }
 
@@ -626,6 +675,9 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
                 this.toggle_sidebar(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &ToggleContextPanel, _, cx| {
+                this.toggle_context_panel(cx);
+            }))
             .on_action(cx.listener(|this, _: &ExportWorkspace, _, cx| {
                 this.export_workspace(cx);
             }))
@@ -672,8 +724,15 @@ impl Render for WorkspaceView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    let mut changed = false;
                     if this.resizing_sidebar {
                         this.resizing_sidebar = false;
+                        changed = true;
+                    }
+                    if this.context_resize.take().is_some() {
+                        changed = true;
+                    }
+                    if changed {
                         this.persist_tabs(cx);
                         cx.notify();
                     }
@@ -686,6 +745,13 @@ impl Render for WorkspaceView {
                         .x
                         .clamp(px(theme::SIDEBAR_MIN), px(theme::SIDEBAR_MAX))
                         .into();
+                    cx.notify();
+                }
+                if let Some(drag) = this.context_resize.as_ref() {
+                    let x: f32 = event.position.x.into();
+                    let dx = drag.start_x - x;
+                    this.context_panel_width = (drag.start_width + dx)
+                        .clamp(theme::CONTEXT_PANEL_MIN, theme::CONTEXT_PANEL_MAX);
                     cx.notify();
                 }
             }))
@@ -732,7 +798,33 @@ impl Render for WorkspaceView {
                                     .min_h_0()
                                     .child(self.terminal_pane.clone()),
                             ),
-                    ),
+                    )
+                    .when(self.context_panel_visible, |d| {
+                        d.child(
+                            div()
+                                .id("context-resizer")
+                                .w(px(4.0))
+                                .h_full()
+                                .cursor(CursorStyle::ResizeColumn)
+                                .hover(|s| s.bg(theme::ACCENT))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        this.context_resize = Some(ContextResizeDrag {
+                                            start_x: event.position.x.into(),
+                                            start_width: this.context_panel_width,
+                                        });
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(self.context_panel_width))
+                                .h_full()
+                                .child(self.context_panel.clone()),
+                        )
+                    }),
             )
             .child(self.status_bar.clone())
             .when(self.show_settings, |d| d.child(self.settings.clone()))

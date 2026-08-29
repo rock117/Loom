@@ -6,6 +6,7 @@ It is a design guide, not a license to copy Zed source. Do not paste Zed crates 
 
 For **why we chose X over Y**, see [DECISIONS.md](./DECISIONS.md).  
 For **non-obvious GPUI/platform pitfalls** (including UI-thread freeze / deadlock checklist), see [HARD_PROBLEMS.md](./HARD_PROBLEMS.md).  
+For **three-column context panel** (Files/SFTP + Info), see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals
@@ -14,7 +15,7 @@ For **low-priority icebox features** (do not build unless explicitly ordered), s
 |------|---------|
 | UI quality | Visual rhythm close to Zed (spacing, contrast, typography, restrained chrome) |
 | Terminal feel | Snappy input/output like Zed’s terminal (GPU text, not a soft CPU bitmap) |
-| Product shape | Postman-style client: left **profiles/groups**, right **multi-tab shells** |
+| Product shape | Postman-style client: left **profiles/groups**, center **multi-tab shells**, optional right **context panel** |
 | Commercial-friendly | Keep **MIT**; study Zed, do not vendor its GPL code |
 | Portability | Windows implementation first; `platform` traits ready for macOS / Linux |
 
@@ -26,7 +27,7 @@ Non-goals for this phase: becoming a mini-IDE, embedding Zed’s `project_panel`
 |-------------|------------------|
 | `terminal` — PTY + VT grid | `src/terminal/` — `alacritty_terminal` + `portable-pty` |
 | `terminal_view` — GPUI element paints cells | `TerminalView` + `TerminalElement` via GPUI `text_system` |
-| `workspace` + panels | Lightweight `WorkspaceView`: sidebar + tabs + terminal |
+| `workspace` + panels | Lightweight `WorkspaceView`: sidebar + tabs + terminal + context panel |
 | `ui` + `theme` | Own `theme` tokens + small widgets (list row, button) |
 | Platform crates (`gpui_windows`, …) | `src/platform/` — traits + `windows` impl, macOS/Linux stubs |
 
@@ -188,4 +189,5 @@ Started on the GPUI tree (post Slint rollback):
 - [x] Scrollback wheel + overlay scrollbar; Ctrl+F find over scrollback/grid
 - [x] Optional line-number gutter (Settings toggle; 1 = oldest scrollback line)
 - [x] Zed-style pane splits (binary tree, sash resize, Ctrl+W closes focused pane)
+- [x] Context panel (right column): SFTP Files browser + Info — see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md)
 - [ ] macOS / Linux runtime validation

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use super::snippets::SnippetsFile;
 use super::workspace::{SettingsFile, UiStateFile, WorkspaceFile};
 use crate::shared::paths;
 
@@ -66,6 +67,17 @@ pub fn load_settings() -> SettingsFile {
 
 pub fn save_settings(settings: &SettingsFile) -> Result<()> {
     write_json(&paths::settings_path(), settings)
+}
+
+pub fn load_snippets() -> SnippetsFile {
+    read_json(&paths::snippets_path())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn save_snippets(file: &SnippetsFile) -> Result<()> {
+    write_json(&paths::snippets_path(), file)
 }
 
 pub fn export_workspace_to(path: &PathBuf, ws: &WorkspaceFile) -> Result<()> {

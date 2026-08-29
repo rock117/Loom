@@ -27,6 +27,8 @@ pub enum StatusBarEvent {
     EditSshProfile(Uuid),
     /// Toggle profiles sidebar visibility (Zed left-dock).
     ToggleSidebar,
+    /// Toggle right context panel visibility.
+    ToggleContextPanel,
 }
 
 impl StatusBar {
@@ -136,6 +138,7 @@ impl Render for StatusBar {
         let manager = self.tabs.read(cx);
         let font_size = manager.font_size;
         let sidebar_visible = self.store.read(cx).ui_state.sidebar_visible;
+        let context_visible = self.store.read(cx).ui_state.context_panel_visible;
         let active = manager
             .active
             .and_then(|id| manager.tabs.iter().find(|t| t.id == id));
@@ -397,7 +400,35 @@ impl Render for StatusBar {
                                     .text_color(theme::TEXT_MUTED)
                                     .child(format!("{font_size:.0}")),
                             ),
-                    )),
+                    ))
+                    .child({
+                        use crate::ui::tooltip::Tooltip;
+                        div()
+                            .id("sb-context")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h_full()
+                            .px(px(theme::SPACE_2))
+                            .rounded(px(theme::RADIUS_SM))
+                            .cursor_pointer()
+                            .when(context_visible, |d| d.bg(theme::HOVER))
+                            .hover(|s| s.bg(theme::HOVER))
+                            .tooltip(|_, cx| {
+                                Tooltip::with_key("Toggle Context Panel", "Ctrl+Shift+B", cx)
+                            })
+                            .child(Self::svg(
+                                "icons/ui/panel-right.svg",
+                                if context_visible {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_MUTED
+                                },
+                            ))
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(StatusBarEvent::ToggleContextPanel);
+                            }))
+                    }),
             )
     }
 }

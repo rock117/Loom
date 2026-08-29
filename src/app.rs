@@ -18,6 +18,7 @@ pub fn run() {
             KeyBinding::new("ctrl-s", SaveWorkspace, Some("Loom")),
             KeyBinding::new("ctrl-,", ToggleSettings, Some("Loom")),
             KeyBinding::new("ctrl-b", ToggleSidebar, Some("Loom")),
+            KeyBinding::new("ctrl-shift-b", ToggleContextPanel, Some("Loom")),
             KeyBinding::new("ctrl-e", ExportWorkspace, Some("Loom")),
             KeyBinding::new("ctrl-shift-i", ImportWorkspace, Some("Loom")),
             KeyBinding::new("ctrl-=", ZoomIn, Some("Loom")),

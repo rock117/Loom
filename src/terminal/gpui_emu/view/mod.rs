@@ -1376,7 +1376,8 @@ impl TerminalView {
         let _ = writer.flush();
     }
 
-    fn paste_text(&mut self, text: &str) {
+    /// Insert text into the PTY (uses bracketed paste when the shell enables it).
+    pub fn paste_text(&mut self, text: &str) {
         use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::term::TermMode;
         self.state

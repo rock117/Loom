@@ -26,6 +26,8 @@ pub struct PaneSession {
     pub pty_master: Option<Arc<parking_lot::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub pty_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     pub ssh_shutdown: Option<flume::Sender<()>>,
+    /// Same-session SFTP handle (SSH panes only).
+    pub ssh_sftp: Option<crate::session::sftp::SftpHandle>,
     _term_subscriptions: Vec<Subscription>,
 }
 
@@ -165,6 +167,7 @@ impl TabManager {
             pty_master: None,
             pty_killer: None,
             ssh_shutdown: None,
+            ssh_sftp: None,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(profile.name.clone(), pane);
@@ -198,6 +201,7 @@ impl TabManager {
             pty_master: None,
             pty_killer: None,
             ssh_shutdown: None,
+            ssh_sftp: None,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(profile.name.clone(), pane);
@@ -271,6 +275,7 @@ impl TabManager {
                         pane.terminal = Some(terminal);
                         pane._term_subscriptions = term_subs;
                         pane.ssh_shutdown = Some(handles.shutdown);
+                        pane.ssh_sftp = Some(handles.sftp);
                         pane.state = ConnectionState::Connected;
                         pane.status_message = format!("ssh · {label}");
                     }
@@ -343,6 +348,7 @@ impl TabManager {
             pty_master: Some(master),
             pty_killer: Some(killer),
             ssh_shutdown: None,
+            ssh_sftp: None,
             _term_subscriptions: term_subs,
         })
     }
@@ -421,6 +427,7 @@ impl TabManager {
                             pty_master: None,
                             pty_killer: None,
                             ssh_shutdown: None,
+                            ssh_sftp: None,
                             _term_subscriptions: Vec::new(),
                         };
                         let tab = &mut self.tabs[tab_idx];

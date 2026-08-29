@@ -159,6 +159,24 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-08-29 — Three-column layout: right context panel
+
+**Status:** accepted  
+
+**Context:** Two-column Loom (Profiles | Terminal) works, but WindTerm-style clients get leverage from a **third column** for session-scoped tools. User asked to document and implement per value order: Snippets → Files/SFTP → Info.
+
+**Options:**
+- Stay two-column; put snippets in Settings / menus only  
+- Overlay drawer from the right (temporary)  
+- Persistent right **context panel** with show/hide like the left sidebar  
+
+**Decision:** Add a toggleable right **Context panel** (`docs/CONTEXT_PANEL.md`). Center remains primary. Primary section = **Files (SFTP)** with Explorer-style navigation and a transfers footer; **Info** stays a thin summary. Snippets are deferred (not a default tab). Default visibility **off**.
+
+**Why:** Clear IA (left = connections, right = tools for current session); SFTP is the high-value WindTerm-style differentiator for a Postman-style SSH client.
+
+**Consequences / follow-ups:** Same russh session opens an SFTP subsystem channel on demand (`russh-sftp`). Recursive folder download/upload in MVP; drag-drop and transfer persistence later.
+---
+
 ## How to use this file in review
 
 1. Before changing terminal stack, UI toolkit, or license boundary, read matching sections here.  
