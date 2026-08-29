@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -13,18 +14,42 @@ use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
 use crate::terminal::{ColorPalette, TerminalConfig, TerminalView};
+use crate::ui::pane_layout::{PaneLayout, RemoveResult, SplitDirection};
 use crate::ui::workspace_store::WorkspaceStore;
 
-pub struct TabSession {
+pub struct PaneSession {
     pub id: Uuid,
     pub profile_id: Uuid,
-    pub title: String,
     pub state: ConnectionState,
     pub status_message: String,
     pub terminal: Option<Entity<TerminalView>>,
     pub pty_master: Option<Arc<parking_lot::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub pty_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     pub ssh_shutdown: Option<flume::Sender<()>>,
+}
+
+pub struct TabSession {
+    pub id: Uuid,
+    pub title: String,
+    pub panes: HashMap<Uuid, PaneSession>,
+    pub layout: PaneLayout,
+    pub focused: Uuid,
+}
+
+impl TabSession {
+    pub fn focused_pane(&self) -> Option<&PaneSession> {
+        self.panes.get(&self.focused)
+    }
+
+    pub fn focused_pane_mut(&mut self) -> Option<&mut PaneSession> {
+        self.panes.get_mut(&self.focused)
+    }
+
+    pub fn display_state(&self) -> ConnectionState {
+        self.focused_pane()
+            .map(|p| p.state)
+            .unwrap_or(ConnectionState::Idle)
+    }
 }
 
 pub struct TabManager {
@@ -48,6 +73,16 @@ impl TabManager {
             .unwrap_or(0)
     }
 
+    pub fn active_tab(&self) -> Option<&TabSession> {
+        let id = self.active?;
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    pub fn active_tab_mut(&mut self) -> Option<&mut TabSession> {
+        let id = self.active?;
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
     pub fn open_profile(
         &mut self,
         profile: &Profile,
@@ -59,7 +94,8 @@ impl TabManager {
         match &profile.kind {
             ProfileKind::Local { .. } => {
                 match self.spawn_local(profile, default_shell, font_family, window, cx) {
-                    Ok(tab) => {
+                    Ok(pane) => {
+                        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
                         let id = tab.id;
                         self.tabs.push(tab);
                         self.active = Some(id);
@@ -115,10 +151,9 @@ impl TabManager {
     }
 
     fn push_failed(&mut self, profile: &Profile, message: String, cx: &mut Context<Self>) {
-        let tab = TabSession {
+        let pane = PaneSession {
             id: Uuid::new_v4(),
             profile_id: profile.id,
-            title: profile.name.clone(),
             state: ConnectionState::Failed,
             status_message: message,
             terminal: None,
@@ -126,6 +161,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
         };
+        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
         let id = tab.id;
         self.tabs.push(tab);
         self.active = Some(id);
@@ -146,20 +182,41 @@ impl TabManager {
             return;
         };
 
-        let tab_id = Uuid::new_v4();
-        self.tabs.push(TabSession {
-            id: tab_id,
+        let pane_id = Uuid::new_v4();
+        let pane = PaneSession {
+            id: pane_id,
             profile_id: profile.id,
-            title: profile.name.clone(),
             state: ConnectionState::Connecting,
             status_message: format!("connecting to {user}@{host}:{port}…"),
             terminal: None,
             pty_master: None,
             pty_killer: None,
             ssh_shutdown: None,
-        });
+        };
+        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
+        let tab_id = tab.id;
+        self.tabs.push(tab);
         self.active = Some(tab_id);
         cx.notify();
+
+        self.spawn_ssh_connect(tab_id, pane_id, profile, auth, font_family, cx);
+    }
+
+    fn spawn_ssh_connect(
+        &mut self,
+        tab_id: Uuid,
+        pane_id: Uuid,
+        profile: &Profile,
+        auth: SshAuthMaterial,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let ProfileKind::Ssh {
+            host, port, user, ..
+        } = &profile.kind
+        else {
+            return;
+        };
 
         let params = SshConnectParams {
             host: host.clone(),
@@ -188,7 +245,10 @@ impl TabManager {
         cx.spawn(async move |this, cx| {
             let result = rx.recv_async().await;
             this.update(cx, |this, cx| {
-                let Some(idx) = this.tabs.iter().position(|t| t.id == tab_id) else {
+                let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                    return;
+                };
+                let Some(pane) = tab.panes.get_mut(&pane_id) else {
                     return;
                 };
                 match result {
@@ -199,18 +259,18 @@ impl TabManager {
                             TerminalView::new(handles.writer, handles.reader, config, cx)
                                 .with_resize_callback(move |c, r| resize(c, r))
                         });
-                        this.tabs[idx].terminal = Some(terminal);
-                        this.tabs[idx].ssh_shutdown = Some(handles.shutdown);
-                        this.tabs[idx].state = ConnectionState::Connected;
-                        this.tabs[idx].status_message = format!("ssh · {label}");
+                        pane.terminal = Some(terminal);
+                        pane.ssh_shutdown = Some(handles.shutdown);
+                        pane.state = ConnectionState::Connected;
+                        pane.status_message = format!("ssh · {label}");
                     }
                     Ok(Err(err)) => {
-                        this.tabs[idx].state = ConnectionState::Failed;
-                        this.tabs[idx].status_message = format!("{err:#}");
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = format!("{err:#}");
                     }
                     Err(_) => {
-                        this.tabs[idx].state = ConnectionState::Failed;
-                        this.tabs[idx].status_message = "SSH connect cancelled".into();
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = "SSH connect cancelled".into();
                     }
                 }
                 cx.notify();
@@ -227,7 +287,7 @@ impl TabManager {
         font_family: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> anyhow::Result<TabSession> {
+    ) -> anyhow::Result<PaneSession> {
         let ProfileKind::Local { shell, cwd, .. } = &profile.kind else {
             anyhow::bail!("not a local profile");
         };
@@ -259,10 +319,9 @@ impl TabManager {
             .and_then(|s| s.to_str())
             .unwrap_or(&shell);
 
-        Ok(TabSession {
+        Ok(PaneSession {
             id: Uuid::new_v4(),
             profile_id: profile.id,
-            title: profile.name.clone(),
             state: ConnectionState::Connected,
             status_message: format!("{shell_short} · {cwd_label}"),
             terminal: Some(terminal),
@@ -270,6 +329,145 @@ impl TabManager {
             pty_killer: Some(killer),
             ssh_shutdown: None,
         })
+    }
+
+    pub fn split_focused(
+        &mut self,
+        direction: SplitDirection,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self.active else {
+            return;
+        };
+        let Some(tab_idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let focused = self.tabs[tab_idx].focused;
+        let Some(profile_id) = self.tabs[tab_idx]
+            .panes
+            .get(&focused)
+            .map(|p| p.profile_id)
+        else {
+            return;
+        };
+
+        let (profile, default_shell, font_family) = {
+            let s = store.read(cx);
+            (
+                s.workspace.find_profile(profile_id).cloned(),
+                s.settings.default_shell.clone(),
+                s.settings.font_family.clone(),
+            )
+        };
+        let Some(profile) = profile else {
+            return;
+        };
+
+        match &profile.kind {
+            ProfileKind::Local { .. } => {
+                match self.spawn_local(
+                    &profile,
+                    default_shell.as_deref(),
+                    &font_family,
+                    window,
+                    cx,
+                ) {
+                    Ok(pane) => {
+                        let new_id = pane.id;
+                        let tab = &mut self.tabs[tab_idx];
+                        tab.panes.insert(new_id, pane);
+                        if tab.layout.split(focused, direction, new_id) {
+                            tab.focused = new_id;
+                        }
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                            pane.state = ConnectionState::Failed;
+                            pane.status_message = format!("split failed: {err:#}");
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+            ProfileKind::Ssh { host, port, user, .. } => {
+                match resolve_ssh_auth(&profile, None) {
+                    Ok(Some(auth)) => {
+                        let new_id = Uuid::new_v4();
+                        let pane = PaneSession {
+                            id: new_id,
+                            profile_id: profile.id,
+                            state: ConnectionState::Connecting,
+                            status_message: format!("connecting to {user}@{host}:{port}…"),
+                            terminal: None,
+                            pty_master: None,
+                            pty_killer: None,
+                            ssh_shutdown: None,
+                        };
+                        let tab = &mut self.tabs[tab_idx];
+                        tab.panes.insert(new_id, pane);
+                        if tab.layout.split(focused, direction, new_id) {
+                            tab.focused = new_id;
+                        }
+                        cx.notify();
+                        self.spawn_ssh_connect(tab_id, new_id, &profile, auth, &font_family, cx);
+                    }
+                    Ok(None) => {
+                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                            pane.status_message = "password required for split".into();
+                        }
+                        cx.notify();
+                    }
+                    Err(err) => {
+                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                            pane.status_message = format!("split failed: {err:#}");
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn activate_pane_in_direction(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let focused = tab.focused;
+        let Some(next) = tab.layout.adjacent_leaf(focused, direction) else {
+            return;
+        };
+        self.focus_pane(next, window, cx);
+    }
+
+    pub fn focus_pane(&mut self, pane_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if !tab.panes.contains_key(&pane_id) {
+            return;
+        }
+        tab.focused = pane_id;
+        if let Some(term) = tab.panes.get(&pane_id).and_then(|p| p.terminal.as_ref()) {
+            term.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
+    }
+
+    pub fn set_split_ratio(&mut self, split_id: Uuid, ratio: f32, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.layout.set_ratio(split_id, ratio) {
+            cx.notify();
+        }
     }
 
     pub fn reconnect(
@@ -282,8 +480,15 @@ impl TabManager {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
-        let profile_id = self.tabs[idx].profile_id;
-        let title = self.tabs[idx].title.clone();
+        let focused = self.tabs[idx].focused;
+        let Some(profile_id) = self.tabs[idx]
+            .panes
+            .get(&focused)
+            .map(|p| p.profile_id)
+        else {
+            return;
+        };
+
         let (profile, default_shell, font_family) = {
             let s = store.read(cx);
             (
@@ -293,18 +498,25 @@ impl TabManager {
             )
         };
         let Some(profile) = profile else {
-            self.tabs[idx].state = ConnectionState::Failed;
-            self.tabs[idx].status_message = "profile missing".into();
+            if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                pane.state = ConnectionState::Failed;
+                pane.status_message = "profile missing".into();
+            }
             cx.notify();
             return;
         };
 
-        teardown_tab_io(&mut self.tabs[idx]);
+        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+            teardown_pane_io(pane);
+            drop(pane.terminal.take());
+        }
 
         match &profile.kind {
             ProfileKind::Local { .. } => {
-                self.tabs[idx].state = ConnectionState::Connecting;
-                self.tabs[idx].status_message = "reconnecting…".into();
+                if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                    pane.state = ConnectionState::Connecting;
+                    pane.status_message = "reconnecting…".into();
+                }
                 match self.spawn_local(
                     &profile,
                     default_shell.as_deref(),
@@ -313,40 +525,76 @@ impl TabManager {
                     cx,
                 ) {
                     Ok(mut fresh) => {
-                        fresh.id = tab_id;
-                        fresh.title = title;
-                        self.tabs[idx] = fresh;
+                        fresh.id = focused;
+                        self.tabs[idx].panes.insert(focused, fresh);
                     }
                     Err(err) => {
-                        self.tabs[idx].state = ConnectionState::Failed;
-                        self.tabs[idx].status_message = format!("{err:#}");
-                    }
-                }
-                cx.notify();
-            }
-            ProfileKind::Ssh { .. } => {
-                self.tabs.remove(idx);
-                self.active = self.tabs.first().map(|t| t.id);
-                cx.notify();
-                match resolve_ssh_auth(&profile, None) {
-                    Ok(Some(auth)) => {
-                        self.begin_ssh(&profile, auth, &font_family, cx);
-                        if let Some(t) = self.tabs.last_mut() {
-                            t.title = title;
+                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                            pane.state = ConnectionState::Failed;
+                            pane.status_message = format!("{err:#}");
                         }
                     }
-                    Ok(None) => self.push_failed(&profile, "password required".into(), cx),
-                    Err(err) => self.push_failed(&profile, format!("{err:#}"), cx),
                 }
+                cx.notify();
             }
+            ProfileKind::Ssh { host, port, user, .. } => match resolve_ssh_auth(&profile, None) {
+                Ok(Some(auth)) => {
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                        pane.profile_id = profile.id;
+                        pane.state = ConnectionState::Connecting;
+                        pane.status_message =
+                            format!("connecting to {user}@{host}:{port}…");
+                    }
+                    cx.notify();
+                    self.spawn_ssh_connect(tab_id, focused, &profile, auth, &font_family, cx);
+                }
+                Ok(None) => {
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = "password required".into();
+                    }
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = format!("{err:#}");
+                    }
+                    cx.notify();
+                }
+            },
         }
     }
 
-    pub fn close_active(&mut self, cx: &mut Context<Self>) {
+    pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(active) = self.active else {
             return;
         };
-        self.close_tab(active, cx);
+        let Some(idx) = self.tabs.iter().position(|t| t.id == active) else {
+            return;
+        };
+        let focused = self.tabs[idx].focused;
+        match self.tabs[idx].layout.remove_leaf(focused) {
+            RemoveResult::RemovedRoot => {
+                self.close_tab(active, cx);
+            }
+            RemoveResult::Collapsed { focus } => {
+                if let Some(mut pane) = self.tabs[idx].panes.remove(&focused) {
+                    teardown_pane_io(&mut pane);
+                    drop(pane.terminal);
+                }
+                self.tabs[idx].focused = focus;
+                if let Some(term) = self.tabs[idx]
+                    .panes
+                    .get(&focus)
+                    .and_then(|p| p.terminal.as_ref())
+                {
+                    term.read(cx).focus_handle().focus(window);
+                }
+                cx.notify();
+            }
+            RemoveResult::NotFound => {}
+        }
     }
 
     pub fn close_tab(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -355,7 +603,6 @@ impl TabManager {
         };
         let mut tab = self.tabs.remove(pos);
         teardown_tab_io(&mut tab);
-        drop(tab.terminal);
 
         self.active = if self.tabs.is_empty() {
             None
@@ -370,14 +617,13 @@ impl TabManager {
         self.active = None;
         for mut tab in tabs.drain(..) {
             teardown_tab_io(&mut tab);
-            drop(tab.terminal);
         }
     }
 
     pub fn select_tab(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.active = Some(id);
         if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
-            if let Some(term) = &tab.terminal {
+            if let Some(term) = tab.focused_pane().and_then(|p| p.terminal.as_ref()) {
                 term.read(cx).focus_handle().focus(window);
             }
         }
@@ -410,13 +656,12 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(active) = self.active else {
+        let Some(tab) = self.active_tab() else {
             return;
         };
-        let Some(tab) = self.tabs.iter().find(|t| t.id == active) else {
+        let Some(profile_id) = tab.focused_pane().map(|p| p.profile_id) else {
             return;
         };
-        let profile_id = tab.profile_id;
         let profile = store.read(cx).workspace.find_profile(profile_id).cloned();
         let (default_shell, font_family) = {
             let s = store.read(cx);
@@ -457,12 +702,14 @@ impl TabManager {
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {
         self.font_size = size.clamp(8.0, 32.0);
         for tab in &self.tabs {
-            if let Some(term) = &tab.terminal {
-                term.update(cx, |terminal, cx| {
-                    let mut config = terminal.config().clone();
-                    config.font_size = px(self.font_size);
-                    terminal.update_config(config, cx);
-                });
+            for pane in tab.panes.values() {
+                if let Some(term) = &pane.terminal {
+                    term.update(cx, |terminal, cx| {
+                        let mut config = terminal.config().clone();
+                        config.font_size = px(self.font_size);
+                        terminal.update_config(config, cx);
+                    });
+                }
             }
         }
         cx.notify();
@@ -472,7 +719,13 @@ impl TabManager {
         let tabs = self
             .tabs
             .iter()
-            .map(|t| (t.profile_id, Some(t.title.clone())))
+            .map(|t| {
+                let profile_id = t
+                    .focused_pane()
+                    .map(|p| p.profile_id)
+                    .unwrap_or_else(Uuid::nil);
+                (profile_id, Some(t.title.clone()))
+            })
             .collect();
         (tabs, self.active_index())
     }
@@ -484,13 +737,33 @@ impl Drop for TabManager {
     }
 }
 
-fn teardown_tab_io(tab: &mut TabSession) {
-    if let Some(tx) = tab.ssh_shutdown.take() {
+fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
+    let pane_id = pane.id;
+    let mut panes = HashMap::new();
+    panes.insert(pane_id, pane);
+    TabSession {
+        id: Uuid::new_v4(),
+        title,
+        panes,
+        layout: PaneLayout::leaf(pane_id),
+        focused: pane_id,
+    }
+}
+
+fn teardown_pane_io(pane: &mut PaneSession) {
+    if let Some(tx) = pane.ssh_shutdown.take() {
         let _ = tx.send(());
     }
-    let master = tab.pty_master.take();
-    let killer = tab.pty_killer.take();
+    let master = pane.pty_master.take();
+    let killer = pane.pty_killer.take();
     teardown_pty(killer, master);
+}
+
+fn teardown_tab_io(tab: &mut TabSession) {
+    for pane in tab.panes.values_mut() {
+        teardown_pane_io(pane);
+        drop(pane.terminal.take());
+    }
 }
 
 fn resolve_ssh_auth(

@@ -12,6 +12,7 @@ A desktop terminal client built with [GPUI](https://gpui.rs): local shell and SS
 - **Local shell** (priority): via `portable-pty` + in-house alacritty/GPUI terminal (Windows: pwsh / PowerShell / cmd)
 - **SSH**: `russh` sessions; passwords stored in the OS keyring when “Remember” is enabled
 - **Find**: Ctrl+F searches terminal scrollback (literal match)
+- **Splits**: Tab-bar columns icon → Split Right / Left / Up / Down (Zed-style popover)
 
 ## Layout
 
@@ -88,6 +89,7 @@ GPUI code follows the skills under `~/.agents/skills` (entities observe, Statefu
 
 Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.  
 Design trade-offs and accepted decisions: **[docs/DECISIONS.md](docs/DECISIONS.md)**.  
+Hard GPUI/platform pitfalls (so we do not relearn them): **[docs/HARD_PROBLEMS.md](docs/HARD_PROBLEMS.md)**.  
 Low-priority icebox features (explicit order only): **[docs/BACKLOG.md](docs/BACKLOG.md)**.  
 Agent / contributor principles: **[AGENTS.md](AGENTS.md)**.
 

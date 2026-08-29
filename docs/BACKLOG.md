@@ -16,7 +16,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 | P1 | **SSH / bastion** | **MVP shipped** (russh + keyring passwords + TOFU known_hosts). Still open: jump hosts, agent, key passphrase UI, nicer host-key change flow. |
 | P2 | **Session templates** | One action opens a defined set of tabs (e.g. API + DB + logs). |
 | P3 | **Profile env / startup** | Per-profile env vars, cwd, init command / script. |
-| P4 | **Tab layouts / splits** | Split panes (H/V), drag to rearrange. |
+| P4 | **Tab layouts / splits** | **MVP shipped** — tab-bar columns popover (Split Right/Left/Up/Down), Zed-style binary tree, sash resize, Ctrl+W closes focused pane; chords kept as secondary. Still open: drag-rearrange panes, persist layouts. Popover paint/anchor lesson: `HARD_PROBLEMS.md`. |
 | P5 | **Command bookmarks / snippets** | Saved commands; insert into the active shell. |
 
 ## Terminal UX

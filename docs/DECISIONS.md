@@ -4,9 +4,10 @@ Record **trade-offs and why**, so future reviews do not re-litigate from scratch
 
 - **Architecture** (`ARCHITECTURE.md`) = what the system is / should be  
 - **This file** = options considered, choice, rationale, follow-ups  
+- **Hard problems** (`HARD_PROBLEMS.md`) = non-obvious GPUI/platform pitfalls (symptom → failed attempts → fix)  
 - **Backlog** (`BACKLOG.md`) = low-priority icebox features (not decisions; do not implement unless explicitly ordered)  
 
-Add a new section when a non-trivial option is chosen (stack, license boundary, terminal path, UX IA, etc.). Prefer facts over slogans.
+Add a new section when a non-trivial option is chosen (stack, license boundary, terminal path, UX IA, etc.). Prefer facts over slogans. When a feature turns into a multi-hour positioning/focus/PTY fight, also add a dated entry under `HARD_PROBLEMS.md`.
 
 ## Template
 
@@ -141,6 +142,20 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 **Why:** Matches common terminal UX; avoids building a separate highlighter; reuses selection paint.
 
 **Consequences / follow-ups:** Regex mode / match count / highlight-all can come later if needed.
+
+---
+
+## 2026-08-29 — Pane splits follow Zed’s binary-tree model
+
+**Status:** accepted  
+
+**Context:** BACKLOG P4; user asked to match Zed’s split behavior rather than Windows Terminal–only Right/Down. Primary UX is a **tab-bar columns button + popover** (not keyboard-first).
+
+**Decision:** Each tab owns a binary `PaneLayout` tree. Actions mirror Zed: `SplitLeft/Right/Up/Down`, `ActivatePane*` by geometry. Each leaf is an independent session (same profile as the focused pane). Tab bar columns icon opens a four-way split menu; keybindings remain: `ctrl-k` + arrows to split, `ctrl-k ctrl-arrows` to activate, `ctrl-\` = SplitRight. `Ctrl+W` closes the focused pane (last pane closes the tab). Focus chrome only when `leaf_count() > 1`.
+
+**Why:** Matches product UX the team already knows from Zed; GPUI already supports chord keybindings. Button + popover matches how users discover splits.
+
+**Consequences / follow-ups:** Drag-rearrange / persist split trees later. `ctrl-k` chord may briefly compete with shell Ctrl+K (same as Zed terminal). Popover positioning is a GPUI hard problem — see `HARD_PROBLEMS.md` (2026-08-29 tab-bar split popover).
 
 ---
 

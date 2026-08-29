@@ -31,5 +31,21 @@ actions!(
         ImportWorkspace,
         /// Quit the application.
         QuitApp,
+        /// Split the focused pane to the left (Zed `pane::SplitLeft`).
+        SplitLeft,
+        /// Split the focused pane to the right (Zed `pane::SplitRight`).
+        SplitRight,
+        /// Split the focused pane upward (Zed `pane::SplitUp`).
+        SplitUp,
+        /// Split the focused pane downward (Zed `pane::SplitDown`).
+        SplitDown,
+        /// Focus the pane to the left (Zed `workspace::ActivatePaneLeft`).
+        ActivatePaneLeft,
+        /// Focus the pane to the right.
+        ActivatePaneRight,
+        /// Focus the pane above.
+        ActivatePaneUp,
+        /// Focus the pane below.
+        ActivatePaneDown,
     ]
 );

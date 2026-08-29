@@ -58,7 +58,8 @@ impl StatusBar {
                 .tabs
                 .iter()
                 .find(|t| t.id == id)
-                .and_then(|t| t.terminal.clone())
+                .and_then(|t| t.focused_pane())
+                .and_then(|p| p.terminal.clone())
         });
         self._observe_terminal = term.map(|entity| {
             cx.observe(&entity, |_this, _term, cx| cx.notify())
@@ -128,10 +129,15 @@ impl Render for StatusBar {
         let toast = self.toast.clone();
 
         let (left, right_geom) = if let Some(tab) = active {
-            let state = tab.state;
             let tab_id = tab.id;
-            let profile_id = tab.profile_id;
-            let profile = self.store.read(cx).workspace.find_profile(profile_id).cloned();
+            let pane = tab.focused_pane();
+            let state = pane
+                .map(|p| p.state)
+                .unwrap_or(ConnectionState::Idle);
+            let profile_id = pane.map(|p| p.profile_id);
+            let profile = profile_id.and_then(|pid| {
+                self.store.read(cx).workspace.find_profile(pid).cloned()
+            });
 
             let (kind_icon, kind_color, target, is_ssh) = match profile.as_ref().map(|p| &p.kind) {
                 Some(ProfileKind::Ssh {
@@ -186,9 +192,8 @@ impl Render for StatusBar {
                 ConnectionState::Disconnected | ConnectionState::Failed
             );
 
-            let (cols, rows) = tab
-                .terminal
-                .as_ref()
+            let (cols, rows) = pane
+                .and_then(|p| p.terminal.as_ref())
                 .map(|t| t.read(cx).dimensions())
                 .unwrap_or((0, 0));
 
@@ -202,7 +207,9 @@ impl Render for StatusBar {
                     cx,
                     move |_, _, cx| {
                         if is_ssh {
-                            cx.emit(StatusBarEvent::EditSshProfile(profile_id));
+                            if let Some(profile_id) = profile_id {
+                                cx.emit(StatusBarEvent::EditSshProfile(profile_id));
+                            }
                         }
                     },
                     div()

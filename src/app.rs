@@ -24,6 +24,16 @@ pub fn run() {
             KeyBinding::new("ctrl-0", ZoomReset, Some("Loom")),
             // Ctrl+Q quits; leave Ctrl+C for the shell.
             KeyBinding::new("ctrl-q", QuitApp, Some("Loom")),
+            // Zed-style pane splits (ctrl-k chord) + VS Code-ish SplitRight.
+            KeyBinding::new("ctrl-k left", SplitLeft, Some("Loom")),
+            KeyBinding::new("ctrl-k right", SplitRight, Some("Loom")),
+            KeyBinding::new("ctrl-k up", SplitUp, Some("Loom")),
+            KeyBinding::new("ctrl-k down", SplitDown, Some("Loom")),
+            KeyBinding::new("ctrl-\\", SplitRight, Some("Loom")),
+            KeyBinding::new("ctrl-k ctrl-left", ActivatePaneLeft, Some("Loom")),
+            KeyBinding::new("ctrl-k ctrl-right", ActivatePaneRight, Some("Loom")),
+            KeyBinding::new("ctrl-k ctrl-up", ActivatePaneUp, Some("Loom")),
+            KeyBinding::new("ctrl-k ctrl-down", ActivatePaneDown, Some("Loom")),
         ]);
 
         cx.on_action(|_: &QuitApp, cx| {

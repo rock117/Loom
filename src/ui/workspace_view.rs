@@ -143,6 +143,13 @@ impl WorkspaceView {
             |this, _, event, window, cx| match event {
                 TabBarEvent::NewTab => this.new_local_tab(window, cx),
                 TabBarEvent::Changed => this.persist_tabs(cx),
+                TabBarEvent::Split(direction) => {
+                    let store = this.store.clone();
+                    let direction = *direction;
+                    this.tabs.update(cx, |m, cx| {
+                        m.split_focused(direction, &store, window, cx);
+                    });
+                }
             },
         ));
 
@@ -157,11 +164,12 @@ impl WorkspaceView {
                         tabs.tabs
                             .iter()
                             .find(|t| t.id == tab_id)
-                            .and_then(|t| {
+                            .and_then(|t| t.focused_pane())
+                            .and_then(|p| {
                                 this.store
                                     .read(cx)
                                     .workspace
-                                    .find_profile(t.profile_id)
+                                    .find_profile(p.profile_id)
                                     .cloned()
                             })
                     };
@@ -472,9 +480,90 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &NewLocalTab, window, cx| {
                 this.new_local_tab(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
-                this.tabs.update(cx, |m, cx| m.close_active(cx));
+            .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                // Zed-like: close focused pane first; last pane closes the tab.
+                this.tabs.update(cx, |m, cx| m.close_active(window, cx));
                 this.persist_tabs(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitLeft, window, cx| {
+                let store = this.store.clone();
+                this.tabs.update(cx, |m, cx| {
+                    m.split_focused(
+                        crate::ui::pane_layout::SplitDirection::Left,
+                        &store,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                let store = this.store.clone();
+                this.tabs.update(cx, |m, cx| {
+                    m.split_focused(
+                        crate::ui::pane_layout::SplitDirection::Right,
+                        &store,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
+                let store = this.store.clone();
+                this.tabs.update(cx, |m, cx| {
+                    m.split_focused(
+                        crate::ui::pane_layout::SplitDirection::Up,
+                        &store,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                let store = this.store.clone();
+                this.tabs.update(cx, |m, cx| {
+                    m.split_focused(
+                        crate::ui::pane_layout::SplitDirection::Down,
+                        &store,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
+                this.tabs.update(cx, |m, cx| {
+                    m.activate_pane_in_direction(
+                        crate::ui::pane_layout::SplitDirection::Left,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneRight, window, cx| {
+                this.tabs.update(cx, |m, cx| {
+                    m.activate_pane_in_direction(
+                        crate::ui::pane_layout::SplitDirection::Right,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneUp, window, cx| {
+                this.tabs.update(cx, |m, cx| {
+                    m.activate_pane_in_direction(
+                        crate::ui::pane_layout::SplitDirection::Up,
+                        window,
+                        cx,
+                    );
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePaneDown, window, cx| {
+                this.tabs.update(cx, |m, cx| {
+                    m.activate_pane_in_direction(
+                        crate::ui::pane_layout::SplitDirection::Down,
+                        window,
+                        cx,
+                    );
+                });
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
                 this.tabs.update(cx, |m, cx| m.next_tab(window, cx));

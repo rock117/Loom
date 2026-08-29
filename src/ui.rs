@@ -1,6 +1,7 @@
 //! GPUI views and workspace state entities.
 
 pub mod password_prompt;
+pub mod pane_layout;
 pub mod rename_edit;
 pub mod settings;
 pub mod sidebar;
