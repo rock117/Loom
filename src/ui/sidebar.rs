@@ -125,10 +125,13 @@ impl Sidebar {
         &self,
         id: impl Into<ElementId>,
         icon: &'static str,
+        tip: &'static str,
         muted: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
+        use crate::ui::tooltip::Tooltip;
+
         let color = if muted {
             theme::TEXT_DISABLED
         } else {
@@ -143,6 +146,7 @@ impl Sidebar {
             .rounded(px(theme::RADIUS_SM))
             .cursor_pointer()
             .hover(|s| s.bg(theme::HOVER))
+            .tooltip(move |_, cx| Tooltip::text(tip, cx))
             .child(Self::svg_icon(icon, ICON_HEADER, color))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.context_menu = None;
@@ -418,6 +422,7 @@ impl Render for Sidebar {
                             .child(self.ghost_svg(
                                 "btn-group",
                                 "icons/ui/folder.svg",
+                                "New Group",
                                 false,
                                 cx,
                                 |this, _, cx| {
@@ -427,6 +432,7 @@ impl Render for Sidebar {
                             .child(self.ghost_svg(
                                 "btn-shell",
                                 "icons/ui/terminal.svg",
+                                "New Local Shell",
                                 false,
                                 cx,
                                 |this, _, cx| {
@@ -438,6 +444,7 @@ impl Render for Sidebar {
                             .child(self.ghost_svg(
                                 "btn-ssh",
                                 "icons/ui/remote.svg",
+                                "New SSH Profile",
                                 false,
                                 cx,
                                 |_, _, cx| {
@@ -447,6 +454,7 @@ impl Render for Sidebar {
                             .child(self.ghost_svg(
                                 "btn-settings",
                                 "icons/ui/settings.svg",
+                                "Settings",
                                 false,
                                 cx,
                                 |_, _, cx| {

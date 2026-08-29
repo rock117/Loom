@@ -293,16 +293,19 @@ impl TerminalView {
                 .child(find_btn(
                     "find-prev",
                     "↑",
+                    "Previous Match",
                     cx.listener(|this, _, _, cx| this.find_prev(cx)),
                 ))
                 .child(find_btn(
                     "find-next",
                     "↓",
+                    "Next Match",
                     cx.listener(|this, _, _, cx| this.find_next(cx)),
                 ))
                 .child(find_btn(
                     "find-close",
                     "×",
+                    "Close Find",
                     cx.listener(|this, _, window, cx| this.close_find(window, cx)),
                 ))
                 .into_any_element(),
@@ -410,8 +413,11 @@ impl TerminalView {
 fn find_btn(
     id: &'static str,
     label: &'static str,
+    tip: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    use crate::ui::tooltip::Tooltip;
+
     div()
         .id(id)
         .size(px(22.0))
@@ -423,6 +429,7 @@ fn find_btn(
         .text_color(theme::TEXT_MUTED)
         .cursor_pointer()
         .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+        .tooltip(move |_, cx| Tooltip::text(tip, cx))
         .child(label)
         .on_click(on_click)
 }

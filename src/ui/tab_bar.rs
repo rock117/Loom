@@ -6,6 +6,7 @@ use crate::model::ConnectionState;
 use crate::shared::theme;
 use crate::ui::pane_layout::SplitDirection;
 use crate::ui::tab_manager::{TabManager, state_color};
+use crate::ui::tooltip::Tooltip;
 
 const ICON: f32 = 14.0;
 const SPLIT_BTN: f32 = 26.0;
@@ -164,6 +165,7 @@ impl Render for TabBar {
                             .rounded(px(theme::RADIUS_SM))
                             .cursor_pointer()
                             .hover(|s| s.bg(theme::BORDER).text_color(theme::TEXT))
+                            .tooltip(|_, cx| Tooltip::with_key("Close Tab", "Ctrl+W", cx))
                             .child("×")
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -190,6 +192,7 @@ impl Render for TabBar {
                     .text_color(theme::TEXT_MUTED)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::HOVER))
+                    .tooltip(|_, cx| Tooltip::with_key("New Tab", "Ctrl+T", cx))
                     .child(Self::svg_icon("icons/ui/plus.svg", ICON, theme::TEXT_MUTED))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.close_split_menu(cx);
@@ -225,6 +228,7 @@ impl Render for TabBar {
                             theme::TEXT_DISABLED,
                         ))
                     })
+                    .tooltip(|_, cx| Tooltip::text("Split Pane", cx))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -281,6 +285,13 @@ impl Render for TabBar {
                             ICON,
                             theme::TEXT_DISABLED,
                         ))
+                    })
+                    .tooltip(move |_, cx| {
+                        if is_zoomed {
+                            Tooltip::text("Restore Pane Size", cx)
+                        } else {
+                            Tooltip::text("Maximize Pane", cx)
+                        }
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.tabs.read(cx).can_zoom_active() {

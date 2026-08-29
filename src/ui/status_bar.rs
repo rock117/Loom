@@ -102,9 +102,13 @@ impl StatusBar {
     fn segment(
         id: impl Into<ElementId>,
         cx: &mut Context<Self>,
+        tooltip: &'static str,
+        key: Option<&'static str>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         child: impl IntoElement,
     ) -> impl IntoElement {
+        use crate::ui::tooltip::Tooltip;
+
         div()
             .id(id)
             .flex()
@@ -115,6 +119,13 @@ impl StatusBar {
             .rounded(px(theme::RADIUS_SM))
             .cursor_pointer()
             .hover(|s| s.bg(theme::HOVER))
+            .tooltip(move |_, cx| {
+                if let Some(key) = key {
+                    Tooltip::with_key(tooltip, key, cx)
+                } else {
+                    Tooltip::text(tooltip, cx)
+                }
+            })
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
             .child(child)
     }
@@ -208,6 +219,12 @@ impl Render for StatusBar {
                 .child(Self::segment(
                     "sb-session",
                     cx,
+                    if is_ssh {
+                        "Edit SSH Profile"
+                    } else {
+                        "Session"
+                    },
+                    None,
                     move |_, _, cx| {
                         if is_ssh {
                             if let Some(profile_id) = profile_id {
@@ -240,6 +257,8 @@ impl Render for StatusBar {
                     d.child(Self::segment(
                         "sb-reconnect",
                         cx,
+                        "Reconnect",
+                        None,
                         move |_, _, cx| {
                             cx.emit(StatusBarEvent::Reconnect(tab_id));
                         },
@@ -280,28 +299,32 @@ impl Render for StatusBar {
         };
 
         // Zed-style: panel toggle is the leftmost status-bar control.
-        let panel_toggle = div()
-            .id("sb-sidebar")
-            .flex()
-            .items_center()
-            .justify_center()
-            .h_full()
-            .px(px(theme::SPACE_2))
-            .rounded(px(theme::RADIUS_SM))
-            .cursor_pointer()
-            .when(sidebar_visible, |d| d.bg(theme::HOVER))
-            .hover(|s| s.bg(theme::HOVER))
-            .child(Self::svg(
-                "icons/ui/panel-left.svg",
-                if sidebar_visible {
-                    theme::TEXT
-                } else {
-                    theme::TEXT_MUTED
-                },
-            ))
-            .on_click(cx.listener(|_, _, _, cx| {
-                cx.emit(StatusBarEvent::ToggleSidebar);
-            }));
+        let panel_toggle = {
+            use crate::ui::tooltip::Tooltip;
+            div()
+                .id("sb-sidebar")
+                .flex()
+                .items_center()
+                .justify_center()
+                .h_full()
+                .px(px(theme::SPACE_2))
+                .rounded(px(theme::RADIUS_SM))
+                .cursor_pointer()
+                .when(sidebar_visible, |d| d.bg(theme::HOVER))
+                .hover(|s| s.bg(theme::HOVER))
+                .tooltip(|_, cx| Tooltip::with_key("Toggle Sidebar", "Ctrl+B", cx))
+                .child(Self::svg(
+                    "icons/ui/panel-left.svg",
+                    if sidebar_visible {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_MUTED
+                    },
+                ))
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.emit(StatusBarEvent::ToggleSidebar);
+                }))
+        };
 
         div()
             .id("status-bar")
@@ -358,6 +381,8 @@ impl Render for StatusBar {
                     .child(Self::segment(
                         "sb-font",
                         cx,
+                        "Settings",
+                        Some("Ctrl+,"),
                         |_, _, cx| {
                             cx.emit(StatusBarEvent::OpenSettings);
                         },
