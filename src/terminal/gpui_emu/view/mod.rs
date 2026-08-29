@@ -426,6 +426,13 @@ pub struct TerminalView {
     /// True while the left button is dragging a selection.
     selecting: bool,
 
+    /// True once the pointer moved to a different cell during this drag.
+    /// Click-without-drag must not leave a 1-cell “fake cursor” highlight.
+    selection_dragged: bool,
+
+    /// Cell where the current selection press started.
+    selection_anchor: Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)>,
+
     /// Last painted terminal bounds (window space) for hit-testing.
     last_bounds: Bounds<Pixels>,
 
@@ -601,6 +608,8 @@ impl TerminalView {
             clipboard_store_callback: None,
             exit_callback: None,
             selecting: false,
+            selection_dragged: false,
+            selection_anchor: None,
             last_bounds: Bounds::default(),
             scrollbar_drag: None,
             find: None,
@@ -944,6 +953,8 @@ impl TerminalView {
 
         use alacritty_terminal::selection::{Selection, SelectionType};
         self.selecting = true;
+        self.selection_dragged = false;
+        self.selection_anchor = Some((point, side));
         self.state.with_term_mut(|term| {
             term.selection = Some(Selection::new(SelectionType::Simple, point, side));
         });
@@ -969,6 +980,17 @@ impl TerminalView {
             return;
         }
         self.selecting = false;
+        self.selection_anchor = None;
+
+        // Plain click (no drag): clear selection — don't leave a blue cell that
+        // looks like a second cursor. Real shell cursor stays at the prompt.
+        if !self.selection_dragged {
+            self.selection_dragged = false;
+            self.state.with_term_mut(|term| term.selection = None);
+            cx.notify();
+            return;
+        }
+        self.selection_dragged = false;
 
         if let Some((point, side)) = self.cell_at(event.position) {
             self.state.with_term_mut(|term| {
@@ -1007,6 +1029,12 @@ impl TerminalView {
         let Some((point, side)) = self.cell_at(event.position) else {
             return;
         };
+        if self
+            .selection_anchor
+            .is_some_and(|(anchor, anchor_side)| anchor != point || anchor_side != side)
+        {
+            self.selection_dragged = true;
+        }
         self.state.with_term_mut(|term| {
             if let Some(selection) = term.selection.as_mut() {
                 selection.update(point, side);
