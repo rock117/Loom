@@ -41,7 +41,7 @@ Path bar shows current remote cwd (`/home/user/...`).
 
 ### Transfers footer
 
-Each upload/download is a row: name, direction, status.  
+Transfers are scoped per SSH pane (switching tabs shows that session’s list only).  
 Phases: **Queued** (waiting on the transfer lane) → **Scanning · N** → `m/n · size · rate · time` → **Done**.  
 **×** / **Clear** cancel the SFTP job (not UI-only) so the transfer lane is freed for the next task.  
 Right-click → Reveal in File Explorer / Remove.  

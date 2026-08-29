@@ -1,5 +1,6 @@
 //! Right context panel — Files (SFTP) + Info (see docs/CONTEXT_PANEL.md).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::prelude::*;
@@ -86,7 +87,8 @@ pub struct ContextPanel {
     bound_pane: Option<Uuid>,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
-    transfers: Vec<TransferRow>,
+    /// Transfers keyed by SSH pane id (not shared across servers/tabs).
+    transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
     transfer_menu: Option<TransferMenu>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
     list_ratio: f32,
@@ -132,7 +134,7 @@ impl ContextPanel {
             error: None,
             bound_pane: None,
             list_gen: 0,
-            transfers: Vec::new(),
+            transfers_by_pane: HashMap::new(),
             transfer_menu: None,
             list_ratio,
             files_body_bounds: None,
@@ -153,7 +155,67 @@ impl ContextPanel {
         Some((id, sftp))
     }
 
+    /// Drop transfer lists for panes that no longer exist; cancel their jobs.
+    fn prune_closed_pane_transfers(&mut self, cx: &App) {
+        let live: std::collections::HashSet<Uuid> = self
+            .tabs
+            .read(cx)
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.keys().copied())
+            .collect();
+        let stale: Vec<Uuid> = self
+            .transfers_by_pane
+            .keys()
+            .copied()
+            .filter(|id| !live.contains(id))
+            .collect();
+        for pane_id in stale {
+            if let Some(rows) = self.transfers_by_pane.remove(&pane_id) {
+                for row in rows {
+                    row.cancel
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    fn pane_transfers(&self, pane_id: Uuid) -> &[TransferRow] {
+        self.transfers_by_pane
+            .get(&pane_id)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn current_transfers(&self) -> &[TransferRow] {
+        match self.bound_pane {
+            Some(id) => self.pane_transfers(id),
+            None => &[],
+        }
+    }
+
+    fn pane_transfers_mut(&mut self, pane_id: Uuid) -> &mut Vec<TransferRow> {
+        self.transfers_by_pane.entry(pane_id).or_default()
+    }
+
+    fn find_transfer_mut(&mut self, id: Uuid) -> Option<&mut TransferRow> {
+        for rows in self.transfers_by_pane.values_mut() {
+            if let Some(row) = rows.iter_mut().find(|t| t.id == id) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    fn find_transfer(&self, id: Uuid) -> Option<&TransferRow> {
+        self.transfers_by_pane
+            .values()
+            .flat_map(|rows| rows.iter())
+            .find(|t| t.id == id)
+    }
+
     fn sync_session(&mut self, cx: &mut Context<Self>) {
+        self.prune_closed_pane_transfers(cx);
         let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             if self.bound_pane.take().is_some() {
                 self.list_gen = self.list_gen.wrapping_add(1);
@@ -163,7 +225,6 @@ impl ContextPanel {
                 self.selected = None;
                 self.error = None;
                 self.listing = false;
-                self.transfers.clear();
                 self.transfer_menu = None;
             }
             return;
@@ -179,8 +240,7 @@ impl ContextPanel {
         self.selected = None;
         self.error = None;
         self.listing = false;
-        // Keep transfer rows from other panes visible until cleared by user;
-        // in-flight ops on the previous pane fail once its SFTP handle is dropped.
+        self.transfer_menu = None;
         self.go_home(sftp, cx);
     }
 
@@ -294,7 +354,7 @@ impl ContextPanel {
     }
 
     fn download_entry(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
-        let Some((_, sftp)) = self.focused_sftp(cx) else {
+        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
@@ -305,7 +365,7 @@ impl ContextPanel {
         let id = Uuid::new_v4();
         let cancel = transfer_cancel_flag();
 
-        self.transfers.insert(
+        self.pane_transfers_mut(pane_id).insert(
             0,
             TransferRow {
                 id,
@@ -349,7 +409,7 @@ impl ContextPanel {
             };
 
             this.update(cx, |this, cx| {
-                if let Some(row) = this.transfers.iter_mut().find(|t| t.id == id) {
+                if let Some(row) = this.find_transfer_mut(id) {
                     row.local_path = Some(local.clone());
                     // Stay Queued until the transfer lane actually starts (first progress).
                     row.status = TransferStatus::Queued;
@@ -395,7 +455,7 @@ impl ContextPanel {
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
                             // Row may already be gone after Remove/Clear — still OK.
-                            if this.transfers.iter().any(|t| t.id == id) {
+                            if this.find_transfer(id).is_some() {
                                 match result {
                                     Ok(Ok(outcome)) => {
                                         let files = if is_dir {
@@ -432,7 +492,7 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        let Some((_, sftp)) = self.focused_sftp(cx) else {
+        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
@@ -455,7 +515,7 @@ impl ContextPanel {
             let cancel = transfer_cancel_flag();
 
             this.update(cx, |this, cx| {
-                this.transfers.insert(
+                this.pane_transfers_mut(pane_id).insert(
                     0,
                     TransferRow {
                         id,
@@ -511,7 +571,7 @@ impl ContextPanel {
                     }
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
-                            if this.transfers.iter().any(|t| t.id == id) {
+                            if this.find_transfer(id).is_some() {
                                 match result {
                                     Ok(Ok(outcome)) => {
                                         this.finish_transfer(id, None, Some(outcome.bytes));
@@ -541,7 +601,7 @@ impl ContextPanel {
     }
 
     fn update_transfer_progress(&mut self, p: TransferProgress) {
-        if let Some(row) = self.transfers.iter_mut().find(|t| t.id == p.id) {
+        if let Some(row) = self.find_transfer_mut(p.id) {
             let (prev_files, prev_total) = match &row.status {
                 TransferStatus::Running {
                     files_done,
@@ -575,7 +635,7 @@ impl ContextPanel {
     }
 
     fn finish_transfer(&mut self, id: Uuid, files: Option<u32>, bytes: Option<u64>) {
-        if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
+        if let Some(row) = self.find_transfer_mut(id) {
             let files = files.or_else(|| match &row.status {
                 TransferStatus::Running { files_done, .. } if row.is_dir => *files_done,
                 _ => None,
@@ -596,41 +656,44 @@ impl ContextPanel {
     }
 
     fn fail_transfer(&mut self, id: Uuid, msg: String) {
-        if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
+        if let Some(row) = self.find_transfer_mut(id) {
             row.elapsed = row.started_at.map(|t| t.elapsed());
             row.status = TransferStatus::Failed(msg);
         }
     }
 
     fn remove_transfer(&mut self, id: Uuid) {
-        if let Some(row) = self.transfers.iter().find(|t| t.id == id) {
+        if let Some(row) = self.find_transfer(id) {
             row.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         self.remove_transfer_silent(id);
     }
 
     fn remove_transfer_silent(&mut self, id: Uuid) {
-        self.transfers.retain(|t| t.id != id);
+        for rows in self.transfers_by_pane.values_mut() {
+            rows.retain(|t| t.id != id);
+        }
         if self.transfer_menu.as_ref().is_some_and(|m| m.id == id) {
             self.transfer_menu = None;
         }
     }
 
     fn clear_transfers(&mut self) {
-        for row in &self.transfers {
-            row.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        let Some(pane_id) = self.bound_pane else {
+            return;
+        };
+        if let Some(rows) = self.transfers_by_pane.get_mut(&pane_id) {
+            for row in rows.iter() {
+                row.cancel
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            rows.clear();
         }
-        self.transfers.clear();
         self.transfer_menu = None;
     }
 
     fn reveal_transfer(&self, id: Uuid) {
-        let Some(path) = self
-            .transfers
-            .iter()
-            .find(|t| t.id == id)
-            .and_then(|t| t.local_path.as_ref())
-        else {
+        let Some(path) = self.find_transfer(id).and_then(|t| t.local_path.as_ref()) else {
             return;
         };
         let _ = platform::reveal_in_file_manager(path);
@@ -913,7 +976,8 @@ impl ContextPanel {
     }
 
     fn render_transfers(&self, height_ratio: f32, cx: &mut Context<Self>) -> impl IntoElement {
-        let has_transfers = !self.transfers.is_empty();
+        let transfers = self.current_transfers();
+        let has_transfers = !transfers.is_empty();
         div()
             .id("ctx-transfers")
             .h(relative(height_ratio.clamp(0.1, 0.65)))
@@ -956,7 +1020,7 @@ impl ContextPanel {
                         )
                     }),
             )
-            .when(self.transfers.is_empty(), |d| {
+            .when(transfers.is_empty(), |d| {
                 d.child(
                     div()
                         .text_xs()
@@ -964,7 +1028,7 @@ impl ContextPanel {
                         .child("No transfers yet"),
                 )
             })
-            .children(self.transfers.iter().map(|row| {
+            .children(transfers.iter().map(|row| {
                 let id = row.id;
                 let arrow = match row.direction {
                     TransferDir::Download => "↓",
@@ -1036,7 +1100,7 @@ impl ContextPanel {
         let menu = self.transfer_menu.as_ref()?;
         let id = menu.id;
         let position = menu.position;
-        let row = self.transfers.iter().find(|t| t.id == id)?;
+        let row = self.find_transfer(id)?;
         let can_reveal = row
             .local_path
             .as_ref()
