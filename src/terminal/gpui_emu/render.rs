@@ -62,10 +62,11 @@
 use super::colors::ColorPalette;
 use super::event::GpuiEventProxy;
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::index::{Column, Point as AlacPoint};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::term::{point_to_viewport, viewport_to_point};
 use alacritty_terminal::vte::ansi::Color;
 use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
@@ -489,15 +490,17 @@ impl TerminalRenderer {
             a: 1.0,
         };
 
-        // Iterate over visible lines
-        for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+        let display_offset = grid.display_offset();
 
+        // Iterate over visible viewport lines (accounts for scrollback offset).
+        for line_idx in 0..num_lines {
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
                 .map(|col_idx| {
-                    let col = Column(col_idx);
-                    let point = AlacPoint::new(line, col);
+                    let point = viewport_to_point(
+                        display_offset,
+                        AlacPoint::new(line_idx, Column(col_idx)),
+                    );
                     let cell = grid[point].clone();
                     (col_idx, cell)
                 })
@@ -538,7 +541,10 @@ impl TerminalRenderer {
                 let mut sel_start = None;
                 let mut sel_end = None;
                 for col_idx in 0..num_cols {
-                    let point = AlacPoint::new(line, Column(col_idx));
+                    let point = viewport_to_point(
+                        display_offset,
+                        AlacPoint::new(line_idx, Column(col_idx)),
+                    );
                     if range.contains(point) {
                         if sel_start.is_none() {
                             sel_start = Some(col_idx);
@@ -660,35 +666,37 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor
+        // Paint cursor only when it falls inside the current viewport.
         let cursor_point = grid.cursor.point;
-        let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
+        if let Some(vp) = point_to_viewport(display_offset, cursor_point) {
+            let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
+            let cursor_y = origin.y + self.cell_height * (vp.line as f32);
 
-        let cursor_color = self.palette.resolve(
-            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-            colors,
-        );
+            let cursor_color = self.palette.resolve(
+                Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
+                colors,
+            );
 
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
+            let cursor_bounds = Bounds {
+                origin: Point {
+                    x: cursor_x,
+                    y: cursor_y,
+                },
+                size: Size {
+                    width: self.cell_width,
+                    height: self.cell_height,
+                },
+            };
 
-        window.paint_quad(quad(
-            cursor_bounds,
-            px(0.0),
-            cursor_color,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+            window.paint_quad(quad(
+                cursor_bounds,
+                px(0.0),
+                cursor_color,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        }
     }
 }
 

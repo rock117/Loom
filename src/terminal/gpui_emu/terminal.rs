@@ -159,9 +159,19 @@ impl TerminalState {
     /// let terminal = TerminalState::new(80, 24, event_proxy);
     /// ```
     pub fn new(cols: usize, rows: usize, event_proxy: GpuiEventProxy) -> Self {
+        Self::new_with_scrollback(cols, rows, 10_000, event_proxy)
+    }
+
+    pub fn new_with_scrollback(
+        cols: usize,
+        rows: usize,
+        scrollback: usize,
+        event_proxy: GpuiEventProxy,
+    ) -> Self {
         // Create a default configuration
         // The Config struct controls various terminal behaviors like scrolling history
-        let config = Config::default();
+        let mut config = Config::default();
+        config.scrolling_history = scrollback.max(1);
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);

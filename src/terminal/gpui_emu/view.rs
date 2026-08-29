@@ -417,7 +417,32 @@ pub struct TerminalView {
 
     /// Last painted terminal bounds (window space) for hit-testing.
     last_bounds: Bounds<Pixels>,
+
+    /// Active scrollbar thumb drag (window Y → display offset).
+    scrollbar_drag: Option<ScrollbarDrag>,
 }
+
+struct ScrollbarDrag {
+    /// Pointer Y within the track when the drag started.
+    pointer_y_in_thumb: Pixels,
+}
+
+struct ScrollMetrics {
+    display_offset: usize,
+    history: usize,
+    screen_lines: usize,
+}
+
+struct ScrollbarGeometry {
+    track: Bounds<Pixels>,
+    thumb_y: Pixels,
+    thumb_h: Pixels,
+}
+
+/// Alacritty-style wheel multiplier (lines per notch / scaled pixel delta).
+const SCROLL_MULTIPLIER: f32 = 3.0;
+const SCROLLBAR_WIDTH: f32 = 10.0;
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 
 impl TerminalView {
     /// Create a new terminal with provided I/O streams.
@@ -470,7 +495,12 @@ impl TerminalView {
         let event_proxy = GpuiEventProxy::new(event_tx);
 
         // Create terminal state
-        let state = TerminalState::new(config.cols, config.rows, event_proxy);
+        let state = TerminalState::new_with_scrollback(
+            config.cols,
+            config.rows,
+            config.scrollback,
+            event_proxy,
+        );
 
         // Create renderer with font settings and color palette
         let renderer = TerminalRenderer::new(
@@ -541,6 +571,7 @@ impl TerminalView {
             exit_callback: None,
             selecting: false,
             last_bounds: Bounds::default(),
+            scrollbar_drag: None,
         }
     }
 
@@ -753,10 +784,42 @@ impl TerminalView {
             return;
         }
 
-        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
-            self.state.with_term_mut(|term| term.selection = None);
-            self.write_to_pty(&bytes);
+        // Scrollback navigation (Zed / Windows Terminal style).
+        if self.handle_scroll_key(&event.keystroke, cx) {
+            return;
         }
+
+        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            self.state.with_term_mut(|term| {
+                term.selection = None;
+                term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            });
+            self.write_to_pty(&bytes);
+            cx.notify();
+        }
+    }
+
+    fn handle_scroll_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        use alacritty_terminal::grid::Scroll;
+
+        let key = keystroke.key.as_str();
+        let mods = &keystroke.modifiers;
+        // Shift+… scrolls history; plain PageUp/Down stay available to the shell.
+        if !mods.shift || mods.control || mods.alt || mods.platform {
+            return false;
+        }
+
+        let scroll = match key {
+            "pageup" => Scroll::PageUp,
+            "pagedown" => Scroll::PageDown,
+            "up" => Scroll::Delta(1),
+            "down" => Scroll::Delta(-1),
+            "home" => Scroll::Top,
+            "end" => Scroll::Bottom,
+            _ => return false,
+        };
+        self.scroll_display(scroll, cx);
+        true
     }
 
     fn is_paste_keystroke(&self, keystroke: &Keystroke) -> bool {
@@ -776,8 +839,6 @@ impl TerminalView {
     }
 
     /// Handle mouse down events.
-    ///
-    /// Currently a placeholder for future mouse selection and interaction support.
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -793,6 +854,10 @@ impl TerminalView {
         }
 
         if event.button != MouseButton::Left {
+            return;
+        }
+
+        if self.handle_scrollbar_mouse_down(event.position, cx) {
             return;
         }
 
@@ -817,6 +882,12 @@ impl TerminalView {
         if event.button != MouseButton::Left {
             return;
         }
+
+        if self.scrollbar_drag.take().is_some() {
+            cx.notify();
+            return;
+        }
+
         if !self.selecting {
             return;
         }
@@ -848,6 +919,11 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.scrollbar_drag.is_some() {
+            self.update_scrollbar_drag(event.position.y, cx);
+            return;
+        }
+
         if !self.selecting {
             return;
         }
@@ -866,7 +942,8 @@ impl TerminalView {
         &self,
         position: Point<Pixels>,
     ) -> Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)> {
-        use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+        use alacritty_terminal::index::{Column, Point as AlacPoint, Side};
+        use alacritty_terminal::term::viewport_to_point;
 
         let cell_w: f32 = self.renderer.cell_width.into();
         let cell_h: f32 = self.renderer.cell_height.into();
@@ -891,8 +968,11 @@ impl TerminalView {
             Side::Right
         };
 
-        // Match the viewport Line indices used by TerminalRenderer::paint.
-        Some((AlacPoint::new(Line(row as i32), Column(col)), side))
+        let display_offset = self
+            .state
+            .with_term(|term| term.grid().display_offset());
+        let point = viewport_to_point(display_offset, AlacPoint::new(row, Column(col)));
+        Some((point, side))
     }
 
     fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
@@ -907,18 +987,189 @@ impl TerminalView {
         true
     }
 
-    /// Handle scroll events.
-    ///
-    /// Currently a placeholder for future scrollback support.
+    /// Handle scroll events — wheel / trackpad moves the scrollback viewport.
     fn on_scroll(
         &mut self,
-        _event: &ScrollWheelEvent,
+        event: &ScrollWheelEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+        use alacritty_terminal::grid::Scroll;
+
+        let line_height = self.renderer.cell_height.max(px(1.0));
+        let pixel_delta = event.delta.pixel_delta(line_height);
+        let dy: f32 = pixel_delta.y.into();
+        if dy.abs() < f32::EPSILON {
+            return;
+        }
+
+        // Positive wheel delta (up) → increase display_offset (older history).
+        let lines = ((dy / f32::from(line_height)) * SCROLL_MULTIPLIER).round() as i32;
+        if lines == 0 {
+            return;
+        }
+        self.scroll_display(Scroll::Delta(lines), cx);
+    }
+
+    fn scroll_display(
+        &mut self,
+        scroll: alacritty_terminal::grid::Scroll,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.state.with_term_mut(|term| {
+            let before = term.grid().display_offset();
+            term.scroll_display(scroll);
+            term.grid().display_offset() != before
+        });
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Scroll metrics for the overlay scrollbar. `None` when there is no history.
+    fn scroll_metrics(&self) -> Option<ScrollMetrics> {
+        use alacritty_terminal::grid::Dimensions;
+        self.state.with_term(|term| {
+            let history = term.history_size();
+            if history == 0 {
+                return None;
+            }
+            Some(ScrollMetrics {
+                display_offset: term.grid().display_offset(),
+                history,
+                screen_lines: term.screen_lines().max(1),
+            })
+        })
+    }
+
+    fn scrollbar_geometry(&self, metrics: &ScrollMetrics) -> Option<ScrollbarGeometry> {
+        let track = self.scrollbar_track_bounds();
+        let track_h: f32 = track.size.height.into();
+        if track_h <= 0.0 {
+            return None;
+        }
+
+        let content = (metrics.history + metrics.screen_lines) as f32;
+        let mut thumb_h = (metrics.screen_lines as f32 / content) * track_h;
+        thumb_h = thumb_h.clamp(SCROLLBAR_MIN_THUMB.min(track_h), track_h);
+
+        let max_offset = metrics.history as f32;
+        // document offset from top: 0 at oldest, history at live edge
+        let doc_offset = (metrics.history - metrics.display_offset) as f32;
+        let travel = (track_h - thumb_h).max(0.0);
+        let thumb_y = if max_offset <= 0.0 {
+            0.0
+        } else {
+            (doc_offset / max_offset) * travel
+        };
+
+        Some(ScrollbarGeometry {
+            track,
+            thumb_y: px(thumb_y),
+            thumb_h: px(thumb_h),
+        })
+    }
+
+    fn scrollbar_paint_info(&self) -> Option<ScrollbarGeometry> {
+        let metrics = self.scroll_metrics()?;
+        self.scrollbar_geometry(&metrics)
+    }
+
+    fn scrollbar_track_bounds(&self) -> Bounds<Pixels> {
+        let pad_top = self.config.padding.top;
+        let pad_bottom = self.config.padding.bottom;
+        Bounds {
+            origin: Point {
+                x: self.last_bounds.right() - px(SCROLLBAR_WIDTH),
+                y: self.last_bounds.origin.y + pad_top,
+            },
+            size: Size {
+                width: px(SCROLLBAR_WIDTH),
+                height: (self.last_bounds.size.height - pad_top - pad_bottom).max(px(0.0)),
+            },
+        }
+    }
+
+    fn handle_scrollbar_mouse_down(
+        &mut self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(metrics) = self.scroll_metrics() else {
+            return false;
+        };
+        let Some(geo) = self.scrollbar_geometry(&metrics) else {
+            return false;
+        };
+        if !geo.track.contains(&position) {
+            return false;
+        }
+
+        let thumb_top = geo.track.origin.y + geo.thumb_y;
+        let thumb_bottom = thumb_top + geo.thumb_h;
+        if position.y >= thumb_top && position.y <= thumb_bottom {
+            self.scrollbar_drag = Some(ScrollbarDrag {
+                pointer_y_in_thumb: position.y - thumb_top,
+            });
+        } else {
+            // Click in track: jump so thumb centers on the click.
+            let thumb_h: f32 = geo.thumb_h.into();
+            let track_h: f32 = geo.track.size.height.into();
+            let click_y: f32 = (position.y - geo.track.origin.y).into();
+            let target_thumb_y = (click_y - thumb_h * 0.5).clamp(0.0, (track_h - thumb_h).max(0.0));
+            self.set_display_offset_from_thumb_y(target_thumb_y, &metrics, &geo, cx);
+            self.scrollbar_drag = Some(ScrollbarDrag {
+                pointer_y_in_thumb: px(thumb_h * 0.5),
+            });
+        }
+        self.selecting = false;
+        cx.notify();
+        true
+    }
+
+    fn update_scrollbar_drag(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = self.scrollbar_drag.as_ref() else {
+            return;
+        };
+        let pointer_in_thumb = drag.pointer_y_in_thumb;
+        let Some(metrics) = self.scroll_metrics() else {
+            return;
+        };
+        let Some(geo) = self.scrollbar_geometry(&metrics) else {
+            return;
+        };
+        let thumb_h: f32 = geo.thumb_h.into();
+        let track_h: f32 = geo.track.size.height.into();
+        let y: f32 = (pointer_y - geo.track.origin.y - pointer_in_thumb).into();
+        let target_thumb_y = y.clamp(0.0, (track_h - thumb_h).max(0.0));
+        self.set_display_offset_from_thumb_y(target_thumb_y, &metrics, &geo, cx);
+    }
+
+    fn set_display_offset_from_thumb_y(
+        &mut self,
+        thumb_y: f32,
+        metrics: &ScrollMetrics,
+        geo: &ScrollbarGeometry,
+        cx: &mut Context<Self>,
+    ) {
+        use alacritty_terminal::grid::Scroll;
+
+        let thumb_h: f32 = geo.thumb_h.into();
+        let track_h: f32 = geo.track.size.height.into();
+        let travel = (track_h - thumb_h).max(0.0);
+        let ratio = if travel <= 0.0 {
+            1.0
+        } else {
+            (thumb_y / travel).clamp(0.0, 1.0)
+        };
+        // ratio 0 → top of history (display_offset = history)
+        // ratio 1 → live edge (display_offset = 0)
+        let target_offset = ((1.0 - ratio) * metrics.history as f32).round() as usize;
+        let current = metrics.display_offset;
+        let delta = target_offset as i32 - current as i32;
+        if delta != 0 {
+            self.scroll_display(Scroll::Delta(delta), cx);
+        }
     }
 
     /// Process pending terminal events.
@@ -1003,7 +1254,10 @@ impl TerminalView {
     }
 
     fn paste_text(&mut self, text: &str) {
+        use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::term::TermMode;
+        self.state
+            .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
         if self.state.mode().contains(TermMode::BRACKETED_PASTE) {
             let mut buf = Vec::with_capacity(normalized.len() + 16);
@@ -1108,6 +1362,7 @@ impl Render for TerminalView {
         let view_paint = view.clone();
 
         div()
+            .relative()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
@@ -1131,9 +1386,10 @@ impl Render for TerminalView {
 
                         let measured_renderer = view_paint.read(cx).renderer.clone();
 
-                        // Calculate available space after padding
+                        // Leave a gutter for the overlay scrollbar so glyphs aren't clipped under it.
+                        let gutter = px(SCROLLBAR_WIDTH + 2.0);
                         let available_width: f32 =
-                            (bounds.size.width - padding.left - padding.right).into();
+                            (bounds.size.width - padding.left - padding.right - gutter).into();
                         let available_height: f32 =
                             (bounds.size.height - padding.top - padding.bottom).into();
                         let cell_width_f32: f32 = measured_renderer.cell_width.into();
@@ -1184,6 +1440,38 @@ impl Render for TerminalView {
                         }
 
                         measured_renderer.paint(bounds, padding, &term, window, cx);
+                        drop(term);
+
+                        let scrollbar = view_paint.read(cx).scrollbar_paint_info();
+                        if let Some(geo) = scrollbar {
+                            let track = geo.track;
+                            window.paint_quad(quad(
+                                track,
+                                px(4.0),
+                                hsla(0.60, 0.04, 0.14, 0.35),
+                                Edges::default(),
+                                transparent_black(),
+                                Default::default(),
+                            ));
+                            let thumb = Bounds {
+                                origin: Point {
+                                    x: track.origin.x + px(1.0),
+                                    y: track.origin.y + geo.thumb_y,
+                                },
+                                size: Size {
+                                    width: track.size.width - px(2.0),
+                                    height: geo.thumb_h,
+                                },
+                            };
+                            window.paint_quad(quad(
+                                thumb,
+                                px(3.0),
+                                hsla(0.60, 0.04, 0.55, 0.55),
+                                Edges::default(),
+                                transparent_black(),
+                                Default::default(),
+                            ));
+                        }
                     },
                 )
                 .size_full(),
