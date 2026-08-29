@@ -5,6 +5,7 @@ use crate::model::{
     Group, OpenTabRef, Profile, ProfileKind, SettingsFile, UiStateFile, WorkspaceFile,
     load_settings, load_ui_state, load_workspace, save_settings, save_ui_state, save_workspace,
 };
+use crate::ui::rename_edit::RenameEdit;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
@@ -18,7 +19,7 @@ pub struct WorkspaceStore {
     pub ui_state: UiStateFile,
     pub settings: SettingsFile,
     pub selection: Selection,
-    pub rename_buffer: Option<String>,
+    pub rename: Option<RenameEdit>,
     dirty: bool,
 }
 
@@ -32,7 +33,7 @@ impl WorkspaceStore {
             ui_state,
             settings,
             selection: Selection::None,
-            rename_buffer: None,
+            rename: None,
             dirty: false,
         }
     }
@@ -61,14 +62,18 @@ impl WorkspaceStore {
     }
 
     pub fn select_group(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.selection != Selection::Group(id) {
+            self.rename = None;
+        }
         self.selection = Selection::Group(id);
-        self.rename_buffer = None;
         cx.notify();
     }
 
     pub fn select_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.selection != Selection::Profile(id) {
+            self.rename = None;
+        }
         self.selection = Selection::Profile(id);
-        self.rename_buffer = None;
         cx.notify();
     }
 
@@ -241,16 +246,16 @@ impl WorkspaceStore {
             Selection::None => None,
         };
         if let Some(name) = name {
-            self.rename_buffer = Some(name);
+            self.rename = Some(RenameEdit::new(name));
             cx.notify();
         }
     }
 
     pub fn commit_rename(&mut self, cx: &mut Context<Self>) {
-        let Some(name) = self.rename_buffer.take() else {
+        let Some(edit) = self.rename.take() else {
             return;
         };
-        let name = name.trim().to_string();
+        let name = edit.text.trim().to_string();
         if name.is_empty() {
             cx.notify();
             return;
@@ -273,25 +278,23 @@ impl WorkspaceStore {
         cx.notify();
     }
 
-    pub fn push_rename_char(&mut self, ch: char, cx: &mut Context<Self>) {
-        if let Some(buf) = &mut self.rename_buffer {
-            if !ch.is_control() {
-                buf.push(ch);
-                cx.notify();
-            }
-        }
+    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.rename = None;
+        cx.notify();
     }
 
-    pub fn pop_rename_char(&mut self, cx: &mut Context<Self>) {
-        if let Some(buf) = &mut self.rename_buffer {
-            buf.pop();
+    pub fn toggle_rename_caret(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.rename {
+            edit.caret_visible = !edit.caret_visible;
             cx.notify();
         }
     }
 
-    pub fn cancel_rename(&mut self, cx: &mut Context<Self>) {
-        self.rename_buffer = None;
-        cx.notify();
+    pub fn with_rename(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut RenameEdit)) {
+        if let Some(edit) = &mut self.rename {
+            f(edit);
+            cx.notify();
+        }
     }
 
     pub fn move_profile_to_group(

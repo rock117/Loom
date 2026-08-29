@@ -506,10 +506,13 @@ impl Render for WorkspaceView {
                 this.tabs.update(cx, |m, cx| m.set_font_size(14.0, cx));
                 this.persist_tabs(cx);
             }))
-            .on_action(cx.listener(|this, _: &RenameFocused, _, cx| {
+            .on_action(cx.listener(|this, _: &RenameFocused, window, cx| {
                 match this.store.read(cx).selection {
                     Selection::Profile(_) | Selection::Group(_) => {
-                        this.store.update(cx, |s, cx| s.begin_rename(cx));
+                        this.sidebar.update(cx, |s, cx| {
+                            s.begin_rename(cx);
+                        });
+                        this.sidebar.read(cx).focus_handle(cx).focus(window);
                     }
                     Selection::None => {
                         if let Some(title) =

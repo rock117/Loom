@@ -17,6 +17,8 @@ pub struct Sidebar {
     focus_handle: FocusHandle,
     /// Right-click context menu for a profile or group (Zed-style).
     context_menu: Option<ContextMenuState>,
+    /// Keeps the caret blink loop alive while renaming.
+    _caret_blink: Option<Task<()>>,
     _observe_store: Subscription,
 }
 
@@ -74,8 +76,41 @@ impl Sidebar {
             store,
             focus_handle: cx.focus_handle(),
             context_menu: None,
+            _caret_blink: None,
             _observe_store,
         }
+    }
+
+    fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self._caret_blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.store.read(cx).rename.is_some() {
+                            this.store.update(cx, |s, cx| s.toggle_rename_caret(cx));
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub fn begin_rename(&mut self, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.store.update(cx, |s, cx| s.begin_rename(cx));
+        if self.store.read(cx).rename.is_some() {
+            self.start_caret_blink(cx);
+        }
+        cx.notify();
     }
 
     fn svg_icon(path: &'static str, size: f32, color: Hsla) -> impl IntoElement {
@@ -207,8 +242,9 @@ impl Sidebar {
                 "Rename",
                 false,
                 cx,
-                |this, _, cx| {
-                    this.store.update(cx, |s, cx| s.begin_rename(cx));
+                |this, window, cx| {
+                    this.begin_rename(cx);
+                    this.focus_handle.focus(window);
                 },
             ))
             .child(self.menu_item(
@@ -269,8 +305,9 @@ impl Sidebar {
                 "Rename",
                 false,
                 cx,
-                |this, _, cx| {
-                    this.store.update(cx, |s, cx| s.begin_rename(cx));
+                |this, window, cx| {
+                    this.begin_rename(cx);
+                    this.focus_handle.focus(window);
                 },
             ))
             .child(self.menu_item(
@@ -333,7 +370,7 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let renaming = store.rename_buffer.clone();
+        let renaming = store.rename.clone();
         let selection = store.selection;
         let groups = store.sidebar_groups();
         let other_groups: Vec<(Uuid, String)> = store
@@ -466,23 +503,29 @@ impl Render for Sidebar {
                                         ICON_TREE,
                                         theme::ICON_GROUP,
                                     ))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_xs()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme::TEXT)
-                                            .child(if renaming.is_some() && selected_group {
-                                                format!("{}|", renaming.clone().unwrap_or_default())
-                                            } else {
-                                                gname.clone()
-                                            }),
-                                    )
+                                    .child({
+                                        if let Some(edit) =
+                                            renaming.as_ref().filter(|_| selected_group)
+                                        {
+                                            edit.into_element()
+                                        } else {
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme::TEXT)
+                                                .child(gname.clone())
+                                                .into_any_element()
+                                        }
+                                    })
                                     .on_click(cx.listener(move |this, _event: &ClickEvent, _, cx| {
                                         this.context_menu = None;
+                                        if this.store.read(cx).rename.is_some() {
+                                            return;
+                                        }
                                         this.store.update(cx, |s, cx| {
                                             s.select_group(gid, cx);
                                             s.toggle_group(gid, cx);
@@ -548,12 +591,21 @@ impl Render for Sidebar {
                                     let selected = selection == Selection::Profile(pid);
                                     let (icon_path, icon_color) =
                                         Self::profile_icon(&profile.kind);
-                                    let label = if renaming.is_some() && selected {
-                                        format!("{}|", renaming.clone().unwrap_or_default())
-                                    } else {
-                                        profile.name.clone()
-                                    };
                                     let drag_name: SharedString = profile.name.clone().into();
+                                    let name_el: AnyElement =
+                                        if let Some(edit) = renaming.as_ref().filter(|_| selected) {
+                                            edit.into_element()
+                                        } else {
+                                            div()
+                                                .flex_1()
+                                                .overflow_hidden()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .text_xs()
+                                                .text_color(theme::TEXT)
+                                                .child(profile.name.clone())
+                                                .into_any_element()
+                                        };
                                     div()
                                         .id(SharedString::from(format!("profile-{pid}")))
                                         .flex()
@@ -570,16 +622,7 @@ impl Render for Sidebar {
                                         })
                                         .cursor_pointer()
                                         .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_xs()
-                                                .text_color(theme::TEXT)
-                                                .child(label),
-                                        )
+                                        .child(name_el)
                                         .on_click(cx.listener(
                                             move |this, event: &ClickEvent, _window, cx| {
                                                 this.context_menu = None;
@@ -693,8 +736,9 @@ impl Render for Sidebar {
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                let key = &event.keystroke.key;
-                let renaming = this.store.read(cx).rename_buffer.is_some();
+                let key = event.keystroke.key.as_str();
+                let mods = &event.keystroke.modifiers;
+                let renaming = this.store.read(cx).rename.is_some();
 
                 if key == "escape" {
                     if this.context_menu.is_some() {
@@ -706,18 +750,137 @@ impl Render for Sidebar {
                 }
 
                 if renaming {
+                    let shift = mods.shift;
+                    let chord = mods.control || mods.platform;
+
                     if key == "enter" {
                         this.store.update(cx, |s, cx| s.commit_rename(cx));
                         cx.stop_propagation();
-                    } else if key == "escape" {
+                        return;
+                    }
+                    if key == "escape" {
                         this.store.update(cx, |s, cx| s.cancel_rename(cx));
                         cx.stop_propagation();
-                    } else if key == "backspace" {
-                        this.store.update(cx, |s, cx| s.pop_rename_char(cx));
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("a") {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.select_all());
+                        });
                         cx.stop_propagation();
-                    } else if let Some(ch) = key.chars().next() {
-                        if key.len() == 1 {
-                            this.store.update(cx, |s, cx| s.push_rename_char(ch, cx));
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("c") {
+                        this.store.update(cx, |s, cx| {
+                            if let Some(edit) = &s.rename {
+                                let text = if edit.has_selection() {
+                                    edit.selected_text()
+                                } else {
+                                    edit.text.clone()
+                                };
+                                if !text.is_empty() {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                }
+                            }
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("x") {
+                        this.store.update(cx, |s, cx| {
+                            if let Some(edit) = &s.rename {
+                                let text = if edit.has_selection() {
+                                    edit.selected_text()
+                                } else {
+                                    edit.text.clone()
+                                };
+                                if !text.is_empty() {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                }
+                            }
+                            s.with_rename(cx, |e| {
+                                if e.has_selection() {
+                                    e.delete_selection();
+                                } else {
+                                    e.text.clear();
+                                    e.cursor = 0;
+                                    e.anchor = 0;
+                                }
+                            });
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if (chord && key.eq_ignore_ascii_case("v"))
+                        || (mods.shift && key.eq_ignore_ascii_case("insert"))
+                    {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                            let cleaned = text.replace('\r', "").replace('\n', "");
+                            if !cleaned.is_empty() {
+                                this.store.update(cx, |s, cx| {
+                                    s.with_rename(cx, |e| e.insert(&cleaned));
+                                });
+                            }
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "backspace" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.backspace());
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "delete" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.delete_forward());
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "left" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.move_left(shift));
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "right" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.move_right(shift));
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "home" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.move_home(shift));
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "end" {
+                        this.store.update(cx, |s, cx| {
+                            s.with_rename(cx, |e| e.move_end(shift));
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !chord
+                        && !mods.alt
+                        && let Some(typed) = event.keystroke.key_char.as_deref()
+                    {
+                        let mut cleaned = String::new();
+                        for ch in typed.chars() {
+                            if !ch.is_control() {
+                                cleaned.push(ch);
+                            }
+                        }
+                        if !cleaned.is_empty() {
+                            this.store.update(cx, |s, cx| {
+                                s.with_rename(cx, |e| e.insert(&cleaned));
+                            });
                             cx.stop_propagation();
                         }
                     }
