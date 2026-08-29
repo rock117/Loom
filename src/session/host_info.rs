@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 
 /// Max mounts shown in Info (primary + fullest others).
 const MAX_DISKS: usize = 5;
+/// Max GPUs shown in Info.
+const MAX_GPUS: usize = 2;
 
 /// One filesystem / mount usage row.
 #[derive(Debug, Clone, Default)]
@@ -23,6 +25,25 @@ impl DiskUsage {
     }
 }
 
+/// One GPU row (best-effort; often name-only on non-NVIDIA).
+#[derive(Debug, Clone, Default)]
+pub struct GpuInfo {
+    pub name: String,
+    pub vram_used: Option<u64>,
+    pub vram_total: Option<u64>,
+    /// 0..=100 when the driver reports utilization.
+    pub usage_pct: Option<f32>,
+}
+
+impl GpuInfo {
+    pub fn vram_ratio(&self) -> Option<f32> {
+        match (self.vram_used, self.vram_total) {
+            (Some(used), Some(total)) if total > 0 => Some((used as f64 / total as f64) as f32),
+            _ => None,
+        }
+    }
+}
+
 /// One-shot host metrics for display (manual refresh only).
 #[derive(Debug, Clone, Default)]
 pub struct HostSnapshot {
@@ -37,6 +58,8 @@ pub struct HostSnapshot {
     pub mem_total: u64,
     /// Primary mount first, then other real mounts by fullness (capped).
     pub disks: Vec<DiskUsage>,
+    /// Present only when detection succeeds (hidden in UI otherwise).
+    pub gpus: Vec<GpuInfo>,
     pub load: Option<String>,
     pub uptime_secs: u64,
 }
@@ -78,6 +101,7 @@ pub fn collect_local() -> Result<HostSnapshot> {
 
     let disks_sys = Disks::new_with_refreshed_list();
     let disks = collect_local_disks(&disks_sys);
+    let gpus = collect_local_gpus();
 
     let load = {
         let la = System::load_average();
@@ -104,6 +128,7 @@ pub fn collect_local() -> Result<HostSnapshot> {
         mem_used: sys.used_memory(),
         mem_total: sys.total_memory(),
         disks,
+        gpus,
         load,
         uptime_secs: System::uptime(),
     })
@@ -221,6 +246,224 @@ fn rank_disks(mut disks: Vec<DiskUsage>) -> Vec<DiskUsage> {
     disks
 }
 
+fn collect_local_gpus() -> Vec<GpuInfo> {
+    if let Some(gpus) = probe_nvidia_smi() {
+        return cap_gpus(gpus);
+    }
+    #[cfg(windows)]
+    if let Some(gpus) = probe_windows_cim_gpus() {
+        return cap_gpus(gpus);
+    }
+    #[cfg(not(windows))]
+    if let Some(gpus) = probe_lspci_gpus() {
+        return cap_gpus(gpus);
+    }
+    Vec::new()
+}
+
+fn cap_gpus(mut gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
+    gpus.retain(|g| !g.name.trim().is_empty());
+    gpus.truncate(MAX_GPUS);
+    gpus
+}
+
+fn probe_nvidia_smi() -> Option<Vec<GpuInfo>> {
+    let output = run_capture(
+        "nvidia-smi",
+        &[
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+    )?;
+    let mut gpus = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        if parts.is_empty() || parts[0].is_empty() {
+            continue;
+        }
+        let name = parts[0].to_string();
+        let vram_total = parts
+            .get(1)
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|mib| (mib * 1024.0 * 1024.0) as u64);
+        let vram_used = parts
+            .get(2)
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|mib| (mib * 1024.0 * 1024.0) as u64);
+        let usage_pct = parts.get(3).and_then(|s| s.parse::<f32>().ok());
+        gpus.push(GpuInfo {
+            name,
+            vram_used,
+            vram_total,
+            usage_pct,
+        });
+    }
+    if gpus.is_empty() {
+        None
+    } else {
+        Some(gpus)
+    }
+}
+
+#[cfg(windows)]
+fn probe_windows_cim_gpus() -> Option<Vec<GpuInfo>> {
+    // Name|AdapterRAM — AdapterRAM is often wrong on modern GPUs; keep name, VRAM only if plausible.
+    let script = "Get-CimInstance Win32_VideoController | ForEach-Object { '{0}|{1}' -f $_.Name, $_.AdapterRAM }";
+    let output = run_capture(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    )?;
+    let mut gpus: Vec<GpuInfo> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (name, ram) = match line.split_once('|') {
+            Some((n, r)) => (n.trim(), r.trim()),
+            None => (line, ""),
+        };
+        if name.is_empty() || is_dummy_gpu_name(name) {
+            continue;
+        }
+        let vram_total = ram.parse::<u64>().ok().and_then(|b| {
+            // Win32 AdapterRAM is a 32-bit field and often nonsense; only keep 256MB..=48GB.
+            const MIN: u64 = 256 * 1024 * 1024;
+            const MAX: u64 = 48u64 * 1024 * 1024 * 1024;
+            if (MIN..=MAX).contains(&b) {
+                Some(b)
+            } else {
+                None
+            }
+        });
+        if gpus.iter().any(|g| g.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        gpus.push(GpuInfo {
+            name: name.to_string(),
+            vram_used: None,
+            vram_total,
+            usage_pct: None,
+        });
+    }
+    if gpus.is_empty() {
+        None
+    } else {
+        Some(gpus)
+    }
+}
+
+#[cfg(not(windows))]
+fn probe_lspci_gpus() -> Option<Vec<GpuInfo>> {
+    let output = run_capture("lspci", &[])?;
+    let mut gpus = Vec::new();
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !(lower.contains("vga compatible")
+            || lower.contains("3d controller")
+            || lower.contains("display controller"))
+        {
+            continue;
+        }
+        let name = line
+            .split_once(": ")
+            .map(|(_, rest)| rest.trim())
+            .unwrap_or(line.trim());
+        if name.is_empty() || is_dummy_gpu_name(name) {
+            continue;
+        }
+        if gpus.iter().any(|g| g.name.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        gpus.push(GpuInfo {
+            name: name.to_string(),
+            vram_used: None,
+            vram_total: None,
+            usage_pct: None,
+        });
+    }
+    if gpus.is_empty() {
+        None
+    } else {
+        Some(gpus)
+    }
+}
+
+fn is_dummy_gpu_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("microsoft basic display")
+        || n.contains("microsoft remote display")
+        || n.contains("virtualbox")
+        || (n.contains("aspeed") && n.contains("dummy"))
+        || n == "unknown"
+}
+
+fn run_capture(program: &str, args: &[&str]) -> Option<String> {
+    use std::process::Command;
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = cmd.output().ok()?;
+    if !output.status.success() && output.stdout.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn parse_gpu_field(v: &str) -> GpuInfo {
+    // GPU=name|vram_total_bytes|vram_used_bytes|usage_pct
+    let mut parts = v.splitn(4, '|');
+    let name = parts.next().unwrap_or("").trim().to_string();
+    let vram_total = parts
+        .next()
+        .and_then(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                s.parse().ok()
+            }
+        });
+    let vram_used = parts
+        .next()
+        .and_then(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                s.parse().ok()
+            }
+        });
+    let usage_pct = parts.next().and_then(|s| {
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            s.parse().ok()
+        }
+    });
+    GpuInfo {
+        name,
+        vram_used,
+        vram_total,
+        usage_pct,
+    }
+}
+
 /// Shell script run on remote SSH hosts (stdout KEY=value lines).
 pub fn remote_probe_script() -> &'static str {
     r#"printf 'OS=%s\n' "$(uname -s 2>/dev/null || echo unknown)"
@@ -236,6 +479,16 @@ fi
 # Real mounts only; each DISK=mount|total|used (bytes).
 df -B1 -P -x tmpfs -x devtmpfs -x squashfs -x overlay -x iso9660 -x udf 2>/dev/null \
   | awk 'NR>1 && $2+0>0 {printf "DISK=%s|%s|%s\n",$6,$2,$3}'
+# GPU: prefer nvidia-smi; else lspci name-only.
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null \
+    | awk -F',' '{
+        gsub(/^ +| +$/,"",$1); gsub(/^ +| +$/,"",$2); gsub(/^ +| +$/,"",$3); gsub(/^ +| +$/,"",$4);
+        if ($1!="") printf "GPU=%s|%.0f|%.0f|%s\n",$1,$2*1024*1024,$3*1024*1024,$4
+      }'
+elif command -v lspci >/dev/null 2>&1; then
+  lspci 2>/dev/null | awk -F': ' '/VGA compatible|3D controller|Display controller/{printf "GPU=%s||||\n",$2}'
+fi
 if [ -r /proc/loadavg ]; then
   awk '{printf "LOAD=%s %s %s\n",$1,$2,$3}' /proc/loadavg
 fi
@@ -326,6 +579,20 @@ pub fn parse_remote_probe(stdout: &str) -> Result<HostSnapshot> {
             }
             "LOAD" => snap.load = Some(v.to_string()),
             "UPTIME" => snap.uptime_secs = v.parse().unwrap_or(0),
+            "GPU" => {
+                let gpu = parse_gpu_field(v);
+                if gpu.name.is_empty() || is_dummy_gpu_name(&gpu.name) {
+                    continue;
+                }
+                if snap
+                    .gpus
+                    .iter()
+                    .any(|g| g.name.eq_ignore_ascii_case(&gpu.name))
+                {
+                    continue;
+                }
+                snap.gpus.push(gpu);
+            }
             _ => {}
         }
     }
@@ -342,6 +609,7 @@ pub fn parse_remote_probe(stdout: &str) -> Result<HostSnapshot> {
         snap.cpu_model = "—".into();
     }
     snap.disks = rank_disks(std::mem::take(&mut snap.disks));
+    snap.gpus = cap_gpus(std::mem::take(&mut snap.gpus));
     Ok(snap)
 }
 

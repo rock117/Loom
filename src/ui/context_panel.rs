@@ -2576,6 +2576,143 @@ impl ContextPanel {
                                 d.ratio(),
                             )
                         }))
+                        .children(s.gpus.into_iter().map(|g| {
+                            // Name + optional VRAM meter (same pattern as Memory/Disk).
+                            let detail = match (g.vram_used, g.vram_total, g.usage_pct) {
+                                (Some(used), Some(total), Some(util)) => Some(format!(
+                                    "{} / {} · util {util:.0}%",
+                                    host_info::format_bytes(used),
+                                    host_info::format_bytes(total)
+                                )),
+                                (Some(used), Some(total), None) => Some(format!(
+                                    "{} / {}",
+                                    host_info::format_bytes(used),
+                                    host_info::format_bytes(total)
+                                )),
+                                (None, Some(total), Some(util)) => Some(format!(
+                                    "{} total · util {util:.0}%",
+                                    host_info::format_bytes(total)
+                                )),
+                                (None, Some(total), None) => {
+                                    Some(format!("{} total", host_info::format_bytes(total)))
+                                }
+                                (None, None, Some(util)) => Some(format!("util {util:.0}%")),
+                                _ => None,
+                            };
+
+                            if let (Some(_used), Some(_total), Some(ratio)) =
+                                (g.vram_used, g.vram_total, g.vram_ratio())
+                            {
+                                let ratio = ratio.clamp(0.0, 1.0);
+                                let pct = (ratio * 100.0) as u32;
+                                let fill = if ratio >= 0.9 {
+                                    theme::DANGER
+                                } else {
+                                    theme::ACCENT
+                                };
+                                let pct_color = if ratio >= 0.9 {
+                                    theme::DANGER
+                                } else {
+                                    theme::TEXT
+                                };
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::TEXT)
+                                            .overflow_hidden()
+                                            .child(g.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(theme::SPACE_1))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_MUTED)
+                                                    .child("VRAM"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(pct_color)
+                                                    .child(format!("{pct}%")),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .h(px(6.0))
+                                            .rounded(px(3.0))
+                                            .bg(theme::BORDER_SUBTLE)
+                                            .overflow_hidden()
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded(px(3.0))
+                                                    .bg(fill)
+                                                    .w(relative(ratio)),
+                                            ),
+                                    )
+                                    .when_some(detail, |d, text| {
+                                        d.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .child(text),
+                                        )
+                                    })
+                            } else {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(theme::SPACE_1))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_MUTED)
+                                                    .child("GPU"),
+                                            )
+                                            .when_some(g.usage_pct, |d, util| {
+                                                d.child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(theme::TEXT)
+                                                        .child(format!("{util:.0}%")),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::TEXT)
+                                            .overflow_hidden()
+                                            .child(g.name),
+                                    )
+                                    .when_some(detail.filter(|_| g.vram_total.is_some()), |d, text| {
+                                        d.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .child(text),
+                                        )
+                                    })
+                            }
+                        }))
                         .child(
                             div()
                                 .text_xs()
