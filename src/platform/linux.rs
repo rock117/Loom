@@ -13,3 +13,11 @@ pub fn native_default_shell() -> String {
 pub fn native_monospace_font_family() -> &'static str {
     "DejaVu Sans Mono"
 }
+
+pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    std::process::Command::new("xdg-open")
+        .arg(path.as_os_str())
+        .spawn()?;
+    Ok(())
+}

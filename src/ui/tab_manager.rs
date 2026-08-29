@@ -13,7 +13,7 @@ use crate::session::credentials;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
-use crate::terminal::{ColorPalette, TerminalConfig, TerminalView};
+use crate::terminal::{ColorPalette, TerminalConfig, TerminalView, TerminalViewEvent};
 use crate::ui::pane_layout::{PaneLayout, RemoveResult, SplitDirection};
 use crate::ui::workspace_store::WorkspaceStore;
 
@@ -26,6 +26,7 @@ pub struct PaneSession {
     pub pty_master: Option<Arc<parking_lot::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub pty_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
     pub ssh_shutdown: Option<flume::Sender<()>>,
+    _term_subscriptions: Vec<Subscription>,
 }
 
 pub struct TabSession {
@@ -162,6 +163,7 @@ impl TabManager {
             pty_master: None,
             pty_killer: None,
             ssh_shutdown: None,
+            _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(profile.name.clone(), pane);
         let id = tab.id;
@@ -194,6 +196,7 @@ impl TabManager {
             pty_master: None,
             pty_killer: None,
             ssh_shutdown: None,
+            _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(profile.name.clone(), pane);
         let tab_id = tab.id;
@@ -262,7 +265,9 @@ impl TabManager {
                             TerminalView::new(handles.writer, handles.reader, config, cx)
                                 .with_resize_callback(move |c, r| resize(c, r))
                         });
+                        let term_subs = wire_terminal_session(&terminal, None, cx);
                         pane.terminal = Some(terminal);
+                        pane._term_subscriptions = term_subs;
                         pane.ssh_shutdown = Some(handles.shutdown);
                         pane.state = ConnectionState::Connected;
                         pane.status_message = format!("ssh · {label}");
@@ -307,15 +312,18 @@ impl TabManager {
             font_family
         };
         let config = terminal_config(self.font_size, family, self.show_line_numbers);
+        let working_dir = cwd
+            .clone()
+            .or_else(|| LocalPty::default_cwd());
         let terminal = cx.new(|cx| {
             TerminalView::new(pty.writer, pty.reader, config, cx).with_resize_callback(resize)
         });
+        let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
         terminal.read(cx).focus_handle().focus(window);
 
-        let cwd_label = cwd
+        let cwd_label = working_dir
             .as_ref()
             .map(|p| p.display().to_string())
-            .or_else(|| LocalPty::default_cwd().map(|p| p.display().to_string()))
             .unwrap_or_else(|| ".".into());
         let shell_short = std::path::Path::new(&shell)
             .file_name()
@@ -331,6 +339,7 @@ impl TabManager {
             pty_master: Some(master),
             pty_killer: Some(killer),
             ssh_shutdown: None,
+            _term_subscriptions: term_subs,
         })
     }
 
@@ -408,6 +417,7 @@ impl TabManager {
                             pty_master: None,
                             pty_killer: None,
                             ssh_shutdown: None,
+                            _term_subscriptions: Vec::new(),
                         };
                         let tab = &mut self.tabs[tab_idx];
                         tab.panes.insert(new_id, pane);
@@ -573,31 +583,90 @@ impl TabManager {
         let Some(active) = self.active else {
             return;
         };
-        let Some(idx) = self.tabs.iter().position(|t| t.id == active) else {
+        let Some(tab) = self.tabs.iter().find(|t| t.id == active) else {
             return;
         };
-        let focused = self.tabs[idx].focused;
-        match self.tabs[idx].layout.remove_leaf(focused) {
+        let pane_id = tab.focused;
+        self.close_pane(pane_id, Some(window), cx);
+    }
+
+    fn pane_id_for_terminal(&self, term: &Entity<TerminalView>) -> Option<Uuid> {
+        for tab in &self.tabs {
+            for (id, pane) in &tab.panes {
+                if pane
+                    .terminal
+                    .as_ref()
+                    .is_some_and(|t| t.entity_id() == term.entity_id())
+                {
+                    return Some(*id);
+                }
+            }
+        }
+        None
+    }
+
+    fn focus_pane_id(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            if tab.panes.contains_key(&pane_id) {
+                tab.focused = pane_id;
+                self.active = Some(tab.id);
+                cx.notify();
+                return;
+            }
+        }
+    }
+
+    /// Close a specific pane (or its tab when it is the last pane).
+    pub fn close_pane(
+        &mut self,
+        pane_id: Uuid,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.panes.contains_key(&pane_id))
+        else {
+            return;
+        };
+        let tab_id = self.tabs[tab_idx].id;
+        self.tabs[tab_idx].focused = pane_id;
+        match self.tabs[tab_idx].layout.remove_leaf(pane_id) {
             RemoveResult::RemovedRoot => {
-                self.close_tab(active, cx);
+                self.close_tab(tab_id, cx);
             }
             RemoveResult::Collapsed { focus } => {
-                if let Some(mut pane) = self.tabs[idx].panes.remove(&focused) {
+                if let Some(mut pane) = self.tabs[tab_idx].panes.remove(&pane_id) {
                     teardown_pane_io(&mut pane);
                     drop(pane.terminal);
                 }
-                self.tabs[idx].focused = focus;
-                if let Some(term) = self.tabs[idx]
-                    .panes
-                    .get(&focus)
-                    .and_then(|p| p.terminal.as_ref())
-                {
-                    term.read(cx).focus_handle().focus(window);
+                self.tabs[tab_idx].focused = focus;
+                if let Some(window) = window {
+                    if let Some(term) = self.tabs[tab_idx]
+                        .panes
+                        .get(&focus)
+                        .and_then(|p| p.terminal.as_ref())
+                    {
+                        term.read(cx).focus_handle().focus(window);
+                    }
                 }
                 cx.notify();
             }
             RemoveResult::NotFound => {}
         }
+    }
+
+    /// Close the focused pane (or the whole tab when it is the last pane).
+    pub fn close_focused_pane(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        let Some(active) = self.active else {
+            return;
+        };
+        let Some(tab) = self.tabs.iter().find(|t| t.id == active) else {
+            return;
+        };
+        let pane_id = tab.focused;
+        self.close_pane(pane_id, window, cx);
     }
 
     pub fn close_tab(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -754,6 +823,30 @@ impl Drop for TabManager {
     fn drop(&mut self) {
         self.teardown_all();
     }
+}
+
+fn wire_terminal_session(
+    terminal: &Entity<TerminalView>,
+    working_dir: Option<std::path::PathBuf>,
+    cx: &mut Context<TabManager>,
+) -> Vec<Subscription> {
+    terminal.update(cx, |t, cx| {
+        t.set_working_directory(working_dir, cx);
+    });
+    let sub = cx.subscribe(terminal, |this, term, event: &TerminalViewEvent, cx| {
+        let Some(pane_id) = this.pane_id_for_terminal(&term) else {
+            return;
+        };
+        match event {
+            TerminalViewEvent::FocusRequested => {
+                this.focus_pane_id(pane_id, cx);
+            }
+            TerminalViewEvent::CloseRequested => {
+                this.close_pane(pane_id, None, cx);
+            }
+        }
+    });
+    vec![sub]
 }
 
 fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {

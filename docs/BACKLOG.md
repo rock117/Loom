@@ -25,6 +25,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 |----|------|--------|
 | T1 | **Output search** | **Shipped** — Ctrl+F find bar over scrollback/grid (literal match, Enter/F3 next, Shift+Enter/Shift+F3 prev, Esc closes). |
 | T2 | **Selection polish** | Double-click word, triple-click line, optional block select. |
+| T2b | **Terminal context menu** | **Shipped** — right-click: Copy, Paste, Copy Path, Reveal in File Explorer, Find…, Select All, Close. Cwd tracks `cd` via OSC 7 / OSC 9;9 (local pwsh/cmd/bash inject OSC). |
 | T3 | **Link detection** | Clickable paths / URLs in output. |
 | T4 | **Notifications** | Long-running command done, bell, disconnect toasts. |
 | T5 | **Output syntax color via external tools** | Prefer `bat` / highlighters that emit ANSI; do **not** build in-app language highlighters for PTY output. Optional: docs or settings hints. Low priority. |

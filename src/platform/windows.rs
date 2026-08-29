@@ -25,6 +25,21 @@ pub fn native_monospace_font_family() -> &'static str {
     }
 }
 
+pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if path.is_file() {
+        // Single argument form: /select,C:\full\path
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", path.display()))
+            .spawn()?;
+    } else {
+        std::process::Command::new("explorer")
+            .arg(path.as_os_str())
+            .spawn()?;
+    }
+    Ok(())
+}
+
 fn font_file_exists(path: &str) -> bool {
     std::path::Path::new(path).is_file()
 }

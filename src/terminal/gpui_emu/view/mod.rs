@@ -47,7 +47,10 @@
 //! terminal.read(cx).focus_handle().focus(window);
 //! ```
 
+mod context_menu;
 mod find;
+
+pub use context_menu::TerminalViewEvent;
 
 use super::colors::ColorPalette;
 use super::event::{GpuiEventProxy, TerminalEvent};
@@ -434,6 +437,12 @@ pub struct TerminalView {
 
     /// Keeps the find-bar caret blink loop alive while find is open.
     _find_caret_blink: Option<Task<()>>,
+
+    /// Right-click context menu anchor (window coordinates).
+    context_menu: Option<Point<Pixels>>,
+
+    /// Local working directory for Copy Path / Reveal (unset for SSH).
+    working_directory: Option<std::path::PathBuf>,
 }
 
 struct ScrollbarDrag {
@@ -549,6 +558,9 @@ impl TerminalView {
                         // Process bytes and notify the view
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
+                            if let Some(cwd) = view.state.take_cwd_update() {
+                                view.working_directory = Some(cwd);
+                            }
                             view.dispatch_pending_events(None, cx);
                             cx.notify();
                         });
@@ -589,6 +601,8 @@ impl TerminalView {
             scrollbar_drag: None,
             find: None,
             _find_caret_blink: None,
+            context_menu: None,
+            working_directory: None,
         }
     }
 
@@ -783,6 +797,11 @@ impl TerminalView {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
+        if self.context_menu.is_some() && key == "escape" {
+            self.close_context_menu(cx);
+            return;
+        }
+
         // Ctrl+F opens find (do not forward 0x06 to the PTY).
         if mods.control
             && !mods.alt
@@ -892,13 +911,17 @@ impl TerminalView {
         cx.notify();
 
         if event.button == MouseButton::Right {
-            self.paste_from_clipboard(cx);
+            cx.emit(crate::terminal::TerminalViewEvent::FocusRequested);
+            self.open_context_menu(event.position, cx);
+            cx.stop_propagation();
             return;
         }
 
         if event.button != MouseButton::Left {
             return;
         }
+
+        self.close_context_menu(cx);
 
         if self.handle_scrollbar_mouse_down(event.position, cx) {
             return;
@@ -1648,6 +1671,7 @@ impl Render for TerminalView {
                 .size_full(),
             )
             .when_some(self.render_find_bar(cx), |d, bar| d.child(bar))
+            .when_some(self.render_context_menu(cx), |d, menu| d.child(menu))
     }
 }
 

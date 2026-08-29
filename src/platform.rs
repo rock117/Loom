@@ -43,3 +43,8 @@ pub fn resolve_shell(configured: Option<&str>) -> String {
     }
     default_shell()
 }
+
+/// Reveal a file or directory in the OS file manager (Explorer / Finder / file manager).
+pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    native_reveal_in_file_manager(path)
+}

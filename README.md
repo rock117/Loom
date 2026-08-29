@@ -13,6 +13,7 @@ A desktop terminal client built with [GPUI](https://gpui.rs): local shell and SS
 - **SSH**: `russh` sessions; passwords stored in the OS keyring when “Remember” is enabled
 - **Find**: Ctrl+F searches terminal scrollback (literal match)
 - **Line numbers**: optional left gutter (Settings → Line numbers)
+- **Context menu**: right-click terminal for Copy / Paste / Copy Path / Reveal / Find / Close (replaces right-click paste)
 - **Splits**: Tab-bar columns icon → Split Right / Left / Up / Down (Zed-style popover)
 
 ## Layout

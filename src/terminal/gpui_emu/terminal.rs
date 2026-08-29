@@ -45,10 +45,12 @@
 //! [`process_bytes`]: TerminalState::process_bytes
 
 use super::event::GpuiEventProxy;
+use super::osc::OscSidecar;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Simple dimensions implementation for terminal initialization.
@@ -127,6 +129,9 @@ pub struct TerminalState {
     /// VTE parser for converting byte streams into terminal actions.
     parser: Processor,
 
+    /// Side-channel OSC observer (cwd via OSC 7 / 9;9).
+    osc: OscSidecar,
+
     /// Number of columns in the terminal.
     cols: usize,
 
@@ -185,6 +190,7 @@ impl TerminalState {
         Self {
             term: Arc::new(Mutex::new(term)),
             parser,
+            osc: OscSidecar::new(),
             cols,
             rows,
         }
@@ -216,6 +222,19 @@ impl TerminalState {
         // The parser.advance method calls handler methods on the Term
         // The Term implements the Handler trait from the VTE crate
         self.parser.advance(&mut *term, bytes);
+        drop(term);
+        // alacritty does not emit OSC 7 — observe on a side-channel parser.
+        self.osc.advance(bytes);
+    }
+
+    /// Shell-reported cwd from the latest OSC 7 / OSC 9;9 (if any).
+    pub fn reported_cwd(&self) -> Option<&Path> {
+        self.osc.current_cwd()
+    }
+
+    /// Consume a cwd change since the last call (for view sync).
+    pub fn take_cwd_update(&mut self) -> Option<PathBuf> {
+        self.osc.take_cwd_update()
     }
 
     /// Resize the terminal to new dimensions.

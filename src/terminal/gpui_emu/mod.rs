@@ -4,9 +4,10 @@
 mod colors;
 mod event;
 mod input;
+mod osc;
 mod render;
 mod terminal;
 mod view;
 
 pub use colors::ColorPalette;
-pub use view::{TerminalConfig, TerminalView};
+pub use view::{TerminalConfig, TerminalView, TerminalViewEvent};
