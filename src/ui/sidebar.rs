@@ -18,6 +18,8 @@ pub struct Sidebar {
 
 struct ContextMenuState {
     profile_id: Uuid,
+    /// Window-space point from the right-click (for `anchored` positioning).
+    position: Point<Pixels>,
 }
 
 impl Sidebar {
@@ -120,7 +122,10 @@ impl Render for Sidebar {
             .iter()
             .map(|g| (g.id, g.name.clone()))
             .collect();
-        let context_menu = self.context_menu.as_ref().map(|m| m.profile_id);
+        let context_menu = self
+            .context_menu
+            .as_ref()
+            .map(|m| (m.profile_id, m.position));
 
         div()
             .track_focus(&self.focus_handle)
@@ -340,14 +345,19 @@ impl Render for Sidebar {
                                         ))
                                         .on_mouse_down(
                                             MouseButton::Right,
-                                            cx.listener(move |this, _, _, cx| {
-                                                this.store.update(cx, |s, cx| {
-                                                    s.select_profile(pid, cx)
-                                                });
-                                                this.context_menu =
-                                                    Some(ContextMenuState { profile_id: pid });
-                                                cx.notify();
-                                            }),
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.select_profile(pid, cx)
+                                                    });
+                                                    this.context_menu = Some(ContextMenuState {
+                                                        profile_id: pid,
+                                                        position: event.position,
+                                                    });
+                                                    cx.notify();
+                                                    cx.stop_propagation();
+                                                },
+                                            ),
                                         )
                                 }))
                             })
@@ -364,58 +374,102 @@ impl Render for Sidebar {
                     .text_color(theme::TEXT_DISABLED)
                     .child("↵ open · F2 rename · Del · right-click"),
             )
-            // Context menu overlay
-            .when_some(context_menu, |this, pid| {
+            // Context menu — anchored to right-click point (window coords)
+            .when_some(context_menu, |this, (pid, position)| {
                 let moves = other_groups.clone();
                 this.child(
-                    div()
-                        .absolute()
-                        .bottom(px(28.0))
-                        .left(px(theme::SPACE_2))
-                        .right(px(theme::SPACE_2))
-                        .p(px(theme::SPACE_1))
-                        .rounded(px(theme::RADIUS))
-                        .bg(theme::ELEVATED)
-                        .border_1()
-                        .border_color(theme::BORDER)
-                        .shadow_md()
-                        .child(self.menu_item("ctx-open", "Open", false, cx, move |_, _, cx| {
-                            cx.emit(SidebarEvent::OpenProfile(pid));
-                        }))
-                        .child(self.menu_item("ctx-rename", "Rename", false, cx, |this, _, cx| {
-                            this.store.update(cx, |s, cx| s.begin_rename(cx));
-                        }))
-                        .child(self.menu_item("ctx-dup", "Duplicate", false, cx, move |this, _, cx| {
-                            this.store.update(cx, |s, cx| {
-                                s.duplicate_profile(pid, cx);
-                            });
-                        }))
-                        .children(moves.into_iter().take(4).map(|(gid, name)| {
-                            let label: SharedString = format!("Move → {name}").into();
+                    anchored()
+                        .position(position)
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(Edges {
+                            top: px(4.0),
+                            right: px(4.0),
+                            bottom: px(4.0),
+                            left: px(4.0),
+                        })
+                        .child(
                             div()
-                                .id(SharedString::from(format!("ctx-move-{gid}")))
-                                .w_full()
-                                .px(px(theme::SPACE_2))
-                                .py(px(theme::SPACE_1))
-                                .rounded(px(theme::RADIUS_SM))
-                                .text_sm()
-                                .text_color(theme::TEXT_MUTED)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                                .child(label)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.store.update(cx, |s, cx| {
-                                        s.move_profile_to_group(pid, gid, cx);
-                                    });
-                                    this.context_menu = None;
-                                    cx.notify();
+                                .min_w(px(160.0))
+                                .p(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS))
+                                .bg(theme::ELEVATED)
+                                .border_1()
+                                .border_color(theme::BORDER)
+                                .shadow_md()
+                                .occlude()
+                                .child(self.menu_item(
+                                    "ctx-open",
+                                    "Open",
+                                    false,
+                                    cx,
+                                    move |_, _, cx| {
+                                        cx.emit(SidebarEvent::OpenProfile(pid));
+                                    },
+                                ))
+                                .child(self.menu_item(
+                                    "ctx-rename",
+                                    "Rename",
+                                    false,
+                                    cx,
+                                    |this, _, cx| {
+                                        this.store.update(cx, |s, cx| s.begin_rename(cx));
+                                    },
+                                ))
+                                .child(self.menu_item(
+                                    "ctx-dup",
+                                    "Duplicate",
+                                    false,
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.store.update(cx, |s, cx| {
+                                            s.duplicate_profile(pid, cx);
+                                        });
+                                    },
+                                ))
+                                .children(moves.into_iter().take(4).map(|(gid, name)| {
+                                    let label: SharedString = format!("Move → {name}").into();
+                                    div()
+                                        .id(SharedString::from(format!("ctx-move-{gid}")))
+                                        .w_full()
+                                        .px(px(theme::SPACE_2))
+                                        .py(px(theme::SPACE_1))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .text_sm()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.store.update(cx, |s, cx| {
+                                                s.move_profile_to_group(pid, gid, cx);
+                                            });
+                                            this.context_menu = None;
+                                            cx.notify();
+                                        }))
                                 }))
-                        }))
-                        .child(div().h(px(1.0)).my(px(theme::SPACE_1)).bg(theme::BORDER_SUBTLE))
-                        .child(self.menu_item("ctx-del", "Delete", true, cx, |this, _, cx| {
-                            this.store.update(cx, |s, cx| s.delete_selection(cx));
-                        }))
-                        .child(self.menu_item("ctx-dismiss", "Close", false, cx, |_, _, _| {})),
+                                .child(
+                                    div()
+                                        .h(px(1.0))
+                                        .my(px(theme::SPACE_1))
+                                        .bg(theme::BORDER_SUBTLE),
+                                )
+                                .child(self.menu_item(
+                                    "ctx-del",
+                                    "Delete",
+                                    true,
+                                    cx,
+                                    |this, _, cx| {
+                                        this.store.update(cx, |s, cx| s.delete_selection(cx));
+                                    },
+                                ))
+                                .child(self.menu_item(
+                                    "ctx-dismiss",
+                                    "Close",
+                                    false,
+                                    cx,
+                                    |_, _, _| {},
+                                )),
+                        ),
                 )
             })
             .on_mouse_down(
