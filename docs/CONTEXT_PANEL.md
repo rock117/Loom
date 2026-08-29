@@ -77,14 +77,16 @@ Same Files UX as SSH; backend is container listing + `docker cp`, not SFTP. Spec
 
 ## Info
 
-**Host** metrics only (no session summary). Loaded automatically the first time you open Info for the current pane; click **↻** to refresh (no interval auto-refresh).
+Compact **Host** view (no session summary). Loads on first open for the current pane; **↻** refreshes (no interval polling).
 
-| Fields |
-|--------|
-| Hostname, OS/kernel, CPU (model · cores · % on Local), memory bar, disk bar (primary mount), load (when available), uptime |
+| Block | Content |
+|-------|---------|
+| Identity | Hostname as title; OS/kernel and CPU as muted lines |
+| Resources | Label; bar with % to its right; used/total under the bar |
+| Footer | `Load … · Up …` on one line |
 
-- **Local:** `sysinfo` (see `src/session/host_info.rs`)
-- **SSH:** one-shot remote shell probe on the same russh session (`SftpRequest::HostProbe`), not via the interactive PTY
+- **Local:** `sysinfo` (`src/session/host_info.rs`)
+- **SSH:** one-shot remote shell probe (`SftpRequest::HostProbe`), not via the interactive PTY
 
 
 ## Non-goals (for now)

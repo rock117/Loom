@@ -2361,61 +2361,56 @@ impl ContextPanel {
         let err = self.host_info_error.clone();
         let snap = self.host_info.clone();
 
-        fn row(label: &str, value: String) -> Div {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child(label.to_string()),
-                )
-                .child(div().text_xs().text_color(theme::TEXT).child(value))
-        }
-
-        fn meter(label: &str, used: u64, total: u64, ratio: f32) -> Div {
+        // Label on its own line; bar + right-aligned %; used/total under the bar.
+        fn resource_meter(label: String, used: u64, total: u64, ratio: f32) -> Div {
             let pct = (ratio.clamp(0.0, 1.0) * 100.0) as u32;
             let bar_w = ratio.clamp(0.0, 1.0);
             div()
                 .flex()
                 .flex_col()
-                .gap(px(4.0))
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child(label),
+                )
                 .child(
                     div()
                         .flex()
-                        .justify_between()
+                        .items_center()
+                        .gap(px(theme::SPACE_2))
                         .child(
                             div()
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .child(label.to_string()),
+                                .flex_1()
+                                .h(px(6.0))
+                                .rounded(px(3.0))
+                                .bg(theme::BORDER_SUBTLE)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        .rounded(px(3.0))
+                                        .bg(theme::ACCENT)
+                                        .w(relative(bar_w)),
+                                ),
                         )
                         .child(
                             div()
                                 .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::TEXT)
-                                .child(format!(
-                                    "{} / {} · {pct}%",
-                                    host_info::format_bytes(used),
-                                    host_info::format_bytes(total)
-                                )),
+                                .child(format!("{pct}%")),
                         ),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .h(px(6.0))
-                        .rounded(px(3.0))
-                        .bg(theme::BORDER_SUBTLE)
-                        .child(
-                            div()
-                                .h_full()
-                                .rounded(px(3.0))
-                                .bg(theme::ACCENT)
-                                .w(relative(bar_w)),
-                        ),
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child(format!(
+                            "{} / {}",
+                            host_info::format_bytes(used),
+                            host_info::format_bytes(total)
+                        )),
                 )
         }
 
@@ -2481,52 +2476,98 @@ impl ContextPanel {
                 )
             })
             .when_some(snap, |d, s| {
-                let cpu = if let Some(pct) = s.cpu_usage_pct {
-                    format!(
-                        "{} · {} cores · {pct:.0}%",
-                        if s.cpu_model.is_empty() {
-                            "—"
-                        } else {
-                            &s.cpu_model
-                        },
-                        s.cpu_cores
-                    )
-                } else {
-                    format!(
-                        "{} · {} cores",
-                        if s.cpu_model.is_empty() {
-                            "—"
-                        } else {
-                            &s.cpu_model
-                        },
-                        s.cpu_cores
-                    )
-                };
                 let os_line = if s.kernel.is_empty() {
                     s.os.clone()
                 } else {
                     format!("{} · {}", s.os, s.kernel)
                 };
-                d.child(row("Hostname", s.hostname.clone()))
-                    .child(row("OS", os_line))
-                    .child(row("CPU", cpu))
-                    .child(meter(
-                        "Memory",
-                        s.mem_used,
-                        s.mem_total,
-                        s.mem_ratio(),
-                    ))
-                    .child(meter(
-                        &format!("Disk ({})", s.disk_mount),
-                        s.disk_used,
-                        s.disk_total,
-                        s.disk_ratio(),
-                    ))
-                    .when_some(s.load.clone(), |d, load| d.child(row("Load", load)))
-                    .child(row(
-                        "Uptime",
-                        host_info::format_uptime(s.uptime_secs),
-                    ))
+                let cpu_line = {
+                    let model = if s.cpu_model.is_empty() {
+                        "—"
+                    } else {
+                        s.cpu_model.as_str()
+                    };
+                    // Keep the identity line short: cores (+ usage if known).
+                    if let Some(pct) = s.cpu_usage_pct {
+                        format!("{model} · {} cores · {pct:.0}%", s.cpu_cores)
+                    } else {
+                        format!("{model} · {} cores", s.cpu_cores)
+                    }
+                };
+                let footer = match &s.load {
+                    Some(load) if !load.is_empty() => {
+                        format!(
+                            "Load {load} · Up {}",
+                            host_info::format_uptime(s.uptime_secs)
+                        )
+                    }
+                    _ => format!("Up {}", host_info::format_uptime(s.uptime_secs)),
+                };
+
+                d.child(
+                    // Identity: hostname as title, OS/CPU as muted lines.
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::TEXT)
+                                .overflow_hidden()
+                                .child(s.hostname.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .overflow_hidden()
+                                .child(os_line),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .overflow_hidden()
+                                .child(cpu_line),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(theme::SPACE_1))
+                        .pt(px(theme::SPACE_2))
+                        .border_t_1()
+                        .border_color(theme::BORDER_SUBTLE)
+                        .flex()
+                        .flex_col()
+                        .gap(px(theme::SPACE_2))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::TEXT_MUTED)
+                                .child("Resources"),
+                        )
+                        .child(resource_meter(
+                            "Memory".into(),
+                            s.mem_used,
+                            s.mem_total,
+                            s.mem_ratio(),
+                        ))
+                        .child(resource_meter(
+                            format!("Disk ({})", s.disk_mount),
+                            s.disk_used,
+                            s.disk_total,
+                            s.disk_ratio(),
+                        ))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .child(footer),
+                        ),
+                )
             })
             .into_any_element()
     }
