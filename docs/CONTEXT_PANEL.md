@@ -82,11 +82,11 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 | Block | Content |
 |-------|---------|
 | Identity | Hostname as title; OS/kernel and CPU as muted lines |
-| Resources | Label; bar with % to its right; used/total under the bar |
+| Resources | Memory meter, then up to 5 disks (primary first, then fullest). Continuous bar; fill turns danger at ≥90% |
 | Footer | `Load … · Up …` on one line |
 
-- **Local:** `sysinfo` (`src/session/host_info.rs`)
-- **SSH:** one-shot remote shell probe (`SftpRequest::HostProbe`), not via the interactive PTY
+- **Local:** `sysinfo` (`src/session/host_info.rs`); skips pseudo FS / noise mounts
+- **SSH:** one-shot remote shell probe (`SftpRequest::HostProbe` + `df`), not via the interactive PTY
 
 
 ## Non-goals (for now)

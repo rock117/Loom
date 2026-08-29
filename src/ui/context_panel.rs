@@ -2361,45 +2361,58 @@ impl ContextPanel {
         let err = self.host_info_error.clone();
         let snap = self.host_info.clone();
 
-        // Label on its own line; bar + right-aligned %; used/total under the bar.
+        // Industry pattern (narrow side panel): label+% · full-width continuous meter · used/total.
+        // Severity on the fill (≥90% danger) — same idea as Activity Monitor / Task Manager.
         fn resource_meter(label: String, used: u64, total: u64, ratio: f32) -> Div {
-            let pct = (ratio.clamp(0.0, 1.0) * 100.0) as u32;
-            let bar_w = ratio.clamp(0.0, 1.0);
+            let ratio = ratio.clamp(0.0, 1.0);
+            let pct = (ratio * 100.0) as u32;
+            let fill = if ratio >= 0.9 {
+                theme::DANGER
+            } else {
+                theme::ACCENT
+            };
+            let pct_color = if ratio >= 0.9 {
+                theme::DANGER
+            } else {
+                theme::TEXT
+            };
             div()
                 .flex()
                 .flex_col()
-                .gap(px(3.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child(label),
-                )
+                .gap(px(4.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(theme::SPACE_2))
+                        .justify_between()
+                        .gap(px(theme::SPACE_1))
                         .child(
                             div()
-                                .flex_1()
-                                .h(px(6.0))
-                                .rounded(px(3.0))
-                                .bg(theme::BORDER_SUBTLE)
-                                .child(
-                                    div()
-                                        .h_full()
-                                        .rounded(px(3.0))
-                                        .bg(theme::ACCENT)
-                                        .w(relative(bar_w)),
-                                ),
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .child(label),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::TEXT)
+                                .text_color(pct_color)
                                 .child(format!("{pct}%")),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(theme::BORDER_SUBTLE)
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded(px(3.0))
+                                .bg(fill)
+                                .w(relative(ratio)),
                         ),
                 )
                 .child(
@@ -2555,12 +2568,14 @@ impl ContextPanel {
                             s.mem_total,
                             s.mem_ratio(),
                         ))
-                        .child(resource_meter(
-                            format!("Disk ({})", s.disk_mount),
-                            s.disk_used,
-                            s.disk_total,
-                            s.disk_ratio(),
-                        ))
+                        .children(s.disks.into_iter().map(|d| {
+                            resource_meter(
+                                format!("Disk ({})", d.mount),
+                                d.used,
+                                d.total,
+                                d.ratio(),
+                            )
+                        }))
                         .child(
                             div()
                                 .text_xs()
