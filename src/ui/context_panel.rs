@@ -1,7 +1,7 @@
-//! Right context panel — Files (SFTP) + Info (see docs/CONTEXT_PANEL.md).
+//! Right context panel — Files (SFTP / local FS) + Info (see docs/CONTEXT_PANEL.md).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
 use gpui::*;
@@ -9,11 +9,13 @@ use uuid::Uuid;
 
 use crate::model::{ConnectionState, ProfileKind};
 use crate::platform;
+use crate::session::local_fs;
 use crate::session::sftp::{
-    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferProgress, parent_remote,
-    transfer_cancel_flag,
+    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferProgress, join_remote,
+    parent_remote, transfer_cancel_flag,
 };
 use crate::shared::theme;
+use crate::ui::rename_edit::RenameEdit;
 use crate::ui::tab_manager::TabManager;
 use crate::ui::tooltip::Tooltip;
 use crate::ui::workspace_store::WorkspaceStore;
@@ -30,6 +32,12 @@ enum PanelTab {
 enum TransferDir {
     Download,
     Upload,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilesKind {
+    Sftp,
+    Local,
 }
 
 #[derive(Clone)]
@@ -72,29 +80,59 @@ struct TransferMenu {
     position: Point<Pixels>,
 }
 
+struct EntryMenu {
+    path: String,
+    position: Point<Pixels>,
+}
+
+enum FilesPrompt {
+    NewFolder {
+        edit: RenameEdit,
+    },
+    Rename {
+        path: String,
+        #[allow(dead_code)]
+        is_dir: bool,
+        edit: RenameEdit,
+    },
+    Chmod {
+        path: String,
+        edit: RenameEdit,
+    },
+    ConfirmDelete {
+        path: String,
+        is_dir: bool,
+        name: String,
+    },
+}
+
 pub struct ContextPanel {
     store: Entity<WorkspaceStore>,
     tabs: Entity<TabManager>,
     active_tab: PanelTab,
-    /// Remote cwd for the Files browser.
+    /// Remote or local cwd for the Files browser.
     cwd: Option<String>,
     home: Option<String>,
     entries: Vec<RemoteEntry>,
     selected: Option<String>,
     listing: bool,
     error: Option<String>,
-    /// Pane id we last bound SFTP state to.
+    /// Pane id we last bound file state to.
     bound_pane: Option<Uuid>,
+    files_kind: Option<FilesKind>,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
     /// Transfers keyed by SSH pane id (not shared across servers/tabs).
     transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
     transfer_menu: Option<TransferMenu>,
+    entry_menu: Option<EntryMenu>,
+    prompt: Option<FilesPrompt>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
     list_ratio: f32,
     files_body_bounds: Option<Bounds<Pixels>>,
     files_sash_drag: bool,
     focus_handle: FocusHandle,
+    _prompt_caret_blink: Option<Task<()>>,
     _observe_store: Subscription,
     _observe_tabs: Subscription,
 }
@@ -133,13 +171,17 @@ impl ContextPanel {
             listing: false,
             error: None,
             bound_pane: None,
+            files_kind: None,
             list_gen: 0,
             transfers_by_pane: HashMap::new(),
             transfer_menu: None,
+            entry_menu: None,
+            prompt: None,
             list_ratio,
             files_body_bounds: None,
             files_sash_drag: false,
             focus_handle: cx.focus_handle(),
+            _prompt_caret_blink: None,
             _observe_store,
             _observe_tabs,
         };
@@ -153,6 +195,35 @@ impl ContextPanel {
         let id = pane.id;
         let sftp = pane.ssh_sftp.clone()?;
         Some((id, sftp))
+    }
+
+    /// SSH SFTP, or a Local profile pane for filesystem browsing.
+    fn focused_files(&self, cx: &App) -> Option<(Uuid, FilesKind, Option<SftpHandle>)> {
+        let tab = self.tabs.read(cx).active_tab()?;
+        let pane = tab.focused_pane()?;
+        let id = pane.id;
+        if let Some(sftp) = pane.ssh_sftp.clone() {
+            return Some((id, FilesKind::Sftp, Some(sftp)));
+        }
+        let profile = self.store.read(cx).workspace.find_profile(pane.profile_id)?;
+        if matches!(profile.kind, ProfileKind::Local { .. }) {
+            return Some((id, FilesKind::Local, None));
+        }
+        None
+    }
+
+    fn reset_files_state(&mut self) {
+        self.list_gen = self.list_gen.wrapping_add(1);
+        self.cwd = None;
+        self.home = None;
+        self.entries.clear();
+        self.selected = None;
+        self.error = None;
+        self.listing = false;
+        self.transfer_menu = None;
+        self.entry_menu = None;
+        self.prompt = None;
+        self._prompt_caret_blink = None;
     }
 
     /// Drop transfer lists for panes that no longer exist; cancel their jobs.
@@ -216,35 +287,29 @@ impl ContextPanel {
 
     fn sync_session(&mut self, cx: &mut Context<Self>) {
         self.prune_closed_pane_transfers(cx);
-        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
-            if self.bound_pane.take().is_some() {
-                self.list_gen = self.list_gen.wrapping_add(1);
-                self.cwd = None;
-                self.home = None;
-                self.entries.clear();
-                self.selected = None;
-                self.error = None;
-                self.listing = false;
-                self.transfer_menu = None;
+        let Some((pane_id, kind, sftp)) = self.focused_files(cx) else {
+            if self.bound_pane.take().is_some() || self.files_kind.take().is_some() {
+                self.reset_files_state();
             }
             return;
         };
-        if self.bound_pane == Some(pane_id) {
+        if self.bound_pane == Some(pane_id) && self.files_kind == Some(kind) {
             return;
         }
         self.bound_pane = Some(pane_id);
-        self.list_gen = self.list_gen.wrapping_add(1);
-        self.cwd = None;
-        self.home = None;
-        self.entries.clear();
-        self.selected = None;
-        self.error = None;
-        self.listing = false;
-        self.transfer_menu = None;
-        self.go_home(sftp, cx);
+        self.files_kind = Some(kind);
+        self.reset_files_state();
+        match kind {
+            FilesKind::Sftp => {
+                if let Some(sftp) = sftp {
+                    self.go_home_sftp(sftp, cx);
+                }
+            }
+            FilesKind::Local => self.go_home_local(cx),
+        }
     }
 
-    fn go_home(&mut self, sftp: SftpHandle, cx: &mut Context<Self>) {
+    fn go_home_sftp(&mut self, sftp: SftpHandle, cx: &mut Context<Self>) {
         let (tx, rx) = flume::bounded(1);
         if sftp.request(SftpRequest::Home { reply: tx }).is_err() {
             self.error = Some("SFTP unavailable".into());
@@ -275,7 +340,44 @@ impl ContextPanel {
         .detach();
     }
 
+    fn go_home_local(&mut self, cx: &mut Context<Self>) {
+        let home = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .and_then(|t| t.focused_pane())
+            .and_then(|p| p.terminal.as_ref())
+            .and_then(|t| t.read(cx).working_directory())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(default_local_home);
+        self.home = Some(home.clone());
+        self.load_dir(home, cx);
+    }
+
+    fn go_home(&mut self, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                if let Some((_, sftp)) = self.focused_sftp(cx) {
+                    self.go_home_sftp(sftp, cx);
+                }
+            }
+            Some(FilesKind::Local) => self.go_home_local(cx),
+            None => {}
+        }
+    }
+
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => self.load_dir_sftp(path, cx),
+            Some(FilesKind::Local) => self.load_dir_local(path, cx),
+            None => {
+                self.error = Some("No file session".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn load_dir_sftp(&mut self, path: String, cx: &mut Context<Self>) {
         let Some((_, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
@@ -326,11 +428,49 @@ impl ContextPanel {
         .detach();
     }
 
+    fn load_dir_local(&mut self, path: String, cx: &mut Context<Self>) {
+        self.list_gen = self.list_gen.wrapping_add(1);
+        let req_gen = self.list_gen;
+        self.listing = true;
+        self.error = None;
+        cx.notify();
+        let path_buf = PathBuf::from(&path);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { local_fs::list_dir(&path_buf) })
+                .await;
+            this.update(cx, |this, cx| {
+                if req_gen != this.list_gen {
+                    return;
+                }
+                this.listing = false;
+                match result {
+                    Ok(entries) => {
+                        this.cwd = Some(path);
+                        this.entries = entries;
+                        this.selected = None;
+                        this.error = None;
+                    }
+                    Err(err) => {
+                        this.error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let Some(cwd) = self.cwd.clone() else {
             return;
         };
-        if let Some(parent) = parent_remote(&cwd) {
+        let parent = match self.files_kind {
+            Some(FilesKind::Local) => local_fs::parent_path(&cwd),
+            _ => parent_remote(&cwd),
+        };
+        if let Some(parent) = parent {
             self.load_dir(parent, cx);
         }
     }
@@ -338,12 +478,21 @@ impl ContextPanel {
     fn enter_or_download(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
         if entry.is_dir {
             self.load_dir(entry.path, cx);
-        } else {
-            self.download_entry(entry, cx);
+            return;
+        }
+        match self.files_kind {
+            Some(FilesKind::Sftp) => self.download_entry(entry, cx),
+            Some(FilesKind::Local) => {
+                let _ = platform::reveal_in_file_manager(Path::new(&entry.path));
+            }
+            None => {}
         }
     }
 
     fn download_selected(&mut self, cx: &mut Context<Self>) {
+        if self.files_kind != Some(FilesKind::Sftp) {
+            return;
+        }
         let Some(path) = self.selected.clone() else {
             return;
         };
@@ -486,7 +635,10 @@ impl ContextPanel {
         .detach();
     }
 
-    fn upload(&mut self, cx: &mut Context<Self>) {
+    fn upload_file(&mut self, cx: &mut Context<Self>) {
+        if self.files_kind != Some(FilesKind::Sftp) {
+            return;
+        }
         let Some(cwd) = self.cwd.clone() else {
             self.error = Some("Open a remote folder first".into());
             cx.notify();
@@ -497,51 +649,109 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        let id = Uuid::new_v4();
 
         cx.spawn(async move |this, cx| {
             let picked = rfd::AsyncFileDialog::new()
-                .set_title("Upload to remote")
+                .set_title("Upload file to remote")
                 .pick_file()
                 .await;
             let Some(handle) = picked else {
                 return;
             };
-            let local: PathBuf = handle.path().to_path_buf();
-            let label = local
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| local.display().to_string());
-            let cancel = transfer_cancel_flag();
-
             this.update(cx, |this, cx| {
-                this.pane_transfers_mut(pane_id).insert(
-                    0,
-                    TransferRow {
-                        id,
-                        label,
-                        direction: TransferDir::Upload,
-                        status: TransferStatus::Queued,
-                        local_path: Some(local.clone()),
-                        is_dir: false,
-                        started_at: None,
-                        elapsed: None,
-                        bytes_done: 0,
-                        bytes_total: None,
-                        cancel: cancel.clone(),
-                    },
-                );
-                cx.notify();
+                this.start_uploads(pane_id, sftp, cwd, vec![handle.path().to_path_buf()], cx);
             })
             .ok();
+        })
+        .detach();
+    }
 
+    fn upload_folder(&mut self, cx: &mut Context<Self>) {
+        if self.files_kind != Some(FilesKind::Sftp) {
+            return;
+        }
+        let Some(cwd) = self.cwd.clone() else {
+            self.error = Some("Open a remote folder first".into());
+            cx.notify();
+            return;
+        };
+        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
+            self.error = Some("No SSH session".into());
+            cx.notify();
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Upload folder to remote")
+                .pick_folder()
+                .await;
+            let Some(handle) = picked else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.start_uploads(pane_id, sftp, cwd, vec![handle.path().to_path_buf()], cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_uploads(
+        &mut self,
+        pane_id: Uuid,
+        sftp: SftpHandle,
+        remote_dir: String,
+        locals: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        for local in locals {
+            self.start_one_upload(pane_id, sftp.clone(), remote_dir.clone(), local, cx);
+        }
+    }
+
+    fn start_one_upload(
+        &mut self,
+        pane_id: Uuid,
+        sftp: SftpHandle,
+        remote_dir: String,
+        local: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let id = Uuid::new_v4();
+        let label = local
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| local.display().to_string());
+        let is_dir = local.is_dir();
+        let cancel = transfer_cancel_flag();
+
+        self.pane_transfers_mut(pane_id).insert(
+            0,
+            TransferRow {
+                id,
+                label,
+                direction: TransferDir::Upload,
+                status: TransferStatus::Queued,
+                local_path: Some(local.clone()),
+                is_dir,
+                started_at: None,
+                elapsed: None,
+                bytes_done: 0,
+                bytes_total: None,
+                cancel: cancel.clone(),
+            },
+        );
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
             if sftp
                 .request(SftpRequest::Upload {
                     id,
                     local,
-                    remote_dir: cwd,
+                    remote_dir,
                     progress: progress_tx,
                     reply: reply_tx,
                     cancel,
@@ -574,7 +784,12 @@ impl ContextPanel {
                             if this.find_transfer(id).is_some() {
                                 match result {
                                     Ok(Ok(outcome)) => {
-                                        this.finish_transfer(id, None, Some(outcome.bytes));
+                                        let files = if is_dir {
+                                            Some(outcome.files)
+                                        } else {
+                                            None
+                                        };
+                                        this.finish_transfer(id, files, Some(outcome.bytes));
                                         if let Some(cwd) = this.cwd.clone() {
                                             this.load_dir(cwd, cx);
                                         }
@@ -699,6 +914,564 @@ impl ContextPanel {
         let _ = platform::reveal_in_file_manager(path);
     }
 
+    fn begin_new_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cwd.is_none() {
+            self.error = Some("Open a folder first".into());
+            cx.notify();
+            return;
+        }
+        self.entry_menu = None;
+        self.prompt = Some(FilesPrompt::NewFolder {
+            edit: RenameEdit::new("New folder"),
+        });
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn begin_rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        self.entry_menu = None;
+        self.prompt = Some(FilesPrompt::Rename {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            edit: RenameEdit::new(entry.name.clone()),
+        });
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn begin_chmod_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        self.entry_menu = None;
+        self.prompt = Some(FilesPrompt::Chmod {
+            path,
+            edit: RenameEdit::new("755"),
+        });
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn begin_delete_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        self.entry_menu = None;
+        self._prompt_caret_blink = None;
+        self.prompt = Some(FilesPrompt::ConfirmDelete {
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            name: entry.name.clone(),
+        });
+        cx.notify();
+    }
+
+    fn start_prompt_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self._prompt_caret_blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if let Some(edit) = this.prompt_edit_mut() {
+                            edit.caret_visible = !edit.caret_visible;
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
+        self.prompt = None;
+        self._prompt_caret_blink = None;
+        cx.notify();
+    }
+
+    fn submit_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        self._prompt_caret_blink = None;
+        match prompt {
+            FilesPrompt::NewFolder { edit } => {
+                let name = edit.text.trim().to_string();
+                if name.is_empty() || name.contains('/') || name.contains('\\') {
+                    self.error = Some("Invalid folder name".into());
+                    self.prompt = Some(FilesPrompt::NewFolder { edit });
+                    self.start_prompt_caret_blink(cx);
+                    cx.notify();
+                    return;
+                }
+                let Some(cwd) = self.cwd.clone() else {
+                    return;
+                };
+                let path = match self.files_kind {
+                    Some(FilesKind::Sftp) => join_remote(&cwd, &name),
+                    Some(FilesKind::Local) => local_fs::join_child(&cwd, &name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    None => return,
+                };
+                self.run_mkdir(path, cx);
+            }
+            FilesPrompt::Rename { path, is_dir, edit } => {
+                let name = edit.text.trim().to_string();
+                if name.is_empty() || name.contains('/') || name.contains('\\') {
+                    self.error = Some("Invalid name".into());
+                    self.prompt = Some(FilesPrompt::Rename {
+                        path,
+                        is_dir,
+                        edit: RenameEdit::new(name),
+                    });
+                    self.start_prompt_caret_blink(cx);
+                    cx.notify();
+                    return;
+                }
+                let parent = match self.files_kind {
+                    Some(FilesKind::Local) => local_fs::parent_path(&path),
+                    _ => parent_remote(&path),
+                };
+                let Some(parent) = parent.or_else(|| self.cwd.clone()) else {
+                    return;
+                };
+                let to = match self.files_kind {
+                    Some(FilesKind::Sftp) => join_remote(&parent, &name),
+                    Some(FilesKind::Local) => local_fs::join_child(&parent, &name)
+                        .to_string_lossy()
+                        .into_owned(),
+                    None => return,
+                };
+                self.run_rename(path, to, cx);
+            }
+            FilesPrompt::Chmod { path, edit } => match local_fs::parse_mode(&edit.text) {
+                Ok(mode) => self.run_chmod(path, mode, cx),
+                Err(err) => {
+                    self.error = Some(format!("{err:#}"));
+                    self.prompt = Some(FilesPrompt::Chmod { path, edit });
+                    self.start_prompt_caret_blink(cx);
+                    cx.notify();
+                }
+            },
+            FilesPrompt::ConfirmDelete {
+                path,
+                is_dir,
+                name: _,
+            } => {
+                self.run_remove(path, is_dir, cx);
+            }
+        }
+    }
+
+    fn run_mkdir(&mut self, path: String, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Mkdir {
+                        path: path.clone(),
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                            Err(_) => this.error = Some("Mkdir cancelled".into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Local) => {
+                let path_buf = PathBuf::from(&path);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::create_dir(&path_buf) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            None => {}
+        }
+    }
+
+    fn run_rename(&mut self, from: String, to: String, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                            Err(_) => this.error = Some("Rename cancelled".into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Local) => {
+                let from_p = PathBuf::from(&from);
+                let to_p = PathBuf::from(&to);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::rename(&from_p, &to_p) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            None => {}
+        }
+    }
+
+    fn run_chmod(&mut self, path: String, mode: u32, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Chmod {
+                        path: path.clone(),
+                        mode,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                            Err(_) => this.error = Some("Chmod cancelled".into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Local) => {
+                let path_buf = PathBuf::from(&path);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::chmod(&path_buf, mode) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            None => {}
+        }
+    }
+
+    fn run_remove(&mut self, path: String, is_dir: bool, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Remove {
+                        path: path.clone(),
+                        is_dir,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                            Err(_) => this.error = Some("Delete cancelled".into()),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Local) => {
+                let path_buf = PathBuf::from(&path);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::remove_path(&path_buf, is_dir) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            None => {}
+        }
+    }
+
+    fn prompt_title(prompt: &FilesPrompt) -> &'static str {
+        match prompt {
+            FilesPrompt::NewFolder { .. } => "New folder",
+            FilesPrompt::Rename { .. } => "Rename",
+            FilesPrompt::Chmod { .. } => "Permissions (octal)",
+            FilesPrompt::ConfirmDelete { .. } => "Delete?",
+        }
+    }
+
+    fn prompt_edit_mut(&mut self) -> Option<&mut RenameEdit> {
+        match self.prompt.as_mut()? {
+            FilesPrompt::NewFolder { edit }
+            | FilesPrompt::Rename { edit, .. }
+            | FilesPrompt::Chmod { edit, .. } => Some(edit),
+            FilesPrompt::ConfirmDelete { .. } => None,
+        }
+    }
+
+    fn handle_prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.prompt.is_none() {
+            return false;
+        }
+        if matches!(self.prompt, Some(FilesPrompt::ConfirmDelete { .. })) {
+            let key = event.keystroke.key.as_str();
+            if key == "escape" {
+                self.cancel_prompt(cx);
+                return true;
+            }
+            if key == "enter" {
+                self.submit_prompt(cx);
+                return true;
+            }
+            return false;
+        }
+
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let shift = mods.shift;
+        let chord = mods.control || mods.platform;
+
+        if key == "enter" {
+            self.submit_prompt(cx);
+            return true;
+        }
+        if key == "escape" {
+            self.cancel_prompt(cx);
+            return true;
+        }
+
+        let Some(edit) = self.prompt_edit_mut() else {
+            return false;
+        };
+
+        if chord && key.eq_ignore_ascii_case("a") {
+            edit.select_all();
+            cx.notify();
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("c") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("x") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            if edit.has_selection() {
+                edit.delete_selection();
+            } else {
+                edit.text.clear();
+                edit.cursor = 0;
+                edit.anchor = 0;
+            }
+            cx.notify();
+            return true;
+        }
+        if (chord && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                let cleaned = text.replace('\r', "").replace('\n', "");
+                if !cleaned.is_empty() {
+                    edit.insert(&cleaned);
+                    cx.notify();
+                }
+            }
+            return true;
+        }
+        if key == "backspace" {
+            edit.backspace();
+            cx.notify();
+            return true;
+        }
+        if key == "delete" {
+            edit.delete_forward();
+            cx.notify();
+            return true;
+        }
+        if key == "left" {
+            edit.move_left(shift);
+            cx.notify();
+            return true;
+        }
+        if key == "right" {
+            edit.move_right(shift);
+            cx.notify();
+            return true;
+        }
+        if key == "home" {
+            edit.move_home(shift);
+            cx.notify();
+            return true;
+        }
+        if key == "end" {
+            edit.move_end(shift);
+            cx.notify();
+            return true;
+        }
+        if let Some(typed) = event.keystroke.key_char.as_deref() {
+            let cleaned = typed.replace('\r', "").replace('\n', "");
+            if !cleaned.is_empty() && !chord {
+                edit.insert(&cleaned);
+                cx.notify();
+                return true;
+            }
+        }
+        false
+    }
+
     fn tab_btn(
         &self,
         id: &'static str,
@@ -740,7 +1513,7 @@ impl ContextPanel {
         tip: &'static str,
         enabled: bool,
         cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
@@ -753,15 +1526,15 @@ impl ContextPanel {
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
                     .tooltip(move |_, cx| Tooltip::text(tip, cx))
-                    .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
+                    .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
             })
             .when(!enabled, |d| d.text_color(theme::TEXT_DISABLED))
             .child(label)
     }
 
     fn render_files(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let has_sftp = self.focused_sftp(cx).is_some();
-        if !has_sftp {
+        let files = self.focused_files(cx);
+        if files.is_none() {
             return div()
                 .flex()
                 .flex_col()
@@ -780,23 +1553,24 @@ impl ContextPanel {
                         .text_xs()
                         .text_color(theme::TEXT_MUTED)
                         .child(
-                            "Remote file browser is available on SSH sessions. \
-                             Open an SSH profile, then browse, download, and upload here.",
+                            "Open a Local or SSH session. Local panes browse the filesystem; \
+                             SSH panes use SFTP for browse, upload, and download.",
                         ),
                 )
                 .into_any_element();
         }
 
+        let is_sftp = self.files_kind == Some(FilesKind::Sftp);
         let cwd = self.cwd.clone().unwrap_or_else(|| "…".into());
-        let can_up = self
-            .cwd
-            .as_ref()
-            .and_then(|p| parent_remote(p))
-            .is_some();
+        let can_up = self.cwd.as_ref().is_some_and(|p| match self.files_kind {
+            Some(FilesKind::Local) => local_fs::parent_path(p).is_some(),
+            _ => parent_remote(p).is_some(),
+        });
         let listing = self.listing;
         let error = self.error.clone();
         let entries = self.entries.clone();
         let selected = self.selected.clone();
+        let has_sel = selected.is_some();
 
         div()
             .flex()
@@ -809,31 +1583,52 @@ impl ContextPanel {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
-                    .child(self.nav_btn("ctx-up", "↑", "Parent folder", can_up, cx, |this, cx| {
+                    .child(self.nav_btn("ctx-up", "↑", "Parent folder", can_up, cx, |this, _, cx| {
                         this.go_up(cx);
                     }))
-                    .child(self.nav_btn("ctx-home", "⌂", "Home", true, cx, |this, cx| {
-                        if let Some((_, sftp)) = this.focused_sftp(cx) {
-                            this.go_home(sftp, cx);
-                        }
+                    .child(self.nav_btn("ctx-home", "⌂", "Home", true, cx, |this, _, cx| {
+                        this.go_home(cx);
                     }))
-                    .child(self.nav_btn("ctx-refresh", "↻", "Refresh", true, cx, |this, cx| {
+                    .child(self.nav_btn("ctx-refresh", "↻", "Refresh", true, cx, |this, _, cx| {
                         if let Some(cwd) = this.cwd.clone() {
                             this.load_dir(cwd, cx);
                         }
                     }))
-                    .child(div().flex_1())
                     .child(self.nav_btn(
-                        "ctx-download",
-                        "↓",
-                        "Download selected",
-                        selected.is_some(),
+                        "ctx-mkdir",
+                        "+",
+                        "New folder",
+                        self.cwd.is_some(),
                         cx,
-                        |this, cx| this.download_selected(cx),
+                        |this, window, cx| this.begin_new_folder(window, cx),
                     ))
-                    .child(self.nav_btn("ctx-upload", "↑+", "Upload file…", true, cx, |this, cx| {
-                        this.upload(cx);
-                    })),
+                    .child(div().flex_1())
+                    .when(is_sftp, |d| {
+                        d.child(self.nav_btn(
+                            "ctx-download",
+                            "↓",
+                            "Download selected",
+                            has_sel,
+                            cx,
+                            |this, _, cx| this.download_selected(cx),
+                        ))
+                        .child(self.nav_btn(
+                            "ctx-upload",
+                            "↑+",
+                            "Upload file…",
+                            true,
+                            cx,
+                            |this, _, cx| this.upload_file(cx),
+                        ))
+                        .child(self.nav_btn(
+                            "ctx-upload-folder",
+                            "⬆📁",
+                            "Upload folder…",
+                            true,
+                            cx,
+                            |this, _, cx| this.upload_folder(cx),
+                        ))
+                    }),
             )
             .child(
                 div()
@@ -848,6 +1643,7 @@ impl ContextPanel {
                     .overflow_hidden()
                     .child(cwd),
             )
+            .when_some(self.render_prompt_bar(cx), |d, bar| d.child(bar))
             .when_some(error, |d, err| {
                 d.child(
                     div()
@@ -866,8 +1662,105 @@ impl ContextPanel {
                         .child("Loading…"),
                 )
             })
-            .child(self.render_files_split(entries, selected, cx))
+            .child(self.render_files_split(entries, selected, is_sftp, cx))
             .into_any_element()
+    }
+
+    fn render_prompt_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let prompt = self.prompt.as_ref()?;
+        let title = Self::prompt_title(prompt);
+        let confirm_label = match prompt {
+            FilesPrompt::ConfirmDelete { name, is_dir, .. } => {
+                if *is_dir {
+                    format!("Delete folder “{name}”?")
+                } else {
+                    format!("Delete “{name}”?")
+                }
+            }
+            _ => String::new(),
+        };
+        let edit_el = match prompt {
+            FilesPrompt::NewFolder { edit }
+            | FilesPrompt::Rename { edit, .. }
+            | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
+            FilesPrompt::ConfirmDelete { .. } => None,
+        };
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_1))
+                .px(px(theme::SPACE_1))
+                .py(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SM))
+                .border_1()
+                .border_color(theme::BORDER)
+                .bg(theme::ELEVATED)
+                .track_focus(&self.focus_handle)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::TEXT)
+                        .child(title),
+                )
+                .when(!confirm_label.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .child(confirm_label),
+                    )
+                })
+                .when_some(edit_el, |d, el| {
+                    d.child(
+                        div()
+                            .id("ctx-prompt-input")
+                            .w_full()
+                            .child(el),
+                    )
+                })
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(theme::SPACE_1))
+                        .child(
+                            div()
+                                .id("ctx-prompt-ok")
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .bg(theme::ACCENT)
+                                .text_color(theme::TEXT)
+                                .cursor_pointer()
+                                .child(if matches!(
+                                    self.prompt,
+                                    Some(FilesPrompt::ConfirmDelete { .. })
+                                ) {
+                                    "Delete"
+                                } else {
+                                    "OK"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("ctx-prompt-cancel")
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_prompt(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// File list + Transfers with a draggable vertical sash.
@@ -875,6 +1768,7 @@ impl ContextPanel {
         &self,
         entries: Vec<RemoteEntry>,
         selected: Option<String>,
+        accept_drops: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let list_ratio = self.list_ratio.clamp(0.35, 0.9);
@@ -910,6 +1804,34 @@ impl ContextPanel {
                     .border_1()
                     .border_color(theme::BORDER_SUBTLE)
                     .rounded(px(theme::RADIUS_SM))
+                    .when(accept_drops, |d| {
+                        d.drag_over::<ExternalPaths>(|style, _, _, _| {
+                            style.bg(theme::ACCENT.opacity(0.2))
+                        })
+                        .can_drop(|dragged: &dyn std::any::Any, _, _| {
+                            dragged.is::<ExternalPaths>()
+                        })
+                        .on_drop(cx.listener(
+                            move |this, paths: &ExternalPaths, _, cx| {
+                                if this.files_kind != Some(FilesKind::Sftp) {
+                                    return;
+                                }
+                                let Some(cwd) = this.cwd.clone() else {
+                                    this.error = Some("Open a remote folder first".into());
+                                    cx.notify();
+                                    return;
+                                };
+                                let Some((pane_id, sftp)) = this.focused_sftp(cx) else {
+                                    return;
+                                };
+                                let locals: Vec<PathBuf> = paths.paths().to_vec();
+                                if locals.is_empty() {
+                                    return;
+                                }
+                                this.start_uploads(pane_id, sftp, cwd, locals, cx);
+                            },
+                        ))
+                    })
                     .children(entries.into_iter().map(|entry| {
                         let path = entry.path.clone();
                         let is_sel = selected.as_deref() == Some(path.as_str());
@@ -946,8 +1868,22 @@ impl ContextPanel {
                                     .text_color(theme::TEXT_MUTED)
                                     .child(size),
                             )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.selected = Some(path.clone());
+                                    this.transfer_menu = None;
+                                    this.entry_menu = Some(EntryMenu {
+                                        path: path.clone(),
+                                        position: event.position,
+                                    });
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.selected = Some(path.clone());
+                                this.entry_menu = None;
+                                this.selected = Some(entry_click.path.clone());
                                 if event.click_count() >= 2 {
                                     this.enter_or_download(entry_click.clone(), cx);
                                 }
@@ -1133,7 +2069,7 @@ impl ContextPanel {
                                 "Reveal in File Explorer",
                                 can_reveal,
                                 cx,
-                                move |this, _cx| {
+                                move |this, _, _cx| {
                                     this.reveal_transfer(id);
                                 },
                             ))
@@ -1142,11 +2078,96 @@ impl ContextPanel {
                                 "Remove",
                                 true,
                                 cx,
-                                move |this, cx| {
+                                move |this, _, cx| {
                                     this.remove_transfer(id);
                                     cx.notify();
                                 },
                             )),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.entry_menu.as_ref()?;
+        let path = menu.path.clone();
+        let position = menu.position;
+        let entry = self.entries.iter().find(|e| e.path == path)?;
+        let is_dir = entry.is_dir;
+        let is_local = self.files_kind == Some(FilesKind::Local);
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(Edges {
+                        top: px(4.0),
+                        right: px(4.0),
+                        bottom: px(4.0),
+                        left: px(4.0),
+                    })
+                    .child(
+                        div()
+                            .min_w(px(160.0))
+                            .p(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .shadow_md()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "file-ctx-new",
+                                "New folder…",
+                                true,
+                                cx,
+                                |this, window, cx| this.begin_new_folder(window, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-rename",
+                                "Rename…",
+                                true,
+                                cx,
+                                |this, window, cx| this.begin_rename_selected(window, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-chmod",
+                                "Permissions…",
+                                true,
+                                cx,
+                                |this, window, cx| this.begin_chmod_selected(window, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-delete",
+                                "Delete…",
+                                true,
+                                cx,
+                                |this, _, cx| this.begin_delete_selected(cx),
+                            ))
+                            .when(is_local, |d| {
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-reveal",
+                                    "Reveal in File Explorer",
+                                    true,
+                                    cx,
+                                    move |this, _, _cx| {
+                                        let _ = platform::reveal_in_file_manager(Path::new(&path));
+                                        this.entry_menu = None;
+                                    },
+                                ))
+                            })
+                            .when(!is_dir && !is_local, |d| {
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-download",
+                                    "Download",
+                                    true,
+                                    cx,
+                                    |this, _, cx| this.download_selected(cx),
+                                ))
+                            }),
                     ),
             )
             .into_any_element(),
@@ -1159,7 +2180,7 @@ impl ContextPanel {
         label: &'static str,
         enabled: bool,
         cx: &mut Context<Self>,
-        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         div()
             .id(id)
@@ -1175,12 +2196,13 @@ impl ContextPanel {
             })
             .when(!enabled, |d| d.text_color(theme::TEXT_DISABLED))
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if !enabled {
                     return;
                 }
-                on_click(this, cx);
+                on_click(this, window, cx);
                 this.transfer_menu = None;
+                this.entry_menu = None;
                 cx.notify();
             }))
     }
@@ -1277,6 +2299,19 @@ impl ContextPanel {
             .child(row("Size", size))
             .into_any_element()
     }
+}
+
+fn default_local_home() -> String {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(|p| PathBuf::from(p).to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "C:\\".into()
+            } else {
+                "/".into()
+            }
+        })
 }
 
 fn format_size(n: u64) -> String {
@@ -1468,6 +2503,7 @@ impl Render for ContextPanel {
         // Keep Files browser in sync when the focused pane changes.
         self.sync_session(cx);
         let transfer_menu = self.render_transfer_menu(cx);
+        let entry_menu = self.render_entry_menu(cx);
 
         div()
             .flex()
@@ -1480,15 +2516,31 @@ impl Render for ContextPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    let mut changed = false;
                     if this.transfer_menu.is_some() {
                         this.transfer_menu = None;
+                        changed = true;
+                    }
+                    if this.entry_menu.is_some() {
+                        this.entry_menu = None;
+                        changed = true;
+                    }
+                    if changed {
                         cx.notify();
                     }
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key.as_str() == "escape" && this.transfer_menu.is_some() {
+                if this.handle_prompt_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if event.keystroke.key.as_str() != "escape" {
+                    return;
+                }
+                if this.transfer_menu.is_some() || this.entry_menu.is_some() {
                     this.transfer_menu = None;
+                    this.entry_menu = None;
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -1572,6 +2624,7 @@ impl Render for ContextPanel {
                     }),
             )
             .when_some(transfer_menu, |d, menu| d.child(menu))
+            .when_some(entry_menu, |d, menu| d.child(menu))
     }
 }
 

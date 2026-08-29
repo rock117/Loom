@@ -102,6 +102,28 @@ pub enum SftpRequest {
         reply: Sender<Result<TransferOutcome>>,
         cancel: TransferCancel,
     },
+    /// Create a remote directory (browse lane).
+    Mkdir {
+        path: String,
+        reply: Sender<Result<()>>,
+    },
+    /// Remove a file or directory tree (browse lane).
+    Remove {
+        path: String,
+        is_dir: bool,
+        reply: Sender<Result<()>>,
+    },
+    Rename {
+        from: String,
+        to: String,
+        reply: Sender<Result<()>>,
+    },
+    /// Set Unix permission bits (e.g. 0o755). File type bits are preserved when possible.
+    Chmod {
+        path: String,
+        mode: u32,
+        reply: Sender<Result<()>>,
+    },
 }
 
 /// Cloneable handle used by the UI to talk to the SSH thread's SFTP pool.
@@ -168,7 +190,15 @@ enum LaneKind {
 }
 
 fn is_browse_request(req: &SftpRequest) -> bool {
-    matches!(req, SftpRequest::Home { .. } | SftpRequest::List { .. })
+    matches!(
+        req,
+        SftpRequest::Home { .. }
+            | SftpRequest::List { .. }
+            | SftpRequest::Mkdir { .. }
+            | SftpRequest::Remove { .. }
+            | SftpRequest::Rename { .. }
+            | SftpRequest::Chmod { .. }
+    )
 }
 
 /// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
@@ -314,6 +344,30 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
         } => {
             let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress, &cancel).await);
         }
+        SftpRequest::Mkdir { path, reply } => {
+            let _ = reply.send(
+                sftp.create_dir(path.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("mkdir {path}: {e}")),
+            );
+        }
+        SftpRequest::Remove {
+            path,
+            is_dir,
+            reply,
+        } => {
+            let _ = reply.send(remove_path(sftp, &path, is_dir).await);
+        }
+        SftpRequest::Rename { from, to, reply } => {
+            let _ = reply.send(
+                sftp.rename(from.clone(), to.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("rename {from} → {to}: {e}")),
+            );
+        }
+        SftpRequest::Chmod { path, mode, reply } => {
+            let _ = reply.send(chmod_path(sftp, &path, mode).await);
+        }
     }
 }
 
@@ -343,7 +397,46 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
         SftpRequest::Download { reply, .. } | SftpRequest::Upload { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
+        SftpRequest::Mkdir { reply, .. }
+        | SftpRequest::Remove { reply, .. }
+        | SftpRequest::Rename { reply, .. }
+        | SftpRequest::Chmod { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(msg)));
+        }
     }
+}
+
+async fn remove_path(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<()> {
+    if is_dir {
+        let entries = list_dir(sftp, path).await?;
+        for entry in entries {
+            Box::pin(remove_path(sftp, &entry.path, entry.is_dir)).await?;
+        }
+        sftp.remove_dir(path.to_string())
+            .await
+            .with_context(|| format!("rmdir {path}"))?;
+    } else {
+        sftp.remove_file(path.to_string())
+            .await
+            .with_context(|| format!("remove {path}"))?;
+    }
+    Ok(())
+}
+
+async fn chmod_path(sftp: &SftpSession, path: &str, mode: u32) -> Result<()> {
+    let mut attrs = sftp
+        .metadata(path.to_string())
+        .await
+        .with_context(|| format!("stat {path}"))?;
+    // Preserve file-type bits (0o170000); apply permission bits from `mode`.
+    const IFMT: u32 = 0o170000;
+    let type_bits = attrs.permissions.unwrap_or(0) & IFMT;
+    let perm_bits = mode & 0o7777;
+    attrs.permissions = Some(type_bits | perm_bits);
+    sftp.set_metadata(path.to_string(), attrs)
+        .await
+        .with_context(|| format!("chmod {path}"))?;
+    Ok(())
 }
 
 async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {
