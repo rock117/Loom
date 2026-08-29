@@ -102,7 +102,8 @@ impl TabManager {
             ProfileKind::Local { .. } => {
                 match self.spawn_local(profile, default_shell, font_family, window, cx) {
                     Ok(pane) => {
-                        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
+                        let title = self.unique_tab_title(&profile.name);
+                        let tab = wrap_pane_as_tab(title, pane);
                         let id = tab.id;
                         self.tabs.push(tab);
                         self.active = Some(id);
@@ -170,7 +171,7 @@ impl TabManager {
             ssh_sftp: None,
             _term_subscriptions: Vec::new(),
         };
-        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
+        let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
         let id = tab.id;
         self.tabs.push(tab);
         self.active = Some(id);
@@ -204,7 +205,7 @@ impl TabManager {
             ssh_sftp: None,
             _term_subscriptions: Vec::new(),
         };
-        let tab = wrap_pane_as_tab(profile.name.clone(), pane);
+        let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
         let tab_id = tab.id;
         self.tabs.push(tab);
         self.active = Some(tab_id);
@@ -734,6 +735,85 @@ impl TabManager {
             Some(self.tabs[pos.min(self.tabs.len() - 1)].id)
         };
         cx.notify();
+    }
+
+    /// Close every tab except `keep`, tearing down PTY/SSH/SFTP for each.
+    pub fn close_other_tabs(&mut self, keep: Uuid, cx: &mut Context<Self>) {
+        let ids: Vec<Uuid> = self
+            .tabs
+            .iter()
+            .map(|t| t.id)
+            .filter(|&id| id != keep)
+            .collect();
+        for id in ids {
+            self.close_tab(id, cx);
+        }
+        if self.tabs.iter().any(|t| t.id == keep) {
+            self.active = Some(keep);
+        }
+        cx.notify();
+    }
+
+    /// Close tabs to the left of `id` (lower indices).
+    pub fn close_tabs_to_left(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let ids: Vec<Uuid> = self.tabs[..pos].iter().map(|t| t.id).collect();
+        for tid in ids {
+            self.close_tab(tid, cx);
+        }
+        if self.tabs.iter().any(|t| t.id == id) {
+            self.active = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// Close tabs to the right of `id` (higher indices).
+    pub fn close_tabs_to_right(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let ids: Vec<Uuid> = self.tabs[pos + 1..].iter().map(|t| t.id).collect();
+        for tid in ids {
+            self.close_tab(tid, cx);
+        }
+        if self.tabs.iter().any(|t| t.id == id) {
+            self.active = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// Close all tabs and release session resources.
+    pub fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.teardown_all();
+        cx.notify();
+    }
+
+    /// Profile id for the focused pane of a tab (fallback: any pane).
+    pub fn profile_id_for_tab(&self, tab_id: Uuid) -> Option<Uuid> {
+        let tab = self.tabs.iter().find(|t| t.id == tab_id)?;
+        tab.focused_pane()
+            .map(|p| p.profile_id)
+            .or_else(|| tab.panes.values().next().map(|p| p.profile_id))
+    }
+
+    /// Prefer `base`, then `base (2)`, `base (3)`, … so duplicate tabs stay distinguishable.
+    fn unique_tab_title(&self, base: &str) -> String {
+        if !self.tabs.iter().any(|t| t.title == base) {
+            return base.to_string();
+        }
+        let mut n = 2u32;
+        loop {
+            let candidate = format!("{base} ({n})");
+            if !self.tabs.iter().any(|t| t.title == candidate) {
+                return candidate;
+            }
+            n = n.saturating_add(1);
+            if n > 10_000 {
+                return format!("{base} ({})", Uuid::new_v4());
+            }
+        }
     }
 
     pub fn teardown_all(&mut self) {

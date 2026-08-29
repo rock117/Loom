@@ -7,27 +7,44 @@ use crate::shared::theme;
 use crate::ui::pane_layout::SplitDirection;
 use crate::ui::tab_manager::{TabManager, state_color};
 use crate::ui::tooltip::Tooltip;
+use crate::ui::workspace_store::WorkspaceStore;
 
 const ICON: f32 = 14.0;
 const SPLIT_BTN: f32 = 26.0;
 
+struct TabContextMenu {
+    tab_id: Uuid,
+    position: Point<Pixels>,
+}
+
 pub struct TabBar {
     pub tabs: Entity<TabManager>,
+    store: Entity<WorkspaceStore>,
     /// Zed-style split popover (open under the columns control).
     split_menu_open: bool,
     /// Window-space point for the menu's top-right corner (same pattern as sidebar).
     split_menu_anchor: Option<Point<Pixels>>,
+    context_menu: Option<TabContextMenu>,
     _observe_tabs: Subscription,
+    _observe_store: Subscription,
 }
 
 impl TabBar {
-    pub fn new(tabs: Entity<TabManager>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        tabs: Entity<TabManager>,
+        store: Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _observe_tabs = cx.observe(&tabs, |_this, _tabs, cx| cx.notify());
+        let _observe_store = cx.observe(&store, |_this, _store, cx| cx.notify());
         Self {
             tabs,
+            store,
             split_menu_open: false,
             split_menu_anchor: None,
+            context_menu: None,
             _observe_tabs,
+            _observe_store,
         }
     }
 
@@ -37,6 +54,35 @@ impl TabBar {
             self.split_menu_anchor = None;
             cx.notify();
         }
+    }
+
+    pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            cx.notify();
+        }
+    }
+
+    /// Dismiss split popover and tab context menu (e.g. click outside).
+    pub fn close_all_menus(&mut self, cx: &mut Context<Self>) {
+        let mut changed = false;
+        if self.split_menu_open {
+            self.split_menu_open = false;
+            self.split_menu_anchor = None;
+            changed = true;
+        }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// True when the split popover or tab context menu is open.
+    pub fn has_open_menu(&self) -> bool {
+        self.context_menu.is_some() || self.split_menu_open
     }
 
     fn svg_icon(path: &'static str, size: f32, color: Hsla) -> impl IntoElement {
@@ -52,7 +98,7 @@ impl TabBar {
             .occlude()
             .flex()
             .flex_col()
-            .w(px(168.0))
+            .min_w(px(180.0))
             .p(px(theme::SPACE_1))
             .rounded(px(theme::RADIUS))
             .bg(theme::ELEVATED)
@@ -61,9 +107,52 @@ impl TabBar {
             .shadow_md()
             .text_xs()
             .text_color(theme::TEXT)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
     }
 
     fn menu_item(
+        &self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let label = label.into();
+        div()
+            .id(id.into())
+            .w_full()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
+            .when(enabled, |d| {
+                d.text_color(theme::TEXT)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::HOVER))
+            })
+            .when(!enabled, |d| d.text_color(theme::TEXT_DISABLED))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if !enabled {
+                    return;
+                }
+                on_click(this, window, cx);
+                this.context_menu = None;
+                this.close_split_menu(cx);
+                cx.notify();
+                cx.stop_propagation();
+            }))
+    }
+
+    fn menu_divider(&self) -> impl IntoElement {
+        div()
+            .w_full()
+            .h(px(1.0))
+            .my(px(theme::SPACE_1))
+            .bg(theme::BORDER_SUBTLE)
+    }
+
+    fn split_menu_item(
         &self,
         id: &'static str,
         label: &'static str,
@@ -90,10 +179,131 @@ impl TabBar {
 
     fn split_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         self.menu_shell()
-            .child(self.menu_item("split-right", "Split Right", SplitDirection::Right, cx))
-            .child(self.menu_item("split-left", "Split Left", SplitDirection::Left, cx))
-            .child(self.menu_item("split-up", "Split Up", SplitDirection::Up, cx))
-            .child(self.menu_item("split-down", "Split Down", SplitDirection::Down, cx))
+            .child(self.split_menu_item("split-right", "Split Right", SplitDirection::Right, cx))
+            .child(self.split_menu_item("split-left", "Split Left", SplitDirection::Left, cx))
+            .child(self.split_menu_item("split-up", "Split Up", SplitDirection::Up, cx))
+            .child(self.split_menu_item("split-down", "Split Down", SplitDirection::Down, cx))
+    }
+
+    fn tab_context_menu(&self, tab_id: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
+        let manager = self.tabs.read(cx);
+        let tab_index = manager.tabs.iter().position(|t| t.id == tab_id);
+        let tab_count = manager.tabs.len();
+        let (has_left, has_right, has_others) = match tab_index {
+            Some(i) => (i > 0, i + 1 < tab_count, tab_count > 1),
+            None => (false, false, false),
+        };
+        let profile_id = manager.profile_id_for_tab(tab_id);
+        let current_group = profile_id.and_then(|pid| {
+            self.store
+                .read(cx)
+                .workspace
+                .group_id_for_profile(pid)
+        });
+        let other_groups: Vec<(Uuid, String)> = self
+            .store
+            .read(cx)
+            .workspace
+            .groups
+            .iter()
+            .filter(|g| Some(g.id) != current_group)
+            .map(|g| (g.id, g.name.clone()))
+            .collect();
+
+        let mut menu = self
+            .menu_shell()
+            .child(self.menu_item("tab-ctx-close", "Close", true, cx, move |this, _, cx| {
+                this.tabs.update(cx, |m, cx| m.close_tab(tab_id, cx));
+                cx.emit(TabBarEvent::Changed);
+            }))
+            .child(self.menu_item(
+                "tab-ctx-close-others",
+                "Close Others",
+                has_others,
+                cx,
+                move |this, _, cx| {
+                    this.tabs
+                        .update(cx, |m, cx| m.close_other_tabs(tab_id, cx));
+                    cx.emit(TabBarEvent::Changed);
+                },
+            ))
+            .child(self.menu_item(
+                "tab-ctx-close-left",
+                "Close to the Left",
+                has_left,
+                cx,
+                move |this, _, cx| {
+                    this.tabs
+                        .update(cx, |m, cx| m.close_tabs_to_left(tab_id, cx));
+                    cx.emit(TabBarEvent::Changed);
+                },
+            ))
+            .child(self.menu_item(
+                "tab-ctx-close-right",
+                "Close to the Right",
+                has_right,
+                cx,
+                move |this, _, cx| {
+                    this.tabs
+                        .update(cx, |m, cx| m.close_tabs_to_right(tab_id, cx));
+                    cx.emit(TabBarEvent::Changed);
+                },
+            ))
+            .child(self.menu_item(
+                "tab-ctx-close-all",
+                "Close All",
+                tab_count > 0,
+                cx,
+                |this, _, cx| {
+                    this.tabs.update(cx, |m, cx| m.close_all_tabs(cx));
+                    cx.emit(TabBarEvent::Changed);
+                },
+            ))
+            .child(self.menu_divider())
+            .child(self.menu_item(
+                "tab-ctx-dup",
+                "Duplicate Tab",
+                profile_id.is_some(),
+                cx,
+                move |this, _, cx| {
+                    if let Some(pid) = profile_id {
+                        cx.emit(TabBarEvent::DuplicateProfile(pid));
+                    } else {
+                        let _ = this;
+                    }
+                },
+            ));
+
+        if let Some(pid) = profile_id {
+            if !other_groups.is_empty() {
+                menu = menu.child(self.menu_divider());
+                for (gid, name) in other_groups {
+                    let label: SharedString = format!("Move Profile → {name}").into();
+                    menu = menu.child(
+                        div()
+                            .id(SharedString::from(format!("tab-ctx-move-{gid}")))
+                            .w_full()
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_color(theme::TEXT)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |s, cx| {
+                                    s.move_profile_to_group(pid, gid, cx);
+                                });
+                                this.context_menu = None;
+                                cx.notify();
+                                cx.stop_propagation();
+                            })),
+                    );
+                }
+            }
+        }
+
+        menu
     }
 }
 
@@ -111,6 +321,7 @@ impl Render for TabBar {
             .collect();
         let menu_open = self.split_menu_open;
         let menu_anchor = self.split_menu_anchor;
+        let context_menu = self.context_menu.as_ref().map(|m| (m.tab_id, m.position));
 
         div()
             .relative()
@@ -124,9 +335,16 @@ impl Render for TabBar {
             .border_color(theme::BORDER)
             .px(px(theme::SPACE_1))
             .gap(px(theme::SPACE_1))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.close_context_menu(cx);
+                }),
+            )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if event.keystroke.key.as_str() == "escape" {
                     this.close_split_menu(cx);
+                    this.close_context_menu(cx);
                     cx.stop_propagation();
                 }
             }))
@@ -141,6 +359,18 @@ impl Render for TabBar {
                     .rounded(px(theme::RADIUS_SM))
                     .when(is_active, |d| d.bg(theme::TAB_ACTIVE))
                     .hover(|s| s.bg(theme::HOVER))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.close_split_menu(cx);
+                            this.context_menu = Some(TabContextMenu {
+                                tab_id: id,
+                                position: event.position,
+                            });
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("tab-select-{id}")))
@@ -152,6 +382,7 @@ impl Render for TabBar {
                             .child(div().text_sm().text_color(theme::TEXT).child(title))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.close_split_menu(cx);
+                                this.close_context_menu(cx);
                                 this.tabs.update(cx, |m, cx| m.select_tab(id, window, cx));
                                 cx.emit(TabBarEvent::Changed);
                             })),
@@ -171,6 +402,7 @@ impl Render for TabBar {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     this.close_split_menu(cx);
+                                    this.close_context_menu(cx);
                                     this.tabs.update(cx, |m, cx| m.close_tab(id, cx));
                                     cx.emit(TabBarEvent::Changed);
                                     cx.stop_propagation();
@@ -196,6 +428,7 @@ impl Render for TabBar {
                     .child(Self::svg_icon("icons/ui/plus.svg", ICON, theme::TEXT_MUTED))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.close_split_menu(cx);
+                        this.close_context_menu(cx);
                         cx.emit(TabBarEvent::NewTab);
                     })),
             )
@@ -232,14 +465,13 @@ impl Render for TabBar {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.close_context_menu(cx);
                             if this.tabs.read(cx).active.is_none() {
                                 return;
                             }
                             if this.split_menu_open {
                                 this.close_split_menu(cx);
                             } else {
-                                // Window coords (same as sidebar). Menu top-right sits on
-                                // the click — which is on the columns icon.
                                 this.split_menu_anchor = Some(point(
                                     event.position.x,
                                     px(theme::TAB_BAR_HEIGHT + 2.0),
@@ -298,12 +530,12 @@ impl Render for TabBar {
                             return;
                         }
                         this.close_split_menu(cx);
+                        this.close_context_menu(cx);
                         this.tabs.update(cx, |m, cx| m.toggle_zoom_focused(cx));
                         cx.emit(TabBarEvent::Changed);
                         cx.stop_propagation();
                     })),
             )
-            // Sidebar-style anchored menu in window space + Zed deferred paint priority.
             .when_some(menu_anchor.filter(|_| menu_open), |d, anchor| {
                 d.child(
                     deferred(
@@ -321,6 +553,23 @@ impl Render for TabBar {
                     .with_priority(1),
                 )
             })
+            .when_some(context_menu, |d, (tab_id, position)| {
+                d.child(
+                    deferred(
+                        anchored()
+                            .position(position)
+                            .anchor(Corner::TopLeft)
+                            .snap_to_window_with_margin(Edges {
+                                top: px(4.0),
+                                right: px(4.0),
+                                bottom: px(4.0),
+                                left: px(4.0),
+                            })
+                            .child(self.tab_context_menu(tab_id, cx)),
+                    )
+                    .with_priority(1),
+                )
+            })
     }
 }
 
@@ -329,6 +578,8 @@ pub enum TabBarEvent {
     NewTab,
     Changed,
     Split(SplitDirection),
+    /// Open another session for this profile (same sidebar group).
+    DuplicateProfile(Uuid),
 }
 
 impl EventEmitter<TabBarEvent> for TabBar {}

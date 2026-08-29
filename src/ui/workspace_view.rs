@@ -65,7 +65,7 @@ impl WorkspaceView {
         let show_line_numbers = store.read(cx).settings.show_line_numbers;
         let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
-        let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
+        let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), store.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
         let context_panel = cx.new(|cx| ContextPanel::new(store.clone(), tabs.clone(), cx));
         let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
@@ -166,6 +166,9 @@ impl WorkspaceView {
                     this.tabs.update(cx, |m, cx| {
                         m.split_focused(direction, &store, window, cx);
                     });
+                }
+                TabBarEvent::DuplicateProfile(profile_id) => {
+                    this.open_profile_id(*profile_id, window, cx);
                 }
             },
         ));
@@ -542,6 +545,7 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_menus_open = self.tab_bar.read(cx).has_open_menu();
         div()
             .key_context("Loom")
             // Do not track_focus on the root — that steals keyboard focus from the
@@ -650,10 +654,18 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &DuplicateTab, window, cx| {
-                let store = this.store.clone();
-                this.tabs
-                    .update(cx, |m, cx| m.duplicate_active(&store, window, cx));
-                this.persist_tabs(cx);
+                let profile_id = this
+                    .tabs
+                    .read(cx)
+                    .active_tab()
+                    .and_then(|t| {
+                        t.focused_pane()
+                            .map(|p| p.profile_id)
+                            .or_else(|| t.panes.values().next().map(|p| p.profile_id))
+                    });
+                if let Some(pid) = profile_id {
+                    this.open_profile_id(pid, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &SaveWorkspace, _, cx| {
                 this.persist_tabs(cx);
@@ -817,5 +829,34 @@ impl Render for WorkspaceView {
             .when(self.show_settings, |d| d.child(self.settings.clone()))
             .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
+            // Full-window backdrop under TabBar menus (priority 0); menu uses priority 1.
+            .when(tab_menus_open, |d| {
+                d.child(
+                    deferred(
+                        div()
+                            .id("tab-menu-backdrop")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.tab_bar.update(cx, |tb, cx| tb.close_all_menus(cx));
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, _, _, cx| {
+                                    this.tab_bar.update(cx, |tb, cx| tb.close_all_menus(cx));
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    )
+                    .with_priority(0),
+                )
+            })
     }
 }
