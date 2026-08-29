@@ -53,6 +53,12 @@ struct TransferRow {
     /// Local path for Reveal (download destination or upload source).
     local_path: Option<PathBuf>,
     is_dir: bool,
+    /// When the SFTP transfer actually started (after file dialogs).
+    started_at: Option<std::time::Instant>,
+    /// Set when the transfer finishes or fails.
+    elapsed: Option<std::time::Duration>,
+    bytes_done: u64,
+    bytes_total: Option<u64>,
 }
 
 struct TransferMenu {
@@ -307,6 +313,10 @@ impl ContextPanel {
                 },
                 local_path: None,
                 is_dir,
+                started_at: None,
+                elapsed: None,
+                bytes_done: 0,
+                bytes_total: if is_dir { None } else { Some(entry.size) },
             },
         );
         cx.notify();
@@ -339,6 +349,7 @@ impl ContextPanel {
             this.update(cx, |this, cx| {
                 if let Some(row) = this.transfers.iter_mut().find(|t| t.id == id) {
                     row.local_path = Some(local.clone());
+                    row.started_at = Some(std::time::Instant::now());
                 }
                 cx.notify();
             })
@@ -386,7 +397,7 @@ impl ContextPanel {
                                     } else {
                                         None
                                     };
-                                    this.finish_transfer(id, files);
+                                    this.finish_transfer(id, files, Some(outcome.bytes));
                                 }
                                 Ok(Err(err)) => this.fail_transfer(id, format!("{err:#}")),
                                 Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
@@ -443,6 +454,10 @@ impl ContextPanel {
                         },
                         local_path: Some(local.clone()),
                         is_dir: false,
+                        started_at: Some(std::time::Instant::now()),
+                        elapsed: None,
+                        bytes_done: 0,
+                        bytes_total: None,
                     },
                 );
                 cx.notify();
@@ -485,8 +500,8 @@ impl ContextPanel {
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
                             match result {
-                                Ok(Ok(_)) => {
-                                    this.finish_transfer(id, None);
+                                Ok(Ok(outcome)) => {
+                                    this.finish_transfer(id, None, Some(outcome.bytes));
                                     if let Some(cwd) = this.cwd.clone() {
                                         this.load_dir(cwd, cx);
                                     }
@@ -521,21 +536,46 @@ impl ContextPanel {
                 files_done: p.files_done.or(prev_files),
                 files_total: p.files_total.or(prev_total),
             };
+            if let Some(b) = p.overall_done {
+                row.bytes_done = b;
+            } else if !row.is_dir {
+                row.bytes_done = p.done;
+            }
+            if let Some(t) = p.overall_total {
+                row.bytes_total = Some(t);
+            } else if let Some(t) = p.total {
+                row.bytes_total = Some(t);
+            }
+            if row.started_at.is_none() {
+                row.started_at = Some(std::time::Instant::now());
+            }
         }
     }
 
-    fn finish_transfer(&mut self, id: Uuid, files: Option<u32>) {
+    fn finish_transfer(&mut self, id: Uuid, files: Option<u32>, bytes: Option<u64>) {
         if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
             let files = files.or_else(|| match &row.status {
                 TransferStatus::Running { files_done, .. } if row.is_dir => *files_done,
                 _ => None,
             });
+            if let Some(b) = bytes {
+                row.bytes_done = b;
+                if row.bytes_total.is_none() {
+                    row.bytes_total = Some(b);
+                }
+            }
+            row.elapsed = Some(
+                row.started_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default(),
+            );
             row.status = TransferStatus::Done { files };
         }
     }
 
     fn fail_transfer(&mut self, id: Uuid, msg: String) {
         if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
+            row.elapsed = row.started_at.map(|t| t.elapsed());
             row.status = TransferStatus::Failed(msg);
         }
     }
@@ -924,7 +964,7 @@ impl ContextPanel {
                             cx.stop_propagation();
                         }),
                     )
-                    .child(div().text_color(theme::TEXT_MUTED).child(arrow))
+                    .child(div().text_color(theme::TEXT_MUTED).flex_shrink_0().child(arrow))
                     .child(
                         div()
                             .flex_1()
@@ -933,10 +973,17 @@ impl ContextPanel {
                             .overflow_hidden()
                             .child(row.label.clone()),
                     )
-                    .child(div().text_color(color).child(status))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .whitespace_nowrap()
+                            .text_color(color)
+                            .child(status),
+                    )
                     .child(
                         div()
                             .id(SharedString::from(format!("xfer-rm-{id}")))
+                            .flex_shrink_0()
                             .px(px(4.0))
                             .rounded(px(theme::RADIUS_SM))
                             .text_color(theme::TEXT_MUTED)
@@ -1151,7 +1198,30 @@ fn format_size(n: u64) -> String {
     }
 }
 
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{:.0}s", secs)
+    } else if secs < 3600.0 {
+        let m = (secs / 60.0).floor() as u32;
+        let s = (secs % 60.0).floor() as u32;
+        format!("{m}m{s:02}s")
+    } else {
+        let h = (secs / 3600.0).floor() as u32;
+        let m = ((secs % 3600.0) / 60.0).floor() as u32;
+        format!("{h}h{m:02}m")
+    }
+}
+
+fn transfer_elapsed(row: &TransferRow) -> Option<std::time::Duration> {
+    row.elapsed.or_else(|| row.started_at.map(|t| t.elapsed()))
+}
+
 fn transfer_status_label(row: &TransferRow) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
     match &row.status {
         TransferStatus::Running {
             done,
@@ -1161,29 +1231,57 @@ fn transfer_status_label(row: &TransferRow) -> String {
         } => {
             if row.is_dir || files_total.is_some() || files_done.is_some() {
                 let d = files_done.unwrap_or(0);
-                return match files_total {
+                parts.push(match files_total {
                     Some(t) => format!("{d}/{t}"),
-                    None => format!("{d}/…"),
-                };
-            }
-            match total {
-                Some(t) if *t > 0 => {
-                    format!("{}%", ((*done as f64 / *t as f64) * 100.0) as u32)
+                    None => "…".into(),
+                });
+            } else {
+                match total {
+                    Some(t) if *t > 0 => {
+                        parts.push(format!("{}%", ((*done as f64 / *t as f64) * 100.0) as u32));
+                    }
+                    _ => {}
                 }
-                _ => format_size(*done),
             }
         }
-        TransferStatus::Done { files } => match files {
-            Some(n) => format!("Done · {n}/{n}"),
-            None => "Done".into(),
-        },
+        TransferStatus::Done { files } => {
+            parts.push("Done".into());
+            if let Some(n) = files {
+                parts.push(format!("{n}/{n}"));
+            }
+        }
         TransferStatus::Failed(msg) => {
-            if msg.len() > 24 {
-                format!("{}…", &msg[..24])
+            let short = if msg.len() > 20 {
+                format!("{}…", &msg[..20])
             } else {
                 msg.clone()
-            }
+            };
+            parts.push(short);
         }
+    }
+
+    let size_label = match (row.bytes_done, row.bytes_total) {
+        (done, Some(total)) if total > 0 && done > 0 && done < total => {
+            Some(format!("{} / {}", format_size(done), format_size(total)))
+        }
+        (_, Some(total)) if total > 0 => Some(format_size(total)),
+        (done, _) if done > 0 => Some(format_size(done)),
+        _ => None,
+    };
+    if let Some(s) = size_label {
+        parts.push(s);
+    }
+
+    if let Some(d) = transfer_elapsed(row) {
+        if !matches!(&row.status, TransferStatus::Failed(_)) || row.started_at.is_some() {
+            parts.push(format_duration(d));
+        }
+    }
+
+    if parts.is_empty() {
+        "…".into()
+    } else {
+        parts.join(" · ")
     }
 }
 

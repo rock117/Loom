@@ -27,14 +27,39 @@ pub struct TransferProgress {
     pub total: Option<u64>,
     /// Files completed so far (recursive folder transfers).
     pub files_done: Option<u32>,
-    /// Total files in a recursive transfer (after pre-count).
+    /// Total files in a recursive transfer (after / during pre-count).
     pub files_total: Option<u32>,
+    /// Bytes transferred for the whole job (folders accumulate).
+    pub overall_done: Option<u64>,
+    /// Total bytes for the whole job (file size or sum of folder files).
+    pub overall_total: Option<u64>,
 }
 
 /// Result of a finished upload/download.
 #[derive(Debug, Clone)]
 pub struct TransferOutcome {
     pub files: u32,
+    pub bytes: u64,
+}
+
+fn progress_msg(
+    id: uuid::Uuid,
+    done: u64,
+    total: Option<u64>,
+    files_done: Option<u32>,
+    files_total: Option<u32>,
+    overall_done: Option<u64>,
+    overall_total: Option<u64>,
+) -> TransferProgress {
+    TransferProgress {
+        id,
+        done,
+        total,
+        files_done,
+        files_total,
+        overall_done,
+        overall_total,
+    }
 }
 
 pub enum SftpRequest {
@@ -327,7 +352,14 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {
     Ok(out)
 }
 
-async fn count_remote_files(sftp: &SftpSession, remote: &str) -> Result<u32> {
+async fn count_remote_files(
+    sftp: &SftpSession,
+    remote: &str,
+    id: uuid::Uuid,
+    progress: &Sender<TransferProgress>,
+    found: &mut u32,
+    bytes: &mut u64,
+) -> Result<u32> {
     let meta = sftp
         .metadata(remote.to_string())
         .await
@@ -339,15 +371,40 @@ async fn count_remote_files(sftp: &SftpSession, remote: &str) -> Result<u32> {
             .await
             .with_context(|| format!("read_dir {remote}"))?
         {
-            n += Box::pin(count_remote_files(sftp, &entry.path())).await?;
+            n += Box::pin(count_remote_files(
+                sftp,
+                &entry.path(),
+                id,
+                progress,
+                found,
+                bytes,
+            ))
+            .await?;
         }
         Ok(n)
     } else {
+        *found += 1;
+        *bytes += meta.size.unwrap_or(0);
+        let _ = progress.try_send(progress_msg(
+            id,
+            0,
+            None,
+            Some(0),
+            Some(*found),
+            Some(0),
+            Some(*bytes),
+        ));
         Ok(1)
     }
 }
 
-async fn count_local_files(local: &Path) -> Result<u32> {
+async fn count_local_files(
+    local: &Path,
+    id: uuid::Uuid,
+    progress: &Sender<TransferProgress>,
+    found: &mut u32,
+    bytes: &mut u64,
+) -> Result<u32> {
     let meta = tokio::fs::metadata(local)
         .await
         .with_context(|| format!("stat {}", local.display()))?;
@@ -357,10 +414,28 @@ async fn count_local_files(local: &Path) -> Result<u32> {
             .await
             .with_context(|| format!("read_dir {}", local.display()))?;
         while let Some(entry) = rd.next_entry().await? {
-            n += Box::pin(count_local_files(&entry.path())).await?;
+            n += Box::pin(count_local_files(
+                &entry.path(),
+                id,
+                progress,
+                found,
+                bytes,
+            ))
+            .await?;
         }
         Ok(n)
     } else if meta.is_file() {
+        *found += 1;
+        *bytes += meta.len();
+        let _ = progress.try_send(progress_msg(
+            id,
+            0,
+            None,
+            Some(0),
+            Some(*found),
+            Some(0),
+            Some(*bytes),
+        ));
         Ok(1)
     } else {
         Ok(0)
@@ -379,20 +454,40 @@ async fn download_path(
         .await
         .with_context(|| format!("stat {remote}"))?;
     if meta.file_type().is_dir() {
-        let files_total = count_remote_files(sftp, remote).await?;
-        let _ = progress.try_send(TransferProgress {
+        let mut found = 0u32;
+        let mut bytes_total = 0u64;
+        let files_total =
+            count_remote_files(sftp, remote, id, progress, &mut found, &mut bytes_total).await?;
+        let _ = progress.try_send(progress_msg(
             id,
-            done: 0,
-            total: None,
-            files_done: Some(0),
-            files_total: Some(files_total),
-        });
+            0,
+            None,
+            Some(0),
+            Some(files_total),
+            Some(0),
+            Some(bytes_total),
+        ));
         let mut files_done = 0u32;
-        download_tree(sftp, id, remote, local, progress, &mut files_done, files_total).await?;
-        Ok(TransferOutcome { files: files_done })
+        let mut bytes_done = 0u64;
+        download_tree(
+            sftp,
+            id,
+            remote,
+            local,
+            progress,
+            &mut files_done,
+            files_total,
+            &mut bytes_done,
+            bytes_total,
+        )
+        .await?;
+        Ok(TransferOutcome {
+            files: files_done,
+            bytes: bytes_done,
+        })
     } else {
-        download_file(sftp, id, remote, local, meta.size, progress).await?;
-        Ok(TransferOutcome { files: 1 })
+        let bytes = download_file(sftp, id, remote, local, meta.size, progress, None, None).await?;
+        Ok(TransferOutcome { files: 1, bytes })
     }
 }
 
@@ -404,6 +499,8 @@ async fn download_tree(
     progress: &Sender<TransferProgress>,
     files_done: &mut u32,
     files_total: u32,
+    bytes_done: &mut u64,
+    bytes_total: u64,
 ) -> Result<()> {
     let meta = sftp
         .metadata(remote.to_string())
@@ -429,20 +526,35 @@ async fn download_tree(
                 progress,
                 files_done,
                 files_total,
+                bytes_done,
+                bytes_total,
             ))
             .await?;
         }
         Ok(())
     } else {
-        download_file(sftp, id, remote, local, meta.size, progress).await?;
-        *files_done += 1;
-        let _ = progress.try_send(TransferProgress {
+        let n = download_file(
+            sftp,
             id,
-            done: 0,
-            total: None,
-            files_done: Some(*files_done),
-            files_total: Some(files_total),
-        });
+            remote,
+            local,
+            meta.size,
+            progress,
+            Some(*bytes_done),
+            Some(bytes_total),
+        )
+        .await?;
+        *files_done += 1;
+        *bytes_done += n;
+        let _ = progress.try_send(progress_msg(
+            id,
+            0,
+            None,
+            Some(*files_done),
+            Some(files_total),
+            Some(*bytes_done),
+            Some(bytes_total),
+        ));
         Ok(())
     }
 }
@@ -454,7 +566,9 @@ async fn download_file(
     local: &Path,
     total: Option<u64>,
     progress: &Sender<TransferProgress>,
-) -> Result<()> {
+    overall_base: Option<u64>,
+    overall_total: Option<u64>,
+) -> Result<u64> {
     if let Some(parent) = local.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
@@ -467,13 +581,16 @@ async fn download_file(
         .with_context(|| format!("create {}", local.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
-    let _ = progress.try_send(TransferProgress {
+    let base = overall_base.unwrap_or(0);
+    let _ = progress.try_send(progress_msg(
         id,
         done,
         total,
-        files_done: None,
-        files_total: None,
-    });
+        None,
+        None,
+        Some(base),
+        overall_total.or(total),
+    ));
     loop {
         let n = remote_file
             .read(&mut buf)
@@ -487,16 +604,18 @@ async fn download_file(
             .await
             .with_context(|| format!("write {}", local.display()))?;
         done += n as u64;
-        let _ = progress.try_send(TransferProgress {
+        let _ = progress.try_send(progress_msg(
             id,
             done,
             total,
-            files_done: None,
-            files_total: None,
-        });
+            None,
+            None,
+            Some(base + done),
+            overall_total.or(total),
+        ));
     }
     local_file.flush().await.ok();
-    Ok(())
+    Ok(done)
 }
 
 async fn upload_path(
@@ -515,20 +634,50 @@ async fn upload_path(
         .await
         .with_context(|| format!("stat {}", local.display()))?;
     if meta.is_dir() {
-        let files_total = count_local_files(local).await?;
-        let _ = progress.try_send(TransferProgress {
+        let mut found = 0u32;
+        let mut bytes_total = 0u64;
+        let files_total =
+            count_local_files(local, id, progress, &mut found, &mut bytes_total).await?;
+        let _ = progress.try_send(progress_msg(
             id,
-            done: 0,
-            total: None,
-            files_done: Some(0),
-            files_total: Some(files_total),
-        });
+            0,
+            None,
+            Some(0),
+            Some(files_total),
+            Some(0),
+            Some(bytes_total),
+        ));
         let mut files_done = 0u32;
-        upload_tree(sftp, id, local, remote_dir, progress, &mut files_done, files_total).await?;
-        Ok(TransferOutcome { files: files_done })
+        let mut bytes_done = 0u64;
+        upload_tree(
+            sftp,
+            id,
+            local,
+            remote_dir,
+            progress,
+            &mut files_done,
+            files_total,
+            &mut bytes_done,
+            bytes_total,
+        )
+        .await?;
+        Ok(TransferOutcome {
+            files: files_done,
+            bytes: bytes_done,
+        })
     } else if meta.is_file() {
-        upload_file(sftp, id, local, &remote, meta.len(), progress).await?;
-        Ok(TransferOutcome { files: 1 })
+        let bytes = upload_file(
+            sftp,
+            id,
+            local,
+            &remote,
+            meta.len(),
+            progress,
+            None,
+            Some(meta.len()),
+        )
+        .await?;
+        Ok(TransferOutcome { files: 1, bytes })
     } else {
         bail!("unsupported local entry {}", local.display());
     }
@@ -542,6 +691,8 @@ async fn upload_tree(
     progress: &Sender<TransferProgress>,
     files_done: &mut u32,
     files_total: u32,
+    bytes_done: &mut u64,
+    bytes_total: u64,
 ) -> Result<()> {
     let name = local
         .file_name()
@@ -565,20 +716,35 @@ async fn upload_tree(
                 progress,
                 files_done,
                 files_total,
+                bytes_done,
+                bytes_total,
             ))
             .await?;
         }
         Ok(())
     } else if meta.is_file() {
-        upload_file(sftp, id, local, &remote, meta.len(), progress).await?;
-        *files_done += 1;
-        let _ = progress.try_send(TransferProgress {
+        let n = upload_file(
+            sftp,
             id,
-            done: 0,
-            total: None,
-            files_done: Some(*files_done),
-            files_total: Some(files_total),
-        });
+            local,
+            &remote,
+            meta.len(),
+            progress,
+            Some(*bytes_done),
+            Some(bytes_total),
+        )
+        .await?;
+        *files_done += 1;
+        *bytes_done += n;
+        let _ = progress.try_send(progress_msg(
+            id,
+            0,
+            None,
+            Some(*files_done),
+            Some(files_total),
+            Some(*bytes_done),
+            Some(bytes_total),
+        ));
         Ok(())
     } else {
         bail!("unsupported local entry {}", local.display());
@@ -592,7 +758,9 @@ async fn upload_file(
     remote: &str,
     total: u64,
     progress: &Sender<TransferProgress>,
-) -> Result<()> {
+    overall_base: Option<u64>,
+    overall_total: Option<u64>,
+) -> Result<u64> {
     let mut local_file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("open {}", local.display()))?;
@@ -602,13 +770,16 @@ async fn upload_file(
         .with_context(|| format!("create {remote}"))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
-    let _ = progress.try_send(TransferProgress {
+    let base = overall_base.unwrap_or(0);
+    let _ = progress.try_send(progress_msg(
         id,
         done,
-        total: Some(total),
-        files_done: None,
-        files_total: None,
-    });
+        Some(total),
+        None,
+        None,
+        Some(base),
+        overall_total.or(Some(total)),
+    ));
     loop {
         let n = local_file.read(&mut buf).await?;
         if n == 0 {
@@ -619,16 +790,18 @@ async fn upload_file(
             .await
             .with_context(|| format!("write {remote}"))?;
         done += n as u64;
-        let _ = progress.try_send(TransferProgress {
+        let _ = progress.try_send(progress_msg(
             id,
             done,
-            total: Some(total),
-            files_done: None,
-            files_total: None,
-        });
+            Some(total),
+            None,
+            None,
+            Some(base + done),
+            overall_total.or(Some(total)),
+        ));
     }
     remote_file.flush().await.ok();
-    Ok(())
+    Ok(done)
 }
 
 pub fn join_remote(base: &str, name: &str) -> String {

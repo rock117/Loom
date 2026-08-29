@@ -42,7 +42,8 @@ Path bar shows current remote cwd (`/home/user/...`).
 ### Transfers footer
 
 Each upload/download is a row: name, direction, status (`…%` / Done / Failed).  
-Folder downloads/uploads show `m/n` after a quick file count (e.g. `3/12`), then `Done · 12/12`.  
+Folder downloads/uploads show `m/n` after a quick file count (e.g. `3/12`), size, and elapsed time
+(e.g. `3/12 · 128 MB · 4.2s`, then `Done · 12/12 · 128 MB · 12.3s`).  
 Actions: **×** remove one, **Clear** all, right-click → Reveal in File Explorer / Remove.  
 MVP: in-memory list for the panel lifetime; no separate Transfers tab.
 
