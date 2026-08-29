@@ -1,7 +1,6 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::model::ConnectionState;
 use crate::shared::theme;
 use crate::ui::tab_manager::TabManager;
 
@@ -36,7 +35,6 @@ impl Render for TerminalPane {
                     .flex_1()
                     .items_center()
                     .justify_center()
-                    .flex()
                     .flex_col()
                     .gap(px(theme::SPACE_2))
                     .child(
@@ -53,79 +51,26 @@ impl Render for TerminalPane {
                     )
                     .into_any_element(),
                 Some(tab) => {
-                    let state = tab.state;
                     let msg = tab.status_message.clone();
-                    let tab_id = tab.id;
-                    let term = tab.terminal.clone();
-
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .size_full()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px(px(theme::STATUS_BAR_PAD_X))
-                                .py(px(theme::STATUS_BAR_PAD_Y))
-                                .bg(theme::PANEL_BG)
-                                .border_b_1()
-                                .border_color(theme::BORDER_SUBTLE)
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme::TEXT_MUTED)
-                                        .child(format!("{} · {msg}", state.label())),
-                                )
-                                .when(
-                                    matches!(
-                                        state,
-                                        ConnectionState::Disconnected
-                                            | ConnectionState::Failed
-                                    ),
-                                    |d| {
-                                        d.child(
-                                            div()
-                                                .id("reconnect-btn")
-                                                .px(px(theme::SPACE_2))
-                                                .py(px(theme::SPACE_1))
-                                                .rounded(px(theme::RADIUS_SM))
-                                                .bg(theme::ACCENT)
-                                                .text_color(rgb(0xffffff))
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .child("Reconnect")
-                                                .on_click(cx.listener(move |_this, _, _window, cx| {
-                                                    cx.emit(TerminalPaneEvent::Reconnect(tab_id));
-                                                })),
-                                        )
-                                    },
-                                ),
-                        )
-                        .child(match term {
-                            Some(entity) => div()
-                                .flex_1()
-                                .size_full()
-                                .child(entity)
-                                .into_any_element(),
-                            None => div()
-                                .flex_1()
-                                .p(px(theme::SPACE_4))
-                                .text_color(theme::TEXT_MUTED)
-                                .child(msg)
-                                .into_any_element(),
-                        })
-                        .into_any_element()
+                    match &tab.terminal {
+                        Some(entity) => div()
+                            .flex_1()
+                            .size_full()
+                            .min_h_0()
+                            .child(entity.clone())
+                            .into_any_element(),
+                        None => div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .p(px(theme::SPACE_4))
+                            .text_sm()
+                            .text_color(theme::TEXT_MUTED)
+                            .child(msg)
+                            .into_any_element(),
+                    }
                 }
             })
     }
 }
-
-#[derive(Clone, Debug)]
-pub enum TerminalPaneEvent {
-    Reconnect(uuid::Uuid),
-}
-
-impl EventEmitter<TerminalPaneEvent> for TerminalPane {}

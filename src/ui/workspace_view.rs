@@ -8,9 +8,10 @@ use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
 use crate::ui::settings::{SettingsEvent, SettingsPanel};
 use crate::ui::sidebar::{Sidebar, SidebarEvent};
 use crate::ui::ssh_form::{SshForm, SshFormEvent};
+use crate::ui::status_bar::{StatusBar, StatusBarEvent};
 use crate::ui::tab_bar::{TabBar, TabBarEvent};
 use crate::ui::tab_manager::TabManager;
-use crate::ui::terminal_pane::{TerminalPane, TerminalPaneEvent};
+use crate::ui::terminal_pane::TerminalPane;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
 pub struct WorkspaceView {
@@ -20,6 +21,7 @@ pub struct WorkspaceView {
     sidebar: Entity<Sidebar>,
     tab_bar: Entity<TabBar>,
     terminal_pane: Entity<TerminalPane>,
+    status_bar: Entity<StatusBar>,
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
@@ -27,7 +29,6 @@ pub struct WorkspaceView {
     resizing_sidebar: bool,
     show_settings: bool,
     show_ssh_form: bool,
-    status_message: Option<SharedString>,
     restore_profiles: Vec<uuid::Uuid>,
     _subscriptions: Vec<Subscription>,
 }
@@ -55,6 +56,7 @@ impl WorkspaceView {
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
+        let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
 
@@ -65,6 +67,7 @@ impl WorkspaceView {
             sidebar: sidebar.clone(),
             tab_bar: tab_bar.clone(),
             terminal_pane: terminal_pane.clone(),
+            status_bar: status_bar.clone(),
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
             password_prompt: None,
@@ -72,7 +75,6 @@ impl WorkspaceView {
             resizing_sidebar: false,
             show_settings: false,
             show_ssh_form: false,
-            status_message: None,
             restore_profiles,
             _subscriptions: Vec::new(),
         };
@@ -145,10 +147,10 @@ impl WorkspaceView {
         ));
 
         view._subscriptions.push(cx.subscribe_in(
-            &terminal_pane,
+            &status_bar,
             window,
             |this, _, event, window, cx| match event {
-                TerminalPaneEvent::Reconnect(id) => {
+                StatusBarEvent::Reconnect(id) => {
                     let tab_id = *id;
                     let profile = {
                         let tabs = this.tabs.read(cx);
@@ -177,6 +179,23 @@ impl WorkspaceView {
                     let store = this.store.clone();
                     this.tabs.update(cx, |m, cx| {
                         m.reconnect(tab_id, &store, window, cx);
+                    });
+                }
+                StatusBarEvent::OpenSettings => {
+                    this.show_settings = true;
+                    this.show_ssh_form = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                }
+                StatusBarEvent::EditSshProfile(id) => {
+                    let id = *id;
+                    this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
+                    this.show_ssh_form = true;
+                    this.show_settings = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                    cx.defer_in(window, |this, window, cx| {
+                        this.ssh_form.read(cx).focus(window);
                     });
                 }
             },
@@ -354,6 +373,11 @@ impl WorkspaceView {
         });
     }
 
+    fn set_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let msg = msg.into();
+        self.status_bar.update(cx, |bar, cx| bar.set_toast(msg, cx));
+    }
+
     fn export_workspace(&mut self, cx: &mut Context<Self>) {
         let ws = self.store.read(cx).workspace.clone();
         cx.spawn(async move |this, cx| {
@@ -370,20 +394,17 @@ impl WorkspaceView {
                         let path = handle.path().to_path_buf();
                         match export_workspace_to(&path, &ws) {
                             Ok(()) => {
-                                this.status_message =
-                                    Some(format!("Exported to {}", path.display()).into());
+                                this.set_toast(format!("Exported to {}", path.display()), cx);
                             }
                             Err(err) => {
-                                this.status_message =
-                                    Some(format!("Export failed: {err:#}").into());
+                                this.set_toast(format!("Export failed: {err:#}"), cx);
                             }
                         }
                     }
                     None => {
-                        this.status_message = Some("Export cancelled".into());
+                        this.set_toast("Export cancelled", cx);
                     }
                 }
-                cx.notify();
             })
             .ok();
         })
@@ -411,20 +432,17 @@ impl WorkspaceView {
                                     cx.notify();
                                 });
                                 this.show_settings = false;
-                                this.status_message =
-                                    Some(format!("Imported from {}", path.display()).into());
+                                this.set_toast(format!("Imported from {}", path.display()), cx);
                             }
                             Err(err) => {
-                                this.status_message =
-                                    Some(format!("Import failed: {err:#}").into());
+                                this.set_toast(format!("Import failed: {err:#}"), cx);
                             }
                         }
                     }
                     None => {
-                        this.status_message = Some("Import cancelled".into());
+                        this.set_toast("Import cancelled", cx);
                     }
                 }
-                cx.notify();
             })
             .ok();
         })
@@ -440,8 +458,6 @@ impl Focusable for WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = self.status_message.clone();
-
         div()
             .key_context("Loom")
             // Do not track_focus on the root — that steals keyboard focus from the
@@ -449,6 +465,7 @@ impl Render for WorkspaceView {
             // (terminal / sidebar) holds focus.
             .size_full()
             .flex()
+            .flex_col()
             .relative()
             .bg(theme::BG)
             .text_color(theme::TEXT)
@@ -476,8 +493,7 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &SaveWorkspace, _, cx| {
                 this.persist_tabs(cx);
                 this.store.update(cx, |s, _| s.persist_now());
-                this.status_message = Some("Workspace saved".into());
-                cx.notify();
+                this.set_toast("Workspace saved", cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
                 this.show_settings = !this.show_settings;
@@ -548,54 +564,48 @@ impl Render for WorkspaceView {
             }))
             .child(
                 div()
-                    .w(px(self.sidebar_width))
-                    .h_full()
-                    .child(self.sidebar.clone()),
-            )
-            .child(
-                div()
-                    .id("sidebar-resizer")
-                    .w(px(4.0))
-                    .h_full()
-                    .cursor(CursorStyle::ResizeColumn)
-                    .hover(|s| s.bg(theme::ACCENT))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.resizing_sidebar = true;
-                            cx.notify();
-                        }),
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .w(px(self.sidebar_width))
+                            .h_full()
+                            .child(self.sidebar.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("sidebar-resizer")
+                            .w(px(4.0))
+                            .h_full()
+                            .cursor(CursorStyle::ResizeColumn)
+                            .hover(|s| s.bg(theme::ACCENT))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.resizing_sidebar = true;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .h_full()
+                            .min_w_0()
+                            .child(self.tab_bar.clone())
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(self.terminal_pane.clone()),
+                            ),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .h_full()
-                    .min_w_0()
-                    .child(self.tab_bar.clone())
-                    .child(div().flex_1().min_h_0().child(self.terminal_pane.clone()))
-                    .when_some(status, |d, msg| {
-                        d.child(
-                            div()
-                                .id("status-toast")
-                                .px_3()
-                                .py_1()
-                                .bg(theme::PANEL_BG)
-                                .border_t_1()
-                                .border_color(theme::BORDER)
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .cursor_pointer()
-                                .child(msg)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.status_message = None;
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
+            .child(self.status_bar.clone())
             .when(self.show_settings, |d| d.child(self.settings.clone()))
             .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
