@@ -1,6 +1,7 @@
 //! SFTP requests served on the same russh session as the interactive shell.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +11,20 @@ use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::ssh::ClientHandler;
+
+/// Shared flag: UI sets true on Remove/Clear so the transfer lane aborts and frees up.
+pub type TransferCancel = Arc<AtomicBool>;
+
+pub fn transfer_cancel_flag() -> TransferCancel {
+    Arc::new(AtomicBool::new(false))
+}
+
+fn ensure_not_cancelled(cancel: &TransferCancel) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
 
 /// One remote directory entry for the Files browser.
 #[derive(Debug, Clone)]
@@ -77,6 +92,7 @@ pub enum SftpRequest {
         local: PathBuf,
         progress: Sender<TransferProgress>,
         reply: Sender<Result<TransferOutcome>>,
+        cancel: TransferCancel,
     },
     Upload {
         id: uuid::Uuid,
@@ -84,6 +100,7 @@ pub enum SftpRequest {
         remote_dir: String,
         progress: Sender<TransferProgress>,
         reply: Sender<Result<TransferOutcome>>,
+        cancel: TransferCancel,
     },
 }
 
@@ -283,8 +300,9 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
             local,
             progress,
             reply,
+            cancel,
         } => {
-            let _ = reply.send(download_path(sftp, id, &remote, &local, &progress).await);
+            let _ = reply.send(download_path(sftp, id, &remote, &local, &progress, &cancel).await);
         }
         SftpRequest::Upload {
             id,
@@ -292,8 +310,9 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
             remote_dir,
             progress,
             reply,
+            cancel,
         } => {
-            let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress).await);
+            let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress, &cancel).await);
         }
     }
 }
@@ -359,7 +378,9 @@ async fn count_remote_files(
     progress: &Sender<TransferProgress>,
     found: &mut u32,
     bytes: &mut u64,
+    cancel: &TransferCancel,
 ) -> Result<u32> {
+    ensure_not_cancelled(cancel)?;
     let meta = sftp
         .metadata(remote.to_string())
         .await
@@ -371,6 +392,7 @@ async fn count_remote_files(
             .await
             .with_context(|| format!("read_dir {remote}"))?
         {
+            ensure_not_cancelled(cancel)?;
             n += Box::pin(count_remote_files(
                 sftp,
                 &entry.path(),
@@ -378,6 +400,7 @@ async fn count_remote_files(
                 progress,
                 found,
                 bytes,
+                cancel,
             ))
             .await?;
         }
@@ -404,7 +427,9 @@ async fn count_local_files(
     progress: &Sender<TransferProgress>,
     found: &mut u32,
     bytes: &mut u64,
+    cancel: &TransferCancel,
 ) -> Result<u32> {
+    ensure_not_cancelled(cancel)?;
     let meta = tokio::fs::metadata(local)
         .await
         .with_context(|| format!("stat {}", local.display()))?;
@@ -414,12 +439,14 @@ async fn count_local_files(
             .await
             .with_context(|| format!("read_dir {}", local.display()))?;
         while let Some(entry) = rd.next_entry().await? {
+            ensure_not_cancelled(cancel)?;
             n += Box::pin(count_local_files(
                 &entry.path(),
                 id,
                 progress,
                 found,
                 bytes,
+                cancel,
             ))
             .await?;
         }
@@ -448,7 +475,9 @@ async fn download_path(
     remote: &str,
     local: &Path,
     progress: &Sender<TransferProgress>,
+    cancel: &TransferCancel,
 ) -> Result<TransferOutcome> {
+    ensure_not_cancelled(cancel)?;
     let meta = sftp
         .metadata(remote.to_string())
         .await
@@ -456,8 +485,17 @@ async fn download_path(
     if meta.file_type().is_dir() {
         let mut found = 0u32;
         let mut bytes_total = 0u64;
-        let files_total =
-            count_remote_files(sftp, remote, id, progress, &mut found, &mut bytes_total).await?;
+        let files_total = count_remote_files(
+            sftp,
+            remote,
+            id,
+            progress,
+            &mut found,
+            &mut bytes_total,
+            cancel,
+        )
+        .await?;
+        ensure_not_cancelled(cancel)?;
         let _ = progress.try_send(progress_msg(
             id,
             0,
@@ -479,6 +517,7 @@ async fn download_path(
             files_total,
             &mut bytes_done,
             bytes_total,
+            cancel,
         )
         .await?;
         Ok(TransferOutcome {
@@ -486,7 +525,9 @@ async fn download_path(
             bytes: bytes_done,
         })
     } else {
-        let bytes = download_file(sftp, id, remote, local, meta.size, progress, None, None).await?;
+        let bytes =
+            download_file(sftp, id, remote, local, meta.size, progress, None, None, cancel)
+                .await?;
         Ok(TransferOutcome { files: 1, bytes })
     }
 }
@@ -501,7 +542,9 @@ async fn download_tree(
     files_total: u32,
     bytes_done: &mut u64,
     bytes_total: u64,
+    cancel: &TransferCancel,
 ) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
     let meta = sftp
         .metadata(remote.to_string())
         .await
@@ -515,6 +558,7 @@ async fn download_tree(
             .await
             .with_context(|| format!("read_dir {remote}"))?
         {
+            ensure_not_cancelled(cancel)?;
             let name = entry.file_name();
             let child_remote = entry.path();
             let child_local = local.join(&name);
@@ -528,6 +572,7 @@ async fn download_tree(
                 files_total,
                 bytes_done,
                 bytes_total,
+                cancel,
             ))
             .await?;
         }
@@ -542,6 +587,7 @@ async fn download_tree(
             progress,
             Some(*bytes_done),
             Some(bytes_total),
+            cancel,
         )
         .await?;
         *files_done += 1;
@@ -568,7 +614,9 @@ async fn download_file(
     progress: &Sender<TransferProgress>,
     overall_base: Option<u64>,
     overall_total: Option<u64>,
+    cancel: &TransferCancel,
 ) -> Result<u64> {
+    ensure_not_cancelled(cancel)?;
     if let Some(parent) = local.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
@@ -592,6 +640,7 @@ async fn download_file(
         overall_total.or(total),
     ));
     loop {
+        ensure_not_cancelled(cancel)?;
         let n = remote_file
             .read(&mut buf)
             .await
@@ -624,7 +673,9 @@ async fn upload_path(
     local: &Path,
     remote_dir: &str,
     progress: &Sender<TransferProgress>,
+    cancel: &TransferCancel,
 ) -> Result<TransferOutcome> {
+    ensure_not_cancelled(cancel)?;
     let name = local
         .file_name()
         .and_then(|s| s.to_str())
@@ -637,7 +688,8 @@ async fn upload_path(
         let mut found = 0u32;
         let mut bytes_total = 0u64;
         let files_total =
-            count_local_files(local, id, progress, &mut found, &mut bytes_total).await?;
+            count_local_files(local, id, progress, &mut found, &mut bytes_total, cancel).await?;
+        ensure_not_cancelled(cancel)?;
         let _ = progress.try_send(progress_msg(
             id,
             0,
@@ -659,6 +711,7 @@ async fn upload_path(
             files_total,
             &mut bytes_done,
             bytes_total,
+            cancel,
         )
         .await?;
         Ok(TransferOutcome {
@@ -675,6 +728,7 @@ async fn upload_path(
             progress,
             None,
             Some(meta.len()),
+            cancel,
         )
         .await?;
         Ok(TransferOutcome { files: 1, bytes })
@@ -693,7 +747,9 @@ async fn upload_tree(
     files_total: u32,
     bytes_done: &mut u64,
     bytes_total: u64,
+    cancel: &TransferCancel,
 ) -> Result<()> {
+    ensure_not_cancelled(cancel)?;
     let name = local
         .file_name()
         .and_then(|s| s.to_str())
@@ -708,6 +764,7 @@ async fn upload_tree(
             .await
             .with_context(|| format!("read_dir {}", local.display()))?;
         while let Some(entry) = rd.next_entry().await? {
+            ensure_not_cancelled(cancel)?;
             Box::pin(upload_tree(
                 sftp,
                 id,
@@ -718,6 +775,7 @@ async fn upload_tree(
                 files_total,
                 bytes_done,
                 bytes_total,
+                cancel,
             ))
             .await?;
         }
@@ -732,6 +790,7 @@ async fn upload_tree(
             progress,
             Some(*bytes_done),
             Some(bytes_total),
+            cancel,
         )
         .await?;
         *files_done += 1;
@@ -760,7 +819,9 @@ async fn upload_file(
     progress: &Sender<TransferProgress>,
     overall_base: Option<u64>,
     overall_total: Option<u64>,
+    cancel: &TransferCancel,
 ) -> Result<u64> {
+    ensure_not_cancelled(cancel)?;
     let mut local_file = tokio::fs::File::open(local)
         .await
         .with_context(|| format!("open {}", local.display()))?;
@@ -781,6 +842,7 @@ async fn upload_file(
         overall_total.or(Some(total)),
     ));
     loop {
+        ensure_not_cancelled(cancel)?;
         let n = local_file.read(&mut buf).await?;
         if n == 0 {
             break;

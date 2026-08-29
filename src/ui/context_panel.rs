@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::model::{ConnectionState, ProfileKind};
 use crate::platform;
 use crate::session::sftp::{
-    RemoteEntry, SftpHandle, SftpRequest, TransferProgress, parent_remote,
+    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferProgress, parent_remote,
+    transfer_cancel_flag,
 };
 use crate::shared::theme;
 use crate::ui::tab_manager::TabManager;
@@ -32,6 +33,8 @@ enum TransferDir {
 
 #[derive(Clone)]
 enum TransferStatus {
+    /// Request is on the transfer lane but the worker has not started it yet.
+    Queued,
     Running {
         done: u64,
         total: Option<u64>,
@@ -59,6 +62,8 @@ struct TransferRow {
     elapsed: Option<std::time::Duration>,
     bytes_done: u64,
     bytes_total: Option<u64>,
+    /// Set on Remove/Clear so the SFTP worker aborts and frees the transfer lane.
+    cancel: TransferCancel,
 }
 
 struct TransferMenu {
@@ -298,6 +303,7 @@ impl ContextPanel {
         let name = entry.name.clone();
         let is_dir = entry.is_dir;
         let id = Uuid::new_v4();
+        let cancel = transfer_cancel_flag();
 
         self.transfers.insert(
             0,
@@ -305,18 +311,14 @@ impl ContextPanel {
                 id,
                 label: name.clone(),
                 direction: TransferDir::Download,
-                status: TransferStatus::Running {
-                    done: 0,
-                    total: if is_dir { None } else { Some(entry.size) },
-                    files_done: if is_dir { Some(0) } else { None },
-                    files_total: None,
-                },
+                status: TransferStatus::Queued,
                 local_path: None,
                 is_dir,
                 started_at: None,
                 elapsed: None,
                 bytes_done: 0,
                 bytes_total: if is_dir { None } else { Some(entry.size) },
+                cancel: cancel.clone(),
             },
         );
         cx.notify();
@@ -349,7 +351,8 @@ impl ContextPanel {
             this.update(cx, |this, cx| {
                 if let Some(row) = this.transfers.iter_mut().find(|t| t.id == id) {
                     row.local_path = Some(local.clone());
-                    row.started_at = Some(std::time::Instant::now());
+                    // Stay Queued until the transfer lane actually starts (first progress).
+                    row.status = TransferStatus::Queued;
                 }
                 cx.notify();
             })
@@ -364,6 +367,7 @@ impl ContextPanel {
                     local,
                     progress: progress_tx,
                     reply: reply_tx,
+                    cancel,
                 })
                 .is_err()
             {
@@ -390,17 +394,27 @@ impl ContextPanel {
                     }
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
-                            match result {
-                                Ok(Ok(outcome)) => {
-                                    let files = if is_dir {
-                                        Some(outcome.files)
-                                    } else {
-                                        None
-                                    };
-                                    this.finish_transfer(id, files, Some(outcome.bytes));
+                            // Row may already be gone after Remove/Clear — still OK.
+                            if this.transfers.iter().any(|t| t.id == id) {
+                                match result {
+                                    Ok(Ok(outcome)) => {
+                                        let files = if is_dir {
+                                            Some(outcome.files)
+                                        } else {
+                                            None
+                                        };
+                                        this.finish_transfer(id, files, Some(outcome.bytes));
+                                    }
+                                    Ok(Err(err)) => {
+                                        let msg = format!("{err:#}");
+                                        if msg.contains("cancelled") {
+                                            this.remove_transfer_silent(id);
+                                        } else {
+                                            this.fail_transfer(id, msg);
+                                        }
+                                    }
+                                    Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
                                 }
-                                Ok(Err(err)) => this.fail_transfer(id, format!("{err:#}")),
-                                Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
                             }
                             cx.notify();
                         }).ok();
@@ -438,6 +452,7 @@ impl ContextPanel {
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| local.display().to_string());
+            let cancel = transfer_cancel_flag();
 
             this.update(cx, |this, cx| {
                 this.transfers.insert(
@@ -446,18 +461,14 @@ impl ContextPanel {
                         id,
                         label,
                         direction: TransferDir::Upload,
-                        status: TransferStatus::Running {
-                            done: 0,
-                            total: None,
-                            files_done: None,
-                            files_total: None,
-                        },
+                        status: TransferStatus::Queued,
                         local_path: Some(local.clone()),
                         is_dir: false,
-                        started_at: Some(std::time::Instant::now()),
+                        started_at: None,
                         elapsed: None,
                         bytes_done: 0,
                         bytes_total: None,
+                        cancel: cancel.clone(),
                     },
                 );
                 cx.notify();
@@ -473,6 +484,7 @@ impl ContextPanel {
                     remote_dir: cwd,
                     progress: progress_tx,
                     reply: reply_tx,
+                    cancel,
                 })
                 .is_err()
             {
@@ -499,15 +511,24 @@ impl ContextPanel {
                     }
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
-                            match result {
-                                Ok(Ok(outcome)) => {
-                                    this.finish_transfer(id, None, Some(outcome.bytes));
-                                    if let Some(cwd) = this.cwd.clone() {
-                                        this.load_dir(cwd, cx);
+                            if this.transfers.iter().any(|t| t.id == id) {
+                                match result {
+                                    Ok(Ok(outcome)) => {
+                                        this.finish_transfer(id, None, Some(outcome.bytes));
+                                        if let Some(cwd) = this.cwd.clone() {
+                                            this.load_dir(cwd, cx);
+                                        }
                                     }
+                                    Ok(Err(err)) => {
+                                        let msg = format!("{err:#}");
+                                        if msg.contains("cancelled") {
+                                            this.remove_transfer_silent(id);
+                                        } else {
+                                            this.fail_transfer(id, msg);
+                                        }
+                                    }
+                                    Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
                                 }
-                                Ok(Err(err)) => this.fail_transfer(id, format!("{err:#}")),
-                                Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
                             }
                             cx.notify();
                         }).ok();
@@ -527,12 +548,16 @@ impl ContextPanel {
                     files_total,
                     ..
                 } => (*files_done, *files_total),
+                TransferStatus::Queued | TransferStatus::Failed(_) => (None, None),
                 TransferStatus::Done { files } => (*files, *files),
-                TransferStatus::Failed(_) => (None, None),
             };
+            // First progress = left the queue and the worker is actually running this job.
+            if row.started_at.is_none() {
+                row.started_at = Some(std::time::Instant::now());
+            }
             row.status = TransferStatus::Running {
                 done: p.done,
-                total: p.total,
+                total: p.total.or(row.bytes_total),
                 files_done: p.files_done.or(prev_files),
                 files_total: p.files_total.or(prev_total),
             };
@@ -545,9 +570,6 @@ impl ContextPanel {
                 row.bytes_total = Some(t);
             } else if let Some(t) = p.total {
                 row.bytes_total = Some(t);
-            }
-            if row.started_at.is_none() {
-                row.started_at = Some(std::time::Instant::now());
             }
         }
     }
@@ -581,6 +603,13 @@ impl ContextPanel {
     }
 
     fn remove_transfer(&mut self, id: Uuid) {
+        if let Some(row) = self.transfers.iter().find(|t| t.id == id) {
+            row.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.remove_transfer_silent(id);
+    }
+
+    fn remove_transfer_silent(&mut self, id: Uuid) {
         self.transfers.retain(|t| t.id != id);
         if self.transfer_menu.as_ref().is_some_and(|m| m.id == id) {
             self.transfer_menu = None;
@@ -588,6 +617,9 @@ impl ContextPanel {
     }
 
     fn clear_transfers(&mut self) {
+        for row in &self.transfers {
+            row.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         self.transfers.clear();
         self.transfer_menu = None;
     }
@@ -942,6 +974,7 @@ impl ContextPanel {
                 let color = match &row.status {
                     TransferStatus::Failed(_) => theme::DANGER,
                     TransferStatus::Done { .. } => theme::ICON_LOCAL,
+                    TransferStatus::Queued => theme::TEXT_DISABLED,
                     _ => theme::TEXT_MUTED,
                 };
                 div()
@@ -1219,17 +1252,51 @@ fn transfer_elapsed(row: &TransferRow) -> Option<std::time::Duration> {
     row.elapsed.or_else(|| row.started_at.map(|t| t.elapsed()))
 }
 
+fn format_rate(bytes_per_sec: f64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    if bytes_per_sec >= MB {
+        format!("{:.1} MB/s", bytes_per_sec / MB)
+    } else if bytes_per_sec >= KB {
+        format!("{:.0} KB/s", bytes_per_sec / KB)
+    } else if bytes_per_sec > 0.0 {
+        format!("{:.0} B/s", bytes_per_sec)
+    } else {
+        String::new()
+    }
+}
+
 fn transfer_status_label(row: &TransferRow) -> String {
     let mut parts: Vec<String> = Vec::new();
 
+    // Folder jobs first walk the tree (files_done stays 0, bytes_done stays 0 while
+    // files_total / bytes_total grow). Queued means the transfer lane has not started yet.
+    let scanning = row.is_dir
+        && row.bytes_done == 0
+        && matches!(
+            &row.status,
+            TransferStatus::Running {
+                files_done: Some(0) | None,
+                ..
+            }
+        );
+
     match &row.status {
+        TransferStatus::Queued => {
+            parts.push("Queued".into());
+        }
         TransferStatus::Running {
             done,
             total,
             files_done,
             files_total,
         } => {
-            if row.is_dir || files_total.is_some() || files_done.is_some() {
+            if scanning {
+                parts.push(match files_total {
+                    Some(t) => format!("Scanning · {t}"),
+                    None => "Scanning…".into(),
+                });
+            } else if row.is_dir || files_total.is_some() || files_done.is_some() {
                 let d = files_done.unwrap_or(0);
                 parts.push(match files_total {
                     Some(t) => format!("{d}/{t}"),
@@ -1240,7 +1307,12 @@ fn transfer_status_label(row: &TransferRow) -> String {
                     Some(t) if *t > 0 => {
                         parts.push(format!("{}%", ((*done as f64 / *t as f64) * 100.0) as u32));
                     }
-                    _ => {}
+                    _ if *done > 0 => {
+                        parts.push(format_size(*done));
+                    }
+                    _ => {
+                        parts.push("…".into());
+                    }
                 }
             }
         }
@@ -1251,29 +1323,65 @@ fn transfer_status_label(row: &TransferRow) -> String {
             }
         }
         TransferStatus::Failed(msg) => {
-            let short = if msg.len() > 20 {
-                format!("{}…", &msg[..20])
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("cancelled") || lower.contains("canceled") {
+                parts.push("Cancelled".into());
             } else {
-                msg.clone()
-            };
-            parts.push(short);
+                let short = if msg.len() > 28 {
+                    format!("{}…", &msg[..28])
+                } else {
+                    msg.clone()
+                };
+                parts.push(format!("Failed · {short}"));
+            }
         }
     }
 
-    let size_label = match (row.bytes_done, row.bytes_total) {
-        (done, Some(total)) if total > 0 && done > 0 && done < total => {
+    // Queued: optional known size only (no rate / elapsed — not running yet).
+    if matches!(&row.status, TransferStatus::Queued) {
+        if let Some(total) = row.bytes_total.filter(|t| *t > 0) {
+            parts.push(format_size(total));
+        }
+        return parts.join(" · ");
+    }
+
+    let size_label = match (row.bytes_done, row.bytes_total, scanning) {
+        (done, Some(total), false) if total > 0 && done > 0 && done < total => {
             Some(format!("{} / {}", format_size(done), format_size(total)))
         }
-        (_, Some(total)) if total > 0 => Some(format_size(total)),
-        (done, _) if done > 0 => Some(format_size(done)),
+        (_, Some(total), true) if total > 0 => Some(format_size(total)),
+        (done, Some(total), false) if total > 0 && done >= total => Some(format_size(total)),
+        (_, Some(total), false) if total > 0 && row.bytes_done == 0 => Some(format_size(total)),
+        (done, None, false) if done > 0 => Some(format_size(done)),
         _ => None,
     };
     if let Some(s) = size_label {
-        parts.push(s);
+        // Avoid duplicating size when Running already pushed format_size(done) above.
+        if !parts.iter().any(|p| p == &s) {
+            parts.push(s);
+        }
+    }
+
+    // Live average rate while bytes are moving (not during folder scan).
+    if !scanning
+        && matches!(&row.status, TransferStatus::Running { .. })
+        && row.bytes_done > 0
+    {
+        if let Some(started) = row.started_at {
+            let secs = started.elapsed().as_secs_f64().max(0.001);
+            let rate = format_rate(row.bytes_done as f64 / secs);
+            if !rate.is_empty() {
+                parts.push(rate);
+            }
+        }
     }
 
     if let Some(d) = transfer_elapsed(row) {
-        if !matches!(&row.status, TransferStatus::Failed(_)) || row.started_at.is_some() {
+        if matches!(
+            &row.status,
+            TransferStatus::Running { .. } | TransferStatus::Done { .. }
+        ) || (matches!(&row.status, TransferStatus::Failed(_)) && row.started_at.is_some())
+        {
             parts.push(format_duration(d));
         }
     }
