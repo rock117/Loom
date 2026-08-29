@@ -185,9 +185,11 @@ impl Render for Sidebar {
                             .child(self.ghost_svg(
                                 "btn-ssh",
                                 "icons/ui/remote.svg",
-                                true,
+                                false,
                                 cx,
-                                |_, _, _| {},
+                                |_, _, cx| {
+                                    cx.emit(SidebarEvent::OpenSshForm);
+                                },
                             ))
                             .child(self.ghost_svg(
                                 "btn-settings",
@@ -505,6 +507,7 @@ pub enum SidebarEvent {
     #[allow(dead_code)]
     ShowProfileMenu(Uuid),
     OpenSettings,
+    OpenSshForm,
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}

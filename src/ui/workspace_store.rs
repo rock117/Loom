@@ -125,6 +125,32 @@ impl WorkspaceStore {
         Some(id)
     }
 
+    pub fn add_ssh_profile(&mut self, profile: Profile, cx: &mut Context<Self>) -> bool {
+        let group_id = match self.selection {
+            Selection::Group(id) => id,
+            Selection::Profile(pid) => match self.workspace.group_id_for_profile(pid) {
+                Some(id) => id,
+                None => return false,
+            },
+            Selection::None => match self.workspace.groups.first().map(|g| g.id) {
+                Some(id) => id,
+                None => return false,
+            },
+        };
+        let id = profile.id;
+        if let Some(g) = self.workspace.find_group_mut(group_id) {
+            g.profiles.push(profile);
+            g.collapsed = false;
+        } else {
+            return false;
+        }
+        self.selection = Selection::Profile(id);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
+    }
+
     pub fn duplicate_profile(&mut self, id: Uuid, cx: &mut Context<Self>) -> Option<Uuid> {
         let group_id = self.workspace.group_id_for_profile(id)?;
         let dup = self.workspace.find_profile(id)?.duplicate();
@@ -146,6 +172,7 @@ impl WorkspaceStore {
     pub fn delete_selection(&mut self, cx: &mut Context<Self>) {
         match self.selection {
             Selection::Profile(id) => {
+                let _ = crate::session::credentials::delete_password(id);
                 self.workspace.remove_profile(id);
                 self.selection = Selection::None;
                 self.mark_dirty();

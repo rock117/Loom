@@ -107,7 +107,26 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 **Why:** Product identity is session management, not editing a codebase.
 
-**Consequences / follow-ups:** SSH remains deferred; local shell is the priority path.
+**Consequences / follow-ups:** Local shell remains the default path; SSH is implemented separately via `russh`.
+
+---
+
+## 2026-08-29 — SSH via russh + OS keyring passwords
+
+**Status:** accepted  
+
+**Context:** Loom needs interactive SSH sessions that reuse the existing GPUI terminal view. Passwords must be rememberable without writing secrets into `workspace.json`.
+
+**Options:**
+- Shell out to system `ssh`  
+- Embed `russh` and bridge channel I/O to `TerminalView`  
+- Store passwords in profile JSON vs OS credential store  
+
+**Decision:** Use **`russh`** on a dedicated Tokio thread; bridge stdin/stdout with flume. Persist passwords with **`keyring`** (Windows Credential Manager). Host keys use trust-on-first-use in `known_hosts.json`.
+
+**Why:** Keeps MIT-friendly Rust stack, matches Local session I/O shape, avoids plaintext secrets on disk.
+
+**Consequences / follow-ups:** Jump hosts / agent forwarding / passphrase UI later. Host-key change requires manual known_hosts edit for now.
 
 ---
 

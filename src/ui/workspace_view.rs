@@ -4,8 +4,10 @@ use gpui::*;
 use crate::model::{export_workspace_to, import_workspace_from};
 use crate::shared::actions::*;
 use crate::shared::theme;
+use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
 use crate::ui::settings::{SettingsEvent, SettingsPanel};
 use crate::ui::sidebar::{Sidebar, SidebarEvent};
+use crate::ui::ssh_form::{SshForm, SshFormEvent};
 use crate::ui::tab_bar::{TabBar, TabBarEvent};
 use crate::ui::tab_manager::TabManager;
 use crate::ui::terminal_pane::{TerminalPane, TerminalPaneEvent};
@@ -19,9 +21,12 @@ pub struct WorkspaceView {
     tab_bar: Entity<TabBar>,
     terminal_pane: Entity<TerminalPane>,
     settings: Entity<SettingsPanel>,
+    ssh_form: Entity<SshForm>,
+    password_prompt: Option<Entity<PasswordPrompt>>,
     sidebar_width: f32,
     resizing_sidebar: bool,
     show_settings: bool,
+    show_ssh_form: bool,
     status_message: Option<SharedString>,
     restore_profiles: Vec<uuid::Uuid>,
     _subscriptions: Vec<Subscription>,
@@ -51,6 +56,7 @@ impl WorkspaceView {
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
+        let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
 
         let mut view = Self {
             focus_handle: cx.focus_handle(),
@@ -60,9 +66,12 @@ impl WorkspaceView {
             tab_bar: tab_bar.clone(),
             terminal_pane: terminal_pane.clone(),
             settings: settings.clone(),
+            ssh_form: ssh_form.clone(),
+            password_prompt: None,
             sidebar_width,
             resizing_sidebar: false,
             show_settings: false,
+            show_ssh_form: false,
             status_message: None,
             restore_profiles,
             _subscriptions: Vec::new(),
@@ -76,6 +85,40 @@ impl WorkspaceView {
                 SidebarEvent::ShowProfileMenu(_) => {}
                 SidebarEvent::OpenSettings => {
                     this.show_settings = true;
+                    this.show_ssh_form = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                }
+                SidebarEvent::OpenSshForm => {
+                    this.ssh_form.update(cx, |f, cx| f.reset(cx));
+                    this.show_ssh_form = true;
+                    this.show_settings = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                    cx.defer_in(window, |this, window, cx| {
+                        this.ssh_form.read(cx).focus(window);
+                    });
+                }
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
+            &ssh_form,
+            window,
+            move |this, _, event: &SshFormEvent, window, cx| match event {
+                SshFormEvent::Close => {
+                    this.show_ssh_form = false;
+                    cx.notify();
+                }
+                SshFormEvent::Created {
+                    profile_id,
+                    connect,
+                    oneshot_password,
+                } => {
+                    this.show_ssh_form = false;
+                    if *connect {
+                        this.connect_ssh(*profile_id, oneshot_password.clone(), window, cx);
+                    }
                     cx.notify();
                 }
             },
@@ -95,9 +138,34 @@ impl WorkspaceView {
             window,
             |this, _, event, window, cx| match event {
                 TerminalPaneEvent::Reconnect(id) => {
+                    let tab_id = *id;
+                    let profile = {
+                        let tabs = this.tabs.read(cx);
+                        tabs.tabs
+                            .iter()
+                            .find(|t| t.id == tab_id)
+                            .and_then(|t| {
+                                this.store
+                                    .read(cx)
+                                    .workspace
+                                    .find_profile(t.profile_id)
+                                    .cloned()
+                            })
+                    };
+                    if let Some(profile) = profile {
+                        if TabManager::ssh_needs_password(&profile) {
+                            this.show_password_prompt(
+                                profile.id,
+                                profile.name.clone(),
+                                window,
+                                cx,
+                            );
+                            return;
+                        }
+                    }
                     let store = this.store.clone();
                     this.tabs.update(cx, |m, cx| {
-                        m.reconnect(*id, &store, window, cx);
+                        m.reconnect(tab_id, &store, window, cx);
                     });
                 }
             },
@@ -140,18 +208,114 @@ impl WorkspaceView {
                 s.settings.font_family.clone(),
             )
         };
-        if let Some(profile) = profile {
+        let Some(profile) = profile else {
+            return;
+        };
+
+        if TabManager::ssh_needs_password(&profile) {
+            self.show_password_prompt(profile.id, profile.name.clone(), window, cx);
+            return;
+        }
+
+        self.tabs.update(cx, |m, cx| {
+            m.open_profile(
+                &profile,
+                default_shell.as_deref(),
+                &font_family,
+                window,
+                cx,
+            );
+        });
+        self.persist_tabs(cx);
+    }
+
+    fn connect_ssh(
+        &mut self,
+        profile_id: uuid::Uuid,
+        oneshot_password: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (profile, font_family) = {
+            let s = self.store.read(cx);
+            (
+                s.workspace.find_profile(profile_id).cloned(),
+                s.settings.font_family.clone(),
+            )
+        };
+        let Some(profile) = profile else {
+            return;
+        };
+
+        if let Some(password) = oneshot_password {
             self.tabs.update(cx, |m, cx| {
-                m.open_profile(
-                    &profile,
-                    default_shell.as_deref(),
-                    &font_family,
-                    window,
-                    cx,
-                );
+                m.open_ssh_with_password(&profile, password, &font_family, cx);
             });
             self.persist_tabs(cx);
+            return;
         }
+
+        if TabManager::ssh_needs_password(&profile) {
+            self.show_password_prompt(profile.id, profile.name.clone(), window, cx);
+            return;
+        }
+
+        self.tabs.update(cx, |m, cx| {
+            m.open_ssh_profile(&profile, &font_family, cx);
+        });
+        self.persist_tabs(cx);
+    }
+
+    fn show_password_prompt(
+        &mut self,
+        profile_id: uuid::Uuid,
+        title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let prompt = cx.new(|cx| PasswordPrompt::new(profile_id, title, cx));
+        self._subscriptions.push(cx.subscribe(&prompt, {
+            move |this, _, event: &PasswordPromptEvent, cx| match event {
+                PasswordPromptEvent::Cancel => {
+                    this.password_prompt = None;
+                    cx.notify();
+                }
+                PasswordPromptEvent::Submit {
+                    profile_id,
+                    password,
+                } => {
+                    this.password_prompt = None;
+                    let (profile, font_family) = {
+                        let s = this.store.read(cx);
+                        (
+                            s.workspace.find_profile(*profile_id).cloned(),
+                            s.settings.font_family.clone(),
+                        )
+                    };
+                    if let Some(profile) = profile {
+                        this.tabs.update(cx, |m, cx| {
+                            m.open_ssh_with_password(
+                                &profile,
+                                password.clone(),
+                                &font_family,
+                                cx,
+                            );
+                        });
+                        this.persist_tabs(cx);
+                    }
+                    cx.notify();
+                }
+            }
+        }));
+        self.password_prompt = Some(prompt);
+        self.show_settings = false;
+        self.show_ssh_form = false;
+        cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            if let Some(prompt) = this.password_prompt.as_ref() {
+                prompt.read(cx).focus(window);
+            }
+        });
     }
 
     fn new_local_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -419,5 +583,7 @@ impl Render for WorkspaceView {
                     }),
             )
             .when(self.show_settings, |d| d.child(self.settings.clone()))
+            .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
+            .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
     }
 }

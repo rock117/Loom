@@ -3,9 +3,20 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SshAuth {
-    PasswordPrompt,
-    PrivateKey { path: PathBuf },
+    /// Password from OS credential store when `remember` is true.
+    Password {
+        #[serde(default = "default_true")]
+        remember: bool,
+    },
+    PrivateKey {
+        path: PathBuf,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -78,7 +89,7 @@ impl Profile {
                 host,
                 port,
                 user,
-                auth: SshAuth::PasswordPrompt,
+                auth: SshAuth::Password { remember: true },
             },
         }
     }

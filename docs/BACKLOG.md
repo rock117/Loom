@@ -13,7 +13,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| P1 | **SSH / bastion** | Keys, password, agent; multi-hop later. Natural fit for profiles. |
+| P1 | **SSH / bastion** | **MVP shipped** (russh + keyring passwords + TOFU known_hosts). Still open: jump hosts, agent, key passphrase UI, nicer host-key change flow. |
 | P2 | **Session templates** | One action opens a defined set of tabs (e.g. API + DB + logs). |
 | P3 | **Profile env / startup** | Per-profile env vars, cwd, init command / script. |
 | P4 | **Tab layouts / splits** | Split panes (H/V), drag to rearrange. |

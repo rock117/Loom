@@ -1,15 +1,18 @@
 use std::sync::Arc;
+use std::thread;
 
 use gpui::prelude::*;
 use gpui::*;
-use crate::terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::ChildKiller;
 use uuid::Uuid;
 
-use crate::model::{ConnectionState, Profile, ProfileKind};
+use crate::model::{ConnectionState, Profile, ProfileKind, SshAuth};
 use crate::platform;
+use crate::session::credentials;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
+use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
+use crate::terminal::{ColorPalette, TerminalConfig, TerminalView};
 use crate::ui::workspace_store::WorkspaceStore;
 
 pub struct TabSession {
@@ -21,6 +24,7 @@ pub struct TabSession {
     pub terminal: Option<Entity<TerminalView>>,
     pub pty_master: Option<Arc<parking_lot::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
     pub pty_killer: Option<Box<dyn ChildKiller + Send + Sync>>,
+    pub ssh_shutdown: Option<flume::Sender<()>>,
 }
 
 pub struct TabManager {
@@ -52,48 +56,171 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !profile.kind.is_local() {
-            let tab = TabSession {
-                id: Uuid::new_v4(),
-                profile_id: profile.id,
-                title: profile.name.clone(),
-                state: ConnectionState::Failed,
-                status_message: "SSH is not enabled yet".into(),
-                terminal: None,
-                pty_master: None,
-                pty_killer: None,
-            };
-            let id = tab.id;
-            self.tabs.push(tab);
-            self.active = Some(id);
-            cx.notify();
-            return;
+        match &profile.kind {
+            ProfileKind::Local { .. } => {
+                match self.spawn_local(profile, default_shell, font_family, window, cx) {
+                    Ok(tab) => {
+                        let id = tab.id;
+                        self.tabs.push(tab);
+                        self.active = Some(id);
+                        cx.notify();
+                    }
+                    Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+                }
+            }
+            ProfileKind::Ssh { .. } => match resolve_ssh_auth(profile, None) {
+                Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+                Ok(None) => self.push_failed(profile, "password required".into(), cx),
+                Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+            },
         }
+    }
 
-        match self.spawn_local(profile, default_shell, font_family, window, cx) {
-            Ok(tab) => {
-                let id = tab.id;
-                self.tabs.push(tab);
-                self.active = Some(id);
-                cx.notify();
-            }
-            Err(err) => {
-                let tab = TabSession {
-                    id: Uuid::new_v4(),
-                    profile_id: profile.id,
-                    title: profile.name.clone(),
-                    state: ConnectionState::Failed,
-                    status_message: format!("{err:#}"),
-                    terminal: None,
-                    pty_master: None,
-                    pty_killer: None,
-                };
-                let id = tab.id;
-                self.tabs.push(tab);
-                self.active = Some(id);
-                cx.notify();
-            }
+    /// Open an SSH profile when credentials are already available (keyring).
+    pub fn open_ssh_profile(
+        &mut self,
+        profile: &Profile,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match resolve_ssh_auth(profile, None) {
+            Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+            Ok(None) => self.push_failed(profile, "password required".into(), cx),
+            Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
         }
+    }
+
+    pub fn open_ssh_with_password(
+        &mut self,
+        profile: &Profile,
+        password: String,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        match resolve_ssh_auth(profile, Some(password)) {
+            Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+            Ok(None) => self.push_failed(profile, "password required".into(), cx),
+            Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+        }
+    }
+
+    pub fn ssh_needs_password(profile: &Profile) -> bool {
+        matches!(
+            &profile.kind,
+            ProfileKind::Ssh {
+                auth: SshAuth::Password { .. },
+                ..
+            }
+        ) && credentials::get_password(profile.id)
+            .ok()
+            .flatten()
+            .is_none()
+    }
+
+    fn push_failed(&mut self, profile: &Profile, message: String, cx: &mut Context<Self>) {
+        let tab = TabSession {
+            id: Uuid::new_v4(),
+            profile_id: profile.id,
+            title: profile.name.clone(),
+            state: ConnectionState::Failed,
+            status_message: message,
+            terminal: None,
+            pty_master: None,
+            pty_killer: None,
+            ssh_shutdown: None,
+        };
+        let id = tab.id;
+        self.tabs.push(tab);
+        self.active = Some(id);
+        cx.notify();
+    }
+
+    fn begin_ssh(
+        &mut self,
+        profile: &Profile,
+        auth: SshAuthMaterial,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let ProfileKind::Ssh {
+            host, port, user, ..
+        } = &profile.kind
+        else {
+            return;
+        };
+
+        let tab_id = Uuid::new_v4();
+        self.tabs.push(TabSession {
+            id: tab_id,
+            profile_id: profile.id,
+            title: profile.name.clone(),
+            state: ConnectionState::Connecting,
+            status_message: format!("connecting to {user}@{host}:{port}…"),
+            terminal: None,
+            pty_master: None,
+            pty_killer: None,
+            ssh_shutdown: None,
+        });
+        self.active = Some(tab_id);
+        cx.notify();
+
+        let params = SshConnectParams {
+            host: host.clone(),
+            port: *port,
+            user: user.clone(),
+            auth,
+            cols: 80,
+            rows: 24,
+        };
+        let family = if font_family.trim().is_empty() {
+            platform::monospace_font_family().to_string()
+        } else {
+            font_family.to_string()
+        };
+        let font_size = self.font_size;
+        let label = format!("{user}@{host}:{port}");
+
+        let (tx, rx) = flume::bounded(1);
+        let _ = thread::Builder::new()
+            .name("loom-ssh-connect".into())
+            .spawn(move || {
+                let result = ssh::connect_blocking(params);
+                let _ = tx.send(result);
+            });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                let Some(idx) = this.tabs.iter().position(|t| t.id == tab_id) else {
+                    return;
+                };
+                match result {
+                    Ok(Ok(handles)) => {
+                        let config = terminal_config(font_size, &family);
+                        let resize = handles.resize.clone();
+                        let terminal = cx.new(|cx| {
+                            TerminalView::new(handles.writer, handles.reader, config, cx)
+                                .with_resize_callback(move |c, r| resize(c, r))
+                        });
+                        this.tabs[idx].terminal = Some(terminal);
+                        this.tabs[idx].ssh_shutdown = Some(handles.shutdown);
+                        this.tabs[idx].state = ConnectionState::Connected;
+                        this.tabs[idx].status_message = format!("ssh · {label}");
+                    }
+                    Ok(Err(err)) => {
+                        this.tabs[idx].state = ConnectionState::Failed;
+                        this.tabs[idx].status_message = format!("{err:#}");
+                    }
+                    Err(_) => {
+                        this.tabs[idx].state = ConnectionState::Failed;
+                        this.tabs[idx].status_message = "SSH connect cancelled".into();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn spawn_local(
@@ -144,6 +271,7 @@ impl TabManager {
             terminal: Some(terminal),
             pty_master: Some(master),
             pty_killer: Some(killer),
+            ssh_shutdown: None,
         })
     }
 
@@ -174,32 +302,47 @@ impl TabManager {
             return;
         };
 
-        let old_master = self.tabs[idx].pty_master.take();
-        let old_killer = self.tabs[idx].pty_killer.take();
-        self.tabs[idx].terminal = None;
-        teardown_pty(old_killer, old_master);
+        teardown_tab_io(&mut self.tabs[idx]);
 
-        self.tabs[idx].state = ConnectionState::Connecting;
-        self.tabs[idx].status_message = "reconnecting…".into();
-
-        match self.spawn_local(
-            &profile,
-            default_shell.as_deref(),
-            &font_family,
-            window,
-            cx,
-        ) {
-            Ok(mut fresh) => {
-                fresh.id = tab_id;
-                fresh.title = title;
-                self.tabs[idx] = fresh;
+        match &profile.kind {
+            ProfileKind::Local { .. } => {
+                self.tabs[idx].state = ConnectionState::Connecting;
+                self.tabs[idx].status_message = "reconnecting…".into();
+                match self.spawn_local(
+                    &profile,
+                    default_shell.as_deref(),
+                    &font_family,
+                    window,
+                    cx,
+                ) {
+                    Ok(mut fresh) => {
+                        fresh.id = tab_id;
+                        fresh.title = title;
+                        self.tabs[idx] = fresh;
+                    }
+                    Err(err) => {
+                        self.tabs[idx].state = ConnectionState::Failed;
+                        self.tabs[idx].status_message = format!("{err:#}");
+                    }
+                }
+                cx.notify();
             }
-            Err(err) => {
-                self.tabs[idx].state = ConnectionState::Failed;
-                self.tabs[idx].status_message = format!("{err:#}");
+            ProfileKind::Ssh { .. } => {
+                self.tabs.remove(idx);
+                self.active = self.tabs.first().map(|t| t.id);
+                cx.notify();
+                match resolve_ssh_auth(&profile, None) {
+                    Ok(Some(auth)) => {
+                        self.begin_ssh(&profile, auth, &font_family, cx);
+                        if let Some(t) = self.tabs.last_mut() {
+                            t.title = title;
+                        }
+                    }
+                    Ok(None) => self.push_failed(&profile, "password required".into(), cx),
+                    Err(err) => self.push_failed(&profile, format!("{err:#}"), cx),
+                }
             }
         }
-        cx.notify();
     }
 
     pub fn close_active(&mut self, cx: &mut Context<Self>) {
@@ -213,11 +356,9 @@ impl TabManager {
         let Some(pos) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
-        let tab = self.tabs.remove(pos);
-        let master = tab.pty_master;
-        let killer = tab.pty_killer;
+        let mut tab = self.tabs.remove(pos);
+        teardown_tab_io(&mut tab);
         drop(tab.terminal);
-        teardown_pty(killer, master);
 
         self.active = if self.tabs.is_empty() {
             None
@@ -228,11 +369,11 @@ impl TabManager {
     }
 
     pub fn teardown_all(&mut self) {
-        let tabs = std::mem::take(&mut self.tabs);
+        let mut tabs = std::mem::take(&mut self.tabs);
         self.active = None;
-        for tab in tabs {
+        for mut tab in tabs.drain(..) {
+            teardown_tab_io(&mut tab);
             drop(tab.terminal);
-            teardown_pty(tab.pty_killer, tab.pty_master);
         }
     }
 
@@ -343,6 +484,36 @@ impl TabManager {
 impl Drop for TabManager {
     fn drop(&mut self) {
         self.teardown_all();
+    }
+}
+
+fn teardown_tab_io(tab: &mut TabSession) {
+    if let Some(tx) = tab.ssh_shutdown.take() {
+        let _ = tx.send(());
+    }
+    let master = tab.pty_master.take();
+    let killer = tab.pty_killer.take();
+    teardown_pty(killer, master);
+}
+
+fn resolve_ssh_auth(
+    profile: &Profile,
+    password_override: Option<String>,
+) -> anyhow::Result<Option<SshAuthMaterial>> {
+    let ProfileKind::Ssh { auth, .. } = &profile.kind else {
+        anyhow::bail!("not an SSH profile");
+    };
+    match auth {
+        SshAuth::Password { .. } => {
+            if let Some(p) = password_override {
+                return Ok(Some(SshAuthMaterial::Password(p)));
+            }
+            Ok(credentials::get_password(profile.id)?.map(SshAuthMaterial::Password))
+        }
+        SshAuth::PrivateKey { path } => Ok(Some(SshAuthMaterial::PrivateKey {
+            path: path.clone(),
+            passphrase: None,
+        })),
     }
 }
 
