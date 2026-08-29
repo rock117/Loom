@@ -916,6 +916,9 @@ fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
 }
 
 fn teardown_pane_io(pane: &mut PaneSession) {
+    // Drop SFTP handle first so the pool shuts down and returns channel budget
+    // before (or as) the SSH session disconnects.
+    drop(pane.ssh_sftp.take());
     if let Some(tx) = pane.ssh_shutdown.take() {
         let _ = tx.send(());
     }

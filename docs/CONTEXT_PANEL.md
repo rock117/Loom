@@ -2,7 +2,7 @@
 
 WindTerm-style **third column** on the right: a **session context panel** for the focused pane.
 
-Related: [ARCHITECTURE.md](./ARCHITECTURE.md), [DECISIONS.md](./DECISIONS.md).
+Related: [ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[SFTP_POOL.md](./SFTP_POOL.md)**（SFTP 连接池 / 浏览与传输并行 / 资源回收，中文规格）。
 
 ## Layout
 
@@ -68,8 +68,8 @@ Read-only: profile name, Local/SSH, target, connection state, working directory 
 
 | Piece | Location |
 |-------|----------|
-| Doc | `docs/CONTEXT_PANEL.md` |
-| SFTP bridge | `src/session/sftp.rs` + `ssh.rs` (same russh session) |
+| Doc | `docs/CONTEXT_PANEL.md`、`docs/SFTP_POOL.md` |
+| SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池） |
 | UI | `src/ui/context_panel.rs` |
 | Pane handle | `PaneSession.ssh_sftp` |
 

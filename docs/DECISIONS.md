@@ -174,7 +174,7 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 **Why:** Clear IA (left = connections, right = tools for current session); SFTP is the high-value WindTerm-style differentiator for a Postman-style SSH client.
 
-**Consequences / follow-ups:** Same russh session opens an SFTP subsystem channel on demand (`russh-sftp`). Recursive folder download/upload in MVP; drag-drop and transfer persistence later.
+**Consequences / follow-ups:** Same russh session opens SFTP subsystem channel(s) on demand (`russh-sftp`). Browse/Transfer 分车道连接池、懒开与回收见 [SFTP_POOL.md](./SFTP_POOL.md)。Recursive folder download/upload in MVP; drag-drop and transfer persistence later.
 ---
 
 ## How to use this file in review

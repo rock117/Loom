@@ -73,6 +73,8 @@ pub struct ContextPanel {
     error: Option<String>,
     /// Pane id we last bound SFTP state to.
     bound_pane: Option<Uuid>,
+    /// Bumps on each List so stale replies are ignored.
+    list_gen: u64,
     transfers: Vec<TransferRow>,
     transfer_menu: Option<TransferMenu>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
@@ -118,6 +120,7 @@ impl ContextPanel {
             listing: false,
             error: None,
             bound_pane: None,
+            list_gen: 0,
             transfers: Vec::new(),
             transfer_menu: None,
             list_ratio,
@@ -142,11 +145,15 @@ impl ContextPanel {
     fn sync_session(&mut self, cx: &mut Context<Self>) {
         let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             if self.bound_pane.take().is_some() {
+                self.list_gen = self.list_gen.wrapping_add(1);
                 self.cwd = None;
                 self.home = None;
                 self.entries.clear();
                 self.selected = None;
                 self.error = None;
+                self.listing = false;
+                self.transfers.clear();
+                self.transfer_menu = None;
             }
             return;
         };
@@ -154,11 +161,15 @@ impl ContextPanel {
             return;
         }
         self.bound_pane = Some(pane_id);
+        self.list_gen = self.list_gen.wrapping_add(1);
         self.cwd = None;
         self.home = None;
         self.entries.clear();
         self.selected = None;
         self.error = None;
+        self.listing = false;
+        // Keep transfer rows from other panes visible until cleared by user;
+        // in-flight ops on the previous pane fail once its SFTP handle is dropped.
         self.go_home(sftp, cx);
     }
 
@@ -211,12 +222,17 @@ impl ContextPanel {
             cx.notify();
             return;
         }
+        self.list_gen = self.list_gen.wrapping_add(1);
+        let req_gen = self.list_gen;
         self.listing = true;
         self.error = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = rx.recv_async().await;
             this.update(cx, |this, cx| {
+                if req_gen != this.list_gen {
+                    return;
+                }
                 this.listing = false;
                 match result {
                     Ok(Ok(entries)) => {
@@ -328,7 +344,7 @@ impl ContextPanel {
             })
             .ok();
 
-            let (progress_tx, progress_rx) = flume::unbounded::<TransferProgress>();
+            let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
             if sftp
                 .request(SftpRequest::Download {
@@ -433,7 +449,7 @@ impl ContextPanel {
             })
             .ok();
 
-            let (progress_tx, progress_rx) = flume::unbounded::<TransferProgress>();
+            let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
             if sftp
                 .request(SftpRequest::Upload {

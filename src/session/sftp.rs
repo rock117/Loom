@@ -62,7 +62,7 @@ pub enum SftpRequest {
     },
 }
 
-/// Cloneable handle used by the UI to talk to the SSH thread's SFTP worker.
+/// Cloneable handle used by the UI to talk to the SSH thread's SFTP pool.
 #[derive(Clone)]
 pub struct SftpHandle {
     tx: Sender<SftpRequest>,
@@ -81,51 +81,194 @@ pub fn channel_pair() -> (SftpHandle, Receiver<SftpRequest>) {
     (SftpHandle { tx }, rx)
 }
 
-/// Background task: open SFTP subsystem once, serve requests until the channel closes.
+/// Max concurrent SFTP subsystem channels across the whole app.
+const GLOBAL_SFTP_CHANNEL_BUDGET: usize = 12;
+/// Close an idle lane session after this long with no requests.
+const LANE_IDLE_SECS: u64 = 90;
+
+static OPEN_SFTP_CHANNELS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn try_acquire_channel_budget() -> bool {
+    use std::sync::atomic::Ordering;
+    loop {
+        let cur = OPEN_SFTP_CHANNELS.load(Ordering::SeqCst);
+        if cur >= GLOBAL_SFTP_CHANNEL_BUDGET {
+            return false;
+        }
+        if OPEN_SFTP_CHANNELS
+            .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return true;
+        }
+    }
+}
+
+fn release_channel_budget() {
+    use std::sync::atomic::Ordering;
+    OPEN_SFTP_CHANNELS.fetch_sub(1, Ordering::SeqCst);
+}
+
+/// Holds one budget unit; released on drop.
+struct ChannelBudgetGuard;
+
+impl Drop for ChannelBudgetGuard {
+    fn drop(&mut self) {
+        release_channel_budget();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LaneKind {
+    Browse,
+    Transfer,
+}
+
+fn is_browse_request(req: &SftpRequest) -> bool {
+    matches!(req, SftpRequest::Home { .. } | SftpRequest::List { .. })
+}
+
+/// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
+/// Sessions are opened lazily and closed after idle; closing `req_rx` tears the pool down.
 pub async fn run_sftp_worker(
     session: Arc<client::Handle<ClientHandler>>,
     req_rx: Receiver<SftpRequest>,
 ) {
-    let mut sftp: Option<SftpSession> = None;
+    let (browse_tx, browse_rx) = flume::unbounded::<SftpRequest>();
+    let (transfer_tx, transfer_rx) = flume::unbounded::<SftpRequest>();
+
+    let browse_session = Arc::clone(&session);
+    let transfer_session = Arc::clone(&session);
+    let browse_task = tokio::spawn(async move {
+        run_lane(browse_session, browse_rx, LaneKind::Browse).await;
+    });
+    let transfer_task = tokio::spawn(async move {
+        run_lane(transfer_session, transfer_rx, LaneKind::Transfer).await;
+    });
 
     while let Ok(req) = req_rx.recv_async().await {
-        if sftp.is_none() {
-            match open_sftp(&session).await {
-                Ok(s) => sftp = Some(s),
-                Err(err) => {
-                    reply_open_err(&req, err);
-                    continue;
+        if is_browse_request(&req) {
+            if browse_tx.send(req).is_err() {
+                break;
+            }
+        } else if transfer_tx.send(req).is_err() {
+            break;
+        }
+    }
+
+    // Dropping senders ends both lanes; await so channels are closed before SSH teardown races.
+    drop(browse_tx);
+    drop(transfer_tx);
+    let _ = browse_task.await;
+    let _ = transfer_task.await;
+}
+
+async fn run_lane(
+    session: Arc<client::Handle<ClientHandler>>,
+    req_rx: Receiver<SftpRequest>,
+    kind: LaneKind,
+) {
+    let idle = std::time::Duration::from_secs(LANE_IDLE_SECS);
+    let mut sftp: Option<(SftpSession, ChannelBudgetGuard)> = None;
+
+    loop {
+        if sftp.is_some() {
+            tokio::select! {
+                biased;
+                msg = req_rx.recv_async() => {
+                    match msg {
+                        Ok(req) => {
+                            if let Err(err) = ensure_session(&session, &mut sftp, kind).await {
+                                reply_open_err(&req, err);
+                                continue;
+                            }
+                            let Some((ref s, _)) = sftp else { continue };
+                            dispatch_request(s, req).await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = tokio::time::sleep(idle) => {
+                    // Idle reclaim: drop session and return global budget.
+                    sftp = None;
                 }
             }
+        } else {
+            let Ok(req) = req_rx.recv_async().await else {
+                break;
+            };
+            if let Err(err) = ensure_session(&session, &mut sftp, kind).await {
+                reply_open_err(&req, err);
+                continue;
+            }
+            let Some((ref s, _)) = sftp else { continue };
+            dispatch_request(s, req).await;
         }
-        let Some(sftp) = sftp.as_ref() else {
-            continue;
+    }
+
+    // Lane ends when req_rx closes; budget returns via ChannelBudgetGuard::drop.
+}
+
+async fn ensure_session(
+    session: &client::Handle<ClientHandler>,
+    sftp: &mut Option<(SftpSession, ChannelBudgetGuard)>,
+    kind: LaneKind,
+) -> Result<()> {
+    if sftp.is_some() {
+        return Ok(());
+    }
+    if !try_acquire_channel_budget() {
+        let label = match kind {
+            LaneKind::Browse => "browse",
+            LaneKind::Transfer => "transfer",
         };
-        match req {
-            SftpRequest::Home { reply } => {
-                let _ = reply.send(sftp.canonicalize(".").await.map_err(|e| anyhow::anyhow!("{e}")));
-            }
-            SftpRequest::List { path, reply } => {
-                let _ = reply.send(list_dir(sftp, &path).await);
-            }
-            SftpRequest::Download {
-                id,
-                remote,
-                local,
-                progress,
-                reply,
-            } => {
-                let _ = reply.send(download_path(sftp, id, &remote, &local, &progress).await);
-            }
-            SftpRequest::Upload {
-                id,
-                local,
-                remote_dir,
-                progress,
-                reply,
-            } => {
-                let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress).await);
-            }
+        bail!(
+            "SFTP {label} unavailable: too many open SFTP channels (max {GLOBAL_SFTP_CHANNEL_BUDGET})"
+        );
+    }
+    let guard = ChannelBudgetGuard;
+    match open_sftp(session).await {
+        Ok(s) => {
+            *sftp = Some((s, guard));
+            Ok(())
+        }
+        Err(err) => {
+            drop(guard);
+            Err(err)
+        }
+    }
+}
+
+async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
+    match req {
+        SftpRequest::Home { reply } => {
+            let _ = reply.send(
+                sftp.canonicalize(".")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}")),
+            );
+        }
+        SftpRequest::List { path, reply } => {
+            let _ = reply.send(list_dir(sftp, &path).await);
+        }
+        SftpRequest::Download {
+            id,
+            remote,
+            local,
+            progress,
+            reply,
+        } => {
+            let _ = reply.send(download_path(sftp, id, &remote, &local, &progress).await);
+        }
+        SftpRequest::Upload {
+            id,
+            local,
+            remote_dir,
+            progress,
+            reply,
+        } => {
+            let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress).await);
         }
     }
 }
@@ -237,7 +380,7 @@ async fn download_path(
         .with_context(|| format!("stat {remote}"))?;
     if meta.file_type().is_dir() {
         let files_total = count_remote_files(sftp, remote).await?;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done: 0,
             total: None,
@@ -293,7 +436,7 @@ async fn download_tree(
     } else {
         download_file(sftp, id, remote, local, meta.size, progress).await?;
         *files_done += 1;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done: 0,
             total: None,
@@ -324,7 +467,7 @@ async fn download_file(
         .with_context(|| format!("create {}", local.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
-    let _ = progress.send(TransferProgress {
+    let _ = progress.try_send(TransferProgress {
         id,
         done,
         total,
@@ -344,7 +487,7 @@ async fn download_file(
             .await
             .with_context(|| format!("write {}", local.display()))?;
         done += n as u64;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done,
             total,
@@ -373,7 +516,7 @@ async fn upload_path(
         .with_context(|| format!("stat {}", local.display()))?;
     if meta.is_dir() {
         let files_total = count_local_files(local).await?;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done: 0,
             total: None,
@@ -429,7 +572,7 @@ async fn upload_tree(
     } else if meta.is_file() {
         upload_file(sftp, id, local, &remote, meta.len(), progress).await?;
         *files_done += 1;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done: 0,
             total: None,
@@ -459,7 +602,7 @@ async fn upload_file(
         .with_context(|| format!("create {remote}"))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
-    let _ = progress.send(TransferProgress {
+    let _ = progress.try_send(TransferProgress {
         id,
         done,
         total: Some(total),
@@ -476,7 +619,7 @@ async fn upload_file(
             .await
             .with_context(|| format!("write {remote}"))?;
         done += n as u64;
-        let _ = progress.send(TransferProgress {
+        let _ = progress.try_send(TransferProgress {
             id,
             done,
             total: Some(total),
