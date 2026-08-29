@@ -175,6 +175,45 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 **Why:** Clear IA (left = connections, right = tools for current session); SFTP is the high-value WindTerm-style differentiator for a Postman-style SSH client.
 
 **Consequences / follow-ups:** Same russh session opens SFTP subsystem channel(s) on demand (`russh-sftp`). Browse/Transfer 分车道连接池、懒开与回收见 [SFTP_POOL.md](./SFTP_POOL.md)。Recursive folder download/upload in MVP; drag-drop and transfer persistence later.
+
+---
+
+## 2026-08-29 — Docker 会话与 SSH 同级（exec + docker cp Files）
+
+**Status:** accepted（规格；实现未开始）  
+
+**Context:** 进入容器内部是高频路径（`docker exec -it`），用户希望体验与 SSH 进服务器一致；并要求右侧 Files 可用，传输走 `docker cp`。
+
+**Options:**
+- A — 仅文档化 / 依赖用户手敲 exec，不做一等会话  
+- B — 只做 exec Tab，Files 仍空状态  
+- C — Docker = 一等会话：exec shell + Context Files（`docker cp`），IA 对齐 SSH  
+
+**Decision:** 选 C。规格见 [DOCKER_SESSION.md](./DOCKER_SESSION.md)。不做 Docker Desktop 式管理器；K8s exec 另案。本机 MVP → 再远端（SSH 宿主机上的 Docker）。
+
+**Why:** 与现有 Profile / Tab / Context 模型同构；Files 用 `docker cp` 补齐「进得去也能拷文件」，避免为容器再开一套 SFTP 假象。
+
+**Consequences / follow-ups:** 浏览与 `docker cp` 分车道、可取消、按 pane 隔离 Transfers；实现须用户明确点名后按阶段 1→2 开工。
+
+---
+
+## 2026-08-30 — SSH 端口转发为增强能力（非核心）
+
+**Status:** accepted（规格；实现未开始）  
+
+**Context:** 讨论 Local / Remote / SOCKS UI。命令行等价于 `ssh -L/-R/-D`；可与 shell、SFTP 共用同一 SSH 连接，远端只需 `sshd`，无需 Loom 服务端。
+
+**Options:**
+- A — 不做，继续手敲 `ssh -L`  
+- B — 做成核心卖点 / 独立隧道产品  
+- C — 文档化为 **Profile/会话增强**；同连接 ForwardHub；分期 Local → Remote → SOCKS  
+
+**Decision:** 选 C。规格见 [PORT_FORWARD.md](./PORT_FORWARD.md)。定位明确为**非核心**；默认本机 bind `127.0.0.1`。
+
+**Why:** 覆盖连远端 DB/内网 HTTP 等高频排障，又不稀释「终端 + Files」主叙事；实现量相对可控，且不依赖自研服务端。
+
+**Consequences / follow-ups:** Backlog **P1c**；用户点名后再按阶段 1 实现 Local。
+
 ---
 
 ## How to use this file in review

@@ -2,7 +2,7 @@
 
 WindTerm-style **third column** on the right: a **session context panel** for the focused pane.
 
-Related: [ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[SFTP_POOL.md](./SFTP_POOL.md)**（SFTP 连接池 / 浏览与传输并行 / 资源回收，中文规格）。
+Related: [ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[SFTP_POOL.md](./SFTP_POOL.md)**（SFTP 连接池 / 浏览与传输并行 / 资源回收，中文规格）、**[DOCKER_SESSION.md](./DOCKER_SESSION.md)**（Docker exec + Files / `docker cp`，规格已定未实现）。
 
 ## Layout
 
@@ -17,7 +17,7 @@ Right panel sections:
 
 | Tab | Role |
 |-----|------|
-| **Files** | Remote SFTP browser (SSH only): navigate like Explorer, upload/download |
+| **Files** | Session file browser: **SSH** → SFTP；**Docker**（规划）→ 浏览 + `docker cp`（见 [DOCKER_SESSION.md](./DOCKER_SESSION.md)） |
 | **Info** | Light session summary (profile, target, cwd, size) |
 
 Transfer progress lives in a **footer under Files** (not a separate tab).
@@ -52,7 +52,11 @@ Drag the sash between the file list and Transfers to change their height ratio
 
 ### Local sessions
 
-Files tab shows an empty state: SFTP is SSH-only. Use terminal context menu for local Reveal/Copy Path.
+Files tab shows an empty state: no remote FS bridge. Use terminal context menu for local Reveal/Copy Path.
+
+### Docker sessions (planned)
+
+Same Files UX as SSH; backend is container listing + `docker cp`, not SFTP. Spec: [DOCKER_SESSION.md](./DOCKER_SESSION.md).
 
 ## Info
 
