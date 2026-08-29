@@ -124,6 +124,10 @@ pub enum SftpRequest {
         mode: u32,
         reply: Sender<Result<()>>,
     },
+    /// One-shot remote host metrics (runs on the SSH Handle, not SFTP).
+    HostProbe {
+        reply: Sender<Result<crate::session::host_info::HostSnapshot>>,
+    },
 }
 
 /// Cloneable handle used by the UI to talk to the SSH thread's SFTP pool.
@@ -201,6 +205,10 @@ fn is_browse_request(req: &SftpRequest) -> bool {
     )
 }
 
+fn is_host_probe(req: &SftpRequest) -> bool {
+    matches!(req, SftpRequest::HostProbe { .. })
+}
+
 /// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
 /// Sessions are opened lazily and closed after idle; closing `req_rx` tears the pool down.
 pub async fn run_sftp_worker(
@@ -220,6 +228,17 @@ pub async fn run_sftp_worker(
     });
 
     while let Ok(req) = req_rx.recv_async().await {
+        if is_host_probe(&req) {
+            let SftpRequest::HostProbe { reply } = req else {
+                continue;
+            };
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                let result = crate::session::host_info::collect_via_ssh(&session).await;
+                let _ = reply.send(result);
+            });
+            continue;
+        }
         if is_browse_request(&req) {
             if browse_tx.send(req).is_err() {
                 break;
@@ -368,6 +387,11 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
         SftpRequest::Chmod { path, mode, reply } => {
             let _ = reply.send(chmod_path(sftp, &path, mode).await);
         }
+        SftpRequest::HostProbe { reply } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "host probe must not run on SFTP lane"
+            )));
+        }
     }
 }
 
@@ -401,6 +425,9 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
         | SftpRequest::Remove { reply, .. }
         | SftpRequest::Rename { reply, .. }
         | SftpRequest::Chmod { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(msg)));
+        }
+        SftpRequest::HostProbe { reply } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
     }

@@ -77,7 +77,15 @@ Same Files UX as SSH; backend is container listing + `docker cp`, not SFTP. Spec
 
 ## Info
 
-Read-only: profile name, Local/SSH, target, connection state, working directory (when known), terminal size.
+**Host** metrics only (no session summary). Loaded automatically the first time you open Info for the current pane; click **↻** to refresh (no interval auto-refresh).
+
+| Fields |
+|--------|
+| Hostname, OS/kernel, CPU (model · cores · % on Local), memory bar, disk bar (primary mount), load (when available), uptime |
+
+- **Local:** `sysinfo` (see `src/session/host_info.rs`)
+- **SSH:** one-shot remote shell probe on the same russh session (`SftpRequest::HostProbe`), not via the interactive PTY
+
 
 ## Non-goals (for now)
 
@@ -93,6 +101,7 @@ Read-only: profile name, Local/SSH, target, connection state, working directory 
 | Doc | `docs/CONTEXT_PANEL.md`、`docs/SFTP_POOL.md` |
 | SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
+| Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
 | UI | `src/ui/context_panel.rs` |
 | Pane handle | `PaneSession.ssh_sftp` |
 

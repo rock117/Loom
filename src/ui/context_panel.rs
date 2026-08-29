@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::model::{ConnectionState, ProfileKind};
 use crate::platform;
+use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
 use crate::session::sftp::{
     RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferProgress, join_remote,
@@ -127,6 +128,11 @@ pub struct ContextPanel {
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
     prompt: Option<FilesPrompt>,
+    /// Host metrics for the Info tab (manual refresh).
+    host_info: Option<HostSnapshot>,
+    host_info_pane: Option<Uuid>,
+    host_info_loading: bool,
+    host_info_error: Option<String>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
     list_ratio: f32,
     files_body_bounds: Option<Bounds<Pixels>>,
@@ -177,6 +183,10 @@ impl ContextPanel {
             transfer_menu: None,
             entry_menu: None,
             prompt: None,
+            host_info: None,
+            host_info_pane: None,
+            host_info_loading: false,
+            host_info_error: None,
             list_ratio,
             files_body_bounds: None,
             files_sash_drag: false,
@@ -224,6 +234,10 @@ impl ContextPanel {
         self.entry_menu = None;
         self.prompt = None;
         self._prompt_caret_blink = None;
+        self.host_info = None;
+        self.host_info_pane = None;
+        self.host_info_loading = false;
+        self.host_info_error = None;
     }
 
     /// Drop transfer lists for panes that no longer exist; cancel their jobs.
@@ -1502,6 +1516,9 @@ impl ContextPanel {
                 if tab == PanelTab::Files {
                     this.sync_session(cx);
                 }
+                if tab == PanelTab::Info {
+                    this.ensure_host_info(cx);
+                }
                 cx.notify();
             }))
     }
@@ -2207,69 +2224,142 @@ impl ContextPanel {
             }))
     }
 
-    fn render_info(&self, cx: &mut Context<Self>) -> AnyElement {
-        let manager = self.tabs.read(cx);
-        let Some(tab) = manager.active_tab() else {
-            return div()
-                .p(px(theme::SPACE_2))
-                .text_xs()
-                .text_color(theme::TEXT_MUTED)
-                .child("No session open.")
-                .into_any_element();
-        };
-        let pane = tab.focused_pane();
-        let state = pane.map(|p| p.state).unwrap_or(ConnectionState::Idle);
-        let profile = pane.and_then(|p| {
-            self.store
+    fn refresh_host_info(&mut self, cx: &mut Context<Self>) {
+        let Some((pane_id, kind, sftp)) = self.focused_files(cx) else {
+            // SSH connecting without SFTP yet, or no pane — try SSH via focused pane sftp only.
+            let tab = self.tabs.read(cx).active_tab();
+            let pane = tab.and_then(|t| t.focused_pane());
+            let Some(pane) = pane else {
+                self.host_info_error = Some("No session open".into());
+                cx.notify();
+                return;
+            };
+            if let Some(sftp) = pane.ssh_sftp.clone() {
+                self.start_ssh_host_probe(pane.id, sftp, cx);
+                return;
+            }
+            // Local without going through focused_files? use profile kind.
+            let is_local = self
+                .store
                 .read(cx)
                 .workspace
-                .find_profile(p.profile_id)
-                .cloned()
-        });
-        let (kind_label, detail) = match profile.as_ref().map(|p| &p.kind) {
-            Some(ProfileKind::Ssh {
-                host, port, user, ..
-            }) => ("SSH".into(), format!("{user}@{host}:{port}")),
-            Some(ProfileKind::Local { shell, .. }) => {
-                let shell_label = shell
-                    .as_deref()
-                    .map(|s| {
-                        std::path::Path::new(s)
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(s)
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "default shell".into());
-                ("Local".into(), shell_label)
+                .find_profile(pane.profile_id)
+                .is_some_and(|p| matches!(p.kind, ProfileKind::Local { .. }));
+            if is_local {
+                self.start_local_host_probe(pane.id, cx);
+            } else {
+                self.host_info_error = Some("Connect SSH to refresh host info".into());
+                cx.notify();
             }
-            None => ("—".into(), tab.title.clone()),
+            return;
         };
-        let name = profile
-            .as_ref()
-            .map(|p| p.name.clone())
-            .unwrap_or_else(|| tab.title.clone());
-        let cwd = pane
-            .and_then(|p| p.terminal.as_ref())
-            .and_then(|t| t.read(cx).working_directory())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "—".into());
-        let (cols, rows) = pane
-            .and_then(|p| p.terminal.as_ref())
-            .map(|t| t.read(cx).dimensions())
-            .unwrap_or((0, 0));
-        let size = if cols > 0 && rows > 0 {
-            format!("{cols}×{rows}")
-        } else {
-            "—".into()
+        match kind {
+            FilesKind::Local => self.start_local_host_probe(pane_id, cx),
+            FilesKind::Sftp => {
+                if let Some(sftp) = sftp {
+                    self.start_ssh_host_probe(pane_id, sftp, cx);
+                } else {
+                    self.host_info_error = Some("SFTP unavailable".into());
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Load host info when entering Info or after pane change (no auto interval).
+    fn ensure_host_info(&mut self, cx: &mut Context<Self>) {
+        if self.host_info_loading {
+            return;
+        }
+        let pane_id = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .and_then(|t| t.focused_pane())
+            .map(|p| p.id);
+        let Some(pane_id) = pane_id else {
+            self.host_info = None;
+            self.host_info_pane = None;
+            self.host_info_error = Some("No session open".into());
+            return;
         };
-        let state_label = match state {
-            ConnectionState::Connected => "Connected",
-            ConnectionState::Connecting => "Connecting",
-            ConnectionState::Disconnected => "Disconnected",
-            ConnectionState::Failed => "Failed",
-            ConnectionState::Idle => "Idle",
-        };
+        if self.host_info.is_some() && self.host_info_pane == Some(pane_id) {
+            return;
+        }
+        self.refresh_host_info(cx);
+    }
+
+    fn start_local_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        self.host_info_loading = true;
+        self.host_info_error = None;
+        self.host_info_pane = Some(pane_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { host_info::collect_local() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.host_info_loading = false;
+                match result {
+                    Ok(snap) => {
+                        this.host_info = Some(snap);
+                        this.host_info_error = None;
+                    }
+                    Err(err) => {
+                        this.host_info_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_ssh_host_probe(&mut self, pane_id: Uuid, sftp: SftpHandle, cx: &mut Context<Self>) {
+        self.host_info_loading = true;
+        self.host_info_error = None;
+        self.host_info_pane = Some(pane_id);
+        cx.notify();
+        let (tx, rx) = flume::bounded(1);
+        if sftp
+            .request(SftpRequest::HostProbe { reply: tx })
+            .is_err()
+        {
+            self.host_info_loading = false;
+            self.host_info_error = Some("SSH session unavailable".into());
+            cx.notify();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                this.host_info_loading = false;
+                match result {
+                    Ok(Ok(snap)) => {
+                        this.host_info = Some(snap);
+                        this.host_info_error = None;
+                    }
+                    Ok(Err(err)) => {
+                        this.host_info_error = Some(format!("{err:#}"));
+                    }
+                    Err(_) => {
+                        this.host_info_error = Some("Host probe cancelled".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_info(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        self.ensure_host_info(cx);
+
+        let loading = self.host_info_loading;
+        let err = self.host_info_error.clone();
+        let snap = self.host_info.clone();
 
         fn row(label: &str, value: String) -> Div {
             div()
@@ -2285,18 +2375,159 @@ impl ContextPanel {
                 .child(div().text_xs().text_color(theme::TEXT).child(value))
         }
 
+        fn meter(label: &str, used: u64, total: u64, ratio: f32) -> Div {
+            let pct = (ratio.clamp(0.0, 1.0) * 100.0) as u32;
+            let bar_w = ratio.clamp(0.0, 1.0);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .child(label.to_string()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::TEXT)
+                                .child(format!(
+                                    "{} / {} · {pct}%",
+                                    host_info::format_bytes(used),
+                                    host_info::format_bytes(total)
+                                )),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.0))
+                        .rounded(px(3.0))
+                        .bg(theme::BORDER_SUBTLE)
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded(px(3.0))
+                                .bg(theme::ACCENT)
+                                .w(relative(bar_w)),
+                        ),
+                )
+        }
+
         div()
             .flex()
             .flex_col()
             .flex_1()
-            .p(px(theme::SPACE_2))
+            .min_h_0()
             .gap(px(theme::SPACE_2))
-            .child(row("Profile", name))
-            .child(row("Kind", kind_label))
-            .child(row("Target", detail))
-            .child(row("State", state_label.into()))
-            .child(row("Working directory", cwd))
-            .child(row("Size", size))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::TEXT_MUTED)
+                            .child("Host"),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-info-refresh")
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_xs()
+                            .text_color(if loading {
+                                theme::TEXT_DISABLED
+                            } else {
+                                theme::TEXT_MUTED
+                            })
+                            .when(!loading, |d| {
+                                d.cursor_pointer()
+                                    .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                            })
+                            .child(if loading { "…" } else { "↻" })
+                            .tooltip(|_, cx| Tooltip::text("Refresh host info", cx))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.host_info_loading {
+                                    return;
+                                }
+                                this.refresh_host_info(cx);
+                            })),
+                    ),
+            )
+            .when(loading && snap.is_none(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Loading host info…"),
+                )
+            })
+            .when_some(err, |d, msg| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::DANGER)
+                        .child(msg),
+                )
+            })
+            .when_some(snap, |d, s| {
+                let cpu = if let Some(pct) = s.cpu_usage_pct {
+                    format!(
+                        "{} · {} cores · {pct:.0}%",
+                        if s.cpu_model.is_empty() {
+                            "—"
+                        } else {
+                            &s.cpu_model
+                        },
+                        s.cpu_cores
+                    )
+                } else {
+                    format!(
+                        "{} · {} cores",
+                        if s.cpu_model.is_empty() {
+                            "—"
+                        } else {
+                            &s.cpu_model
+                        },
+                        s.cpu_cores
+                    )
+                };
+                let os_line = if s.kernel.is_empty() {
+                    s.os.clone()
+                } else {
+                    format!("{} · {}", s.os, s.kernel)
+                };
+                d.child(row("Hostname", s.hostname.clone()))
+                    .child(row("OS", os_line))
+                    .child(row("CPU", cpu))
+                    .child(meter(
+                        "Memory",
+                        s.mem_used,
+                        s.mem_total,
+                        s.mem_ratio(),
+                    ))
+                    .child(meter(
+                        &format!("Disk ({})", s.disk_mount),
+                        s.disk_used,
+                        s.disk_total,
+                        s.disk_ratio(),
+                    ))
+                    .when_some(s.load.clone(), |d, load| d.child(row("Load", load)))
+                    .child(row(
+                        "Uptime",
+                        host_info::format_uptime(s.uptime_secs),
+                    ))
+            })
             .into_any_element()
     }
 }
