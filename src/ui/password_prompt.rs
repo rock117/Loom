@@ -41,6 +41,52 @@ impl PasswordPrompt {
         self.focus_handle.focus(window);
     }
 
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return false;
+        };
+        let cleaned = text.replace('\r', "").replace('\n', "");
+        if cleaned.is_empty() {
+            return false;
+        }
+        self.password.push_str(&cleaned);
+        true
+    }
+
+    fn copy_field(&self, cx: &mut Context<Self>) -> bool {
+        if self.password.is_empty() {
+            return false;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(self.password.clone()));
+        true
+    }
+
+    fn handle_clipboard_keys(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let chord = mods.control || mods.platform;
+        if !chord {
+            if mods.shift && key.eq_ignore_ascii_case("insert") {
+                return self.paste_clipboard(cx);
+            }
+            return false;
+        }
+        if key.eq_ignore_ascii_case("v") {
+            return self.paste_clipboard(cx);
+        }
+        if key.eq_ignore_ascii_case("c") {
+            return self.copy_field(cx);
+        }
+        if key.eq_ignore_ascii_case("x") {
+            if !self.copy_field(cx) {
+                return false;
+            }
+            self.password.clear();
+            return true;
+        }
+        false
+    }
+
     fn submit(&mut self, cx: &mut Context<Self>) {
         if self.password.is_empty() {
             self.error = Some("Password required".into());
@@ -116,6 +162,11 @@ impl Render for PasswordPrompt {
                             cx.stop_propagation();
                             return;
                         }
+                        if this.handle_clipboard_keys(event, cx) {
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
                         if key == "enter" {
                             this.submit(cx);
                             cx.stop_propagation();
@@ -168,7 +219,16 @@ impl Render for PasswordPrompt {
                             .border_color(theme::ACCENT)
                             .text_sm()
                             .text_color(theme::TEXT)
-                            .child(format!("{masked}|")),
+                            .child(format!("{masked}|"))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, _, _, cx| {
+                                    if this.paste_clipboard(cx) {
+                                        cx.notify();
+                                    }
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     )
                     .child(
                         div()

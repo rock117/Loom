@@ -122,7 +122,7 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 - Embed `russh` and bridge channel I/O to `TerminalView`  
 - Store passwords in profile JSON vs OS credential store  
 
-**Decision:** Use **`russh`** on a dedicated Tokio thread; bridge stdin/stdout with flume. Persist passwords with **`keyring`** (Windows Credential Manager). Host keys use trust-on-first-use in `known_hosts.json`.
+**Decision:** Use **`russh`** on a dedicated Tokio thread; bridge stdin/stdout with flume. Persist passwords with **`keyring`** + feature **`windows-native`** (Windows Credential Manager). Host keys use trust-on-first-use in `known_hosts.json`. Without the platform keystore feature, keyring uses a non-persistent mock — passwords will not stick.
 
 **Why:** Keeps MIT-friendly Rust stack, matches Local session I/O shape, avoids plaintext secrets on disk.
 

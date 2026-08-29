@@ -12,7 +12,7 @@ anyhow = "1.0"
 dirs = "6"
 flume = "0.12"
 gpui = "0.2.2"
-keyring = "3"
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
 parking_lot = "0.12"
 portable-pty = "0.9"
 rfd = "0.15"

@@ -111,10 +111,7 @@ impl TabManager {
                 auth: SshAuth::Password { .. },
                 ..
             }
-        ) && credentials::get_password(profile.id)
-            .ok()
-            .flatten()
-            .is_none()
+        ) && credentials::needs_password_prompt(profile.id)
     }
 
     fn push_failed(&mut self, profile: &Profile, message: String, cx: &mut Context<Self>) {

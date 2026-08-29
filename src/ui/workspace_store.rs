@@ -151,6 +151,37 @@ impl WorkspaceStore {
         true
     }
 
+    /// Update an existing SSH profile's connection fields (keeps id / group).
+    pub fn update_ssh_profile(
+        &mut self,
+        id: Uuid,
+        name: String,
+        host: String,
+        port: u16,
+        user: String,
+        auth: crate::model::SshAuth,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(id) else {
+            return false;
+        };
+        if !matches!(profile.kind, crate::model::ProfileKind::Ssh { .. }) {
+            return false;
+        }
+        profile.name = name;
+        profile.kind = crate::model::ProfileKind::Ssh {
+            host,
+            port,
+            user,
+            auth,
+        };
+        self.selection = Selection::Profile(id);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
+    }
+
     pub fn duplicate_profile(&mut self, id: Uuid, cx: &mut Context<Self>) -> Option<Uuid> {
         let group_id = self.workspace.group_id_for_profile(id)?;
         let dup = self.workspace.find_profile(id)?.duplicate();
@@ -180,6 +211,11 @@ impl WorkspaceStore {
                 cx.notify();
             }
             Selection::Group(id) => {
+                if let Some(g) = self.workspace.groups.iter().find(|g| g.id == id) {
+                    for p in &g.profiles {
+                        let _ = crate::session::credentials::delete_password(p.id);
+                    }
+                }
                 self.workspace.groups.retain(|g| g.id != id);
                 if self.workspace.groups.is_empty() {
                     self.workspace = WorkspaceFile::default_workspace();

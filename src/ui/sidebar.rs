@@ -15,13 +15,19 @@ const ROW_H: f32 = 26.0;
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
-    /// Right-click context menu for a profile (Zed-style; actions not always-visible).
+    /// Right-click context menu for a profile or group (Zed-style).
     context_menu: Option<ContextMenuState>,
     _observe_store: Subscription,
 }
 
+#[derive(Clone, Copy)]
+enum ContextTarget {
+    Profile(Uuid),
+    Group(Uuid),
+}
+
 struct ContextMenuState {
-    profile_id: Uuid,
+    target: ContextTarget,
     /// Window-space point from the right-click (for `anchored` positioning).
     position: Point<Pixels>,
 }
@@ -106,6 +112,181 @@ impl Sidebar {
                 cx.notify();
             }))
     }
+
+    fn menu_shell(&self) -> Div {
+        div()
+            .min_w(px(160.0))
+            .p(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS))
+            .bg(theme::ELEVATED)
+            .border_1()
+            .border_color(theme::BORDER)
+            .shadow_md()
+            .occlude()
+    }
+
+    fn menu_divider(&self) -> impl IntoElement {
+        div()
+            .h(px(1.0))
+            .my(px(theme::SPACE_1))
+            .bg(theme::BORDER_SUBTLE)
+    }
+
+    fn profile_context_menu(
+        &self,
+        pid: Uuid,
+        moves: Vec<(Uuid, String)>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_ssh = self
+            .store
+            .read(cx)
+            .workspace
+            .find_profile(pid)
+            .map(|p| matches!(p.kind, ProfileKind::Ssh { .. }))
+            .unwrap_or(false);
+
+        self.menu_shell()
+            .child(self.menu_item(
+                "ctx-open",
+                "Open",
+                false,
+                cx,
+                move |_, _, cx| {
+                    cx.emit(SidebarEvent::OpenProfile(pid));
+                },
+            ))
+            .when(is_ssh, |d| {
+                d.child(self.menu_item(
+                    "ctx-edit-ssh",
+                    "Edit SSH…",
+                    false,
+                    cx,
+                    move |_, _, cx| {
+                        cx.emit(SidebarEvent::EditSshProfile(pid));
+                    },
+                ))
+            })
+            .child(self.menu_item(
+                "ctx-rename",
+                "Rename",
+                false,
+                cx,
+                |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.begin_rename(cx));
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-dup",
+                "Duplicate",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.store.update(cx, |s, cx| {
+                        s.duplicate_profile(pid, cx);
+                    });
+                },
+            ))
+            .children(moves.into_iter().take(4).map(|(gid, name)| {
+                let label: SharedString = format!("Move → {name}").into();
+                div()
+                    .id(SharedString::from(format!("ctx-move-{gid}")))
+                    .w_full()
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_1))
+                    .rounded(px(theme::RADIUS_SM))
+                    .text_sm()
+                    .text_color(theme::TEXT_MUTED)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |s, cx| {
+                            s.move_profile_to_group(pid, gid, cx);
+                        });
+                        this.context_menu = None;
+                        cx.notify();
+                    }))
+            }))
+            .child(self.menu_divider())
+            .child(self.menu_item(
+                "ctx-del",
+                "Delete",
+                true,
+                cx,
+                |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.delete_selection(cx));
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-dismiss",
+                "Close",
+                false,
+                cx,
+                |_, _, _| {},
+            ))
+    }
+
+    fn group_context_menu(&self, gid: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
+        self.menu_shell()
+            .child(self.menu_item(
+                "ctx-g-rename",
+                "Rename",
+                false,
+                cx,
+                |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.begin_rename(cx));
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-g-toggle",
+                "Expand / Collapse",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.toggle_group(gid, cx));
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-g-shell",
+                "New Shell",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.store.update(cx, |s, cx| {
+                        s.select_group(gid, cx);
+                        s.add_local_profile(cx);
+                    });
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-g-ssh",
+                "New SSH…",
+                false,
+                cx,
+                move |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.select_group(gid, cx));
+                    cx.emit(SidebarEvent::OpenSshForm);
+                },
+            ))
+            .child(self.menu_divider())
+            .child(self.menu_item(
+                "ctx-g-del",
+                "Delete Group",
+                true,
+                cx,
+                |this, _, cx| {
+                    this.store.update(cx, |s, cx| s.delete_selection(cx));
+                },
+            ))
+            .child(self.menu_item(
+                "ctx-g-dismiss",
+                "Close",
+                false,
+                cx,
+                |_, _, _| {},
+            ))
+    }
 }
 
 impl Focusable for Sidebar {
@@ -129,7 +310,7 @@ impl Render for Sidebar {
         let context_menu = self
             .context_menu
             .as_ref()
-            .map(|m| (m.profile_id, m.position));
+            .map(|m| (m.target, m.position));
 
         div()
             .track_focus(&self.focus_handle)
@@ -268,7 +449,21 @@ impl Render for Sidebar {
                                             s.select_group(gid, cx);
                                             s.toggle_group(gid, cx);
                                         });
-                                    })),
+                                    }))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.store.update(cx, |s, cx| {
+                                                s.select_group(gid, cx);
+                                            });
+                                            this.context_menu = Some(ContextMenuState {
+                                                target: ContextTarget::Group(gid),
+                                                position: event.position,
+                                            });
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                        }),
+                                    ),
                             )
                             .when(!collapsed, |d| {
                                 d.children(profiles.into_iter().map(|profile| {
@@ -323,7 +518,7 @@ impl Render for Sidebar {
                                                         s.select_profile(pid, cx)
                                                     });
                                                     this.context_menu = Some(ContextMenuState {
-                                                        profile_id: pid,
+                                                        target: ContextTarget::Profile(pid),
                                                         position: event.position,
                                                     });
                                                     cx.notify();
@@ -347,8 +542,16 @@ impl Render for Sidebar {
                     .child("↵ open · F2 rename · Del · right-click"),
             )
             // Context menu — anchored to right-click point (window coords)
-            .when_some(context_menu, |this, (pid, position)| {
+            .when_some(context_menu, |this, (target, position)| {
                 let moves = other_groups.clone();
+                let menu: AnyElement = match target {
+                    ContextTarget::Profile(pid) => {
+                        self.profile_context_menu(pid, moves, cx).into_any_element()
+                    }
+                    ContextTarget::Group(gid) => {
+                        self.group_context_menu(gid, cx).into_any_element()
+                    }
+                };
                 this.child(
                     anchored()
                         .position(position)
@@ -359,89 +562,7 @@ impl Render for Sidebar {
                             bottom: px(4.0),
                             left: px(4.0),
                         })
-                        .child(
-                            div()
-                                .min_w(px(160.0))
-                                .p(px(theme::SPACE_1))
-                                .rounded(px(theme::RADIUS))
-                                .bg(theme::ELEVATED)
-                                .border_1()
-                                .border_color(theme::BORDER)
-                                .shadow_md()
-                                .occlude()
-                                .child(self.menu_item(
-                                    "ctx-open",
-                                    "Open",
-                                    false,
-                                    cx,
-                                    move |_, _, cx| {
-                                        cx.emit(SidebarEvent::OpenProfile(pid));
-                                    },
-                                ))
-                                .child(self.menu_item(
-                                    "ctx-rename",
-                                    "Rename",
-                                    false,
-                                    cx,
-                                    |this, _, cx| {
-                                        this.store.update(cx, |s, cx| s.begin_rename(cx));
-                                    },
-                                ))
-                                .child(self.menu_item(
-                                    "ctx-dup",
-                                    "Duplicate",
-                                    false,
-                                    cx,
-                                    move |this, _, cx| {
-                                        this.store.update(cx, |s, cx| {
-                                            s.duplicate_profile(pid, cx);
-                                        });
-                                    },
-                                ))
-                                .children(moves.into_iter().take(4).map(|(gid, name)| {
-                                    let label: SharedString = format!("Move → {name}").into();
-                                    div()
-                                        .id(SharedString::from(format!("ctx-move-{gid}")))
-                                        .w_full()
-                                        .px(px(theme::SPACE_2))
-                                        .py(px(theme::SPACE_1))
-                                        .rounded(px(theme::RADIUS_SM))
-                                        .text_sm()
-                                        .text_color(theme::TEXT_MUTED)
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                                        .child(label)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.store.update(cx, |s, cx| {
-                                                s.move_profile_to_group(pid, gid, cx);
-                                            });
-                                            this.context_menu = None;
-                                            cx.notify();
-                                        }))
-                                }))
-                                .child(
-                                    div()
-                                        .h(px(1.0))
-                                        .my(px(theme::SPACE_1))
-                                        .bg(theme::BORDER_SUBTLE),
-                                )
-                                .child(self.menu_item(
-                                    "ctx-del",
-                                    "Delete",
-                                    true,
-                                    cx,
-                                    |this, _, cx| {
-                                        this.store.update(cx, |s, cx| s.delete_selection(cx));
-                                    },
-                                ))
-                                .child(self.menu_item(
-                                    "ctx-dismiss",
-                                    "Close",
-                                    false,
-                                    cx,
-                                    |_, _, _| {},
-                                )),
-                        ),
+                        .child(menu),
                 )
             })
             .on_mouse_down(
@@ -508,6 +629,7 @@ pub enum SidebarEvent {
     ShowProfileMenu(Uuid),
     OpenSettings,
     OpenSshForm,
+    EditSshProfile(Uuid),
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}

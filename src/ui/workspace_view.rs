@@ -99,6 +99,17 @@ impl WorkspaceView {
                         this.ssh_form.read(cx).focus(window);
                     });
                 }
+                SidebarEvent::EditSshProfile(id) => {
+                    let id = *id;
+                    this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
+                    this.show_ssh_form = true;
+                    this.show_settings = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                    cx.defer_in(window, |this, window, cx| {
+                        this.ssh_form.read(cx).focus(window);
+                    });
+                }
             },
         ));
 
@@ -110,7 +121,7 @@ impl WorkspaceView {
                     this.show_ssh_form = false;
                     cx.notify();
                 }
-                SshFormEvent::Created {
+                SshFormEvent::Saved {
                     profile_id,
                     connect,
                     oneshot_password,

@@ -1,4 +1,8 @@
-//! OS credential helpers for SSH passwords (Windows Credential Manager via `keyring`).
+//! OS credential helpers for SSH passwords.
+//!
+//! On Windows this uses Credential Manager (`keyring` feature `windows-native`).
+//! Without that feature, keyring falls back to an in-memory mock that does not
+//! persist across `Entry` instances — passwords would appear to never stick.
 
 use anyhow::{Context, Result};
 use keyring::Entry;
@@ -29,5 +33,33 @@ pub fn delete_password(profile_id: Uuid) -> Result<()> {
         Ok(()) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(err).context("delete SSH password"),
+    }
+}
+
+/// True when this profile needs an interactive password prompt.
+pub fn needs_password_prompt(profile_id: Uuid) -> bool {
+    match get_password(profile_id) {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(err) => {
+            eprintln!("loom: keyring read failed ({err:#}); prompting for password");
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_persists_across_entry_handles() {
+        let id = Uuid::new_v4();
+        set_password(id, "secret-test").expect("set");
+        assert_eq!(get_password(id).unwrap().as_deref(), Some("secret-test"));
+        // Second get constructs a new Entry — must still hit the OS store.
+        assert_eq!(get_password(id).unwrap().as_deref(), Some("secret-test"));
+        delete_password(id).unwrap();
+        assert_eq!(get_password(id).unwrap(), None);
     }
 }
