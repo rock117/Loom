@@ -52,7 +52,8 @@ impl WorkspaceView {
             .map(|t| t.profile_id)
             .collect();
 
-        let tabs = cx.new(|_cx| TabManager::new(font_size));
+        let show_line_numbers = store.read(cx).settings.show_line_numbers;
+        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
@@ -222,6 +223,10 @@ impl WorkspaceView {
                 SettingsEvent::FontSizeChanged(size) => {
                     this.tabs.update(cx, |m, cx| m.set_font_size(*size, cx));
                     this.persist_tabs(cx);
+                }
+                SettingsEvent::LineNumbersChanged(enabled) => {
+                    this.tabs
+                        .update(cx, |m, cx| m.set_show_line_numbers(*enabled, cx));
                 }
             },
         ));

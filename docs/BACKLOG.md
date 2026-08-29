@@ -29,6 +29,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 | T4 | **Notifications** | Long-running command done, bell, disconnect toasts. |
 | T5 | **Output syntax color via external tools** | Prefer `bat` / highlighters that emit ANSI; do **not** build in-app language highlighters for PTY output. Optional: docs or settings hints. Low priority. |
 | T6 | **Directory listing icons via external tools** | Prefer `eza` / `lsd` (+ Nerd Font); Loom only needs solid Unicode/Nerd Font rendering. Do **not** intercept `ls`. Low priority. |
+| T7 | **Line number gutter** | **Shipped** — absolute scrollback line numbers (1 = oldest in buffer); Settings → Line numbers On/Off (default On). |
 
 ## Appearance
 

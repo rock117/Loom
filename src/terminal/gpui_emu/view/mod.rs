@@ -54,6 +54,7 @@ use super::event::{GpuiEventProxy, TerminalEvent};
 use super::input::keystroke_to_bytes;
 use super::render::TerminalRenderer;
 use super::terminal::TerminalState;
+use crate::shared::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
@@ -137,6 +138,9 @@ pub struct TerminalConfig {
     /// The padding area renders with the terminal's background color
     pub padding: Edges<Pixels>,
 
+    /// Paint a left gutter with absolute scrollback line numbers (1 = oldest).
+    pub show_line_numbers: bool,
+
     /// Color palette for terminal colors (16 ANSI colors, 256 extended colors,
     /// foreground, background, and cursor colors)
     pub colors: ColorPalette,
@@ -152,6 +156,7 @@ impl Default for TerminalConfig {
             scrollback: 10000,
             line_height_multiplier: 1.2,
             padding: Edges::all(px(0.0)),
+            show_line_numbers: true,
             colors: ColorPalette::default(),
         }
     }
@@ -452,6 +457,7 @@ struct ScrollbarGeometry {
 const SCROLL_MULTIPLIER: f32 = 3.0;
 const SCROLLBAR_WIDTH: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+const LINE_NUMBER_PAD: f32 = 6.0;
 
 impl TerminalView {
     /// Create a new terminal with provided I/O streams.
@@ -988,7 +994,8 @@ impl TerminalView {
             return None;
         }
 
-        let origin_x = self.last_bounds.origin.x + self.config.padding.left;
+        let gutter = self.line_number_gutter_width();
+        let origin_x = self.last_bounds.origin.x + self.config.padding.left + px(gutter);
         let origin_y = self.last_bounds.origin.y + self.config.padding.top;
         let rel_x: f32 = (position.x - origin_x).into();
         let rel_y: f32 = (position.y - origin_y).into();
@@ -1010,6 +1017,23 @@ impl TerminalView {
             .with_term(|term| term.grid().display_offset());
         let point = viewport_to_point(display_offset, AlacPoint::new(row, Column(col)));
         Some((point, side))
+    }
+
+    /// Width in pixels of the optional left line-number gutter (0 when disabled).
+    ///
+    /// Uses `scrollback + screen rows` for digit width so this never locks the
+    /// term mutex (safe to call while the paint path already holds `term_arc`).
+    fn line_number_gutter_width(&self) -> f32 {
+        if !self.config.show_line_numbers {
+            return 0.0;
+        }
+        let cell_w: f32 = self.renderer.cell_width.into();
+        if cell_w <= 0.0 {
+            return 0.0;
+        }
+        let max_num = (self.config.scrollback + self.state.rows()).max(1);
+        let digits = ((max_num as f32).log10().floor() as usize + 1).max(2);
+        digits as f32 * cell_w + LINE_NUMBER_PAD * 2.0
     }
 
     fn copy_selection_to_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1386,6 +1410,79 @@ impl TerminalView {
     }
 }
 
+fn paint_line_number_gutter(
+    bounds: Bounds<Pixels>,
+    term: &alacritty_terminal::Term<GpuiEventProxy>,
+    pad: Edges<Pixels>,
+    gutter: f32,
+    font_family: &str,
+    font_size: Pixels,
+    cell_h: Pixels,
+    line_height_multiplier: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    use alacritty_terminal::grid::Dimensions;
+    use alacritty_terminal::index::{Column, Point as AlacPoint};
+    use alacritty_terminal::term::viewport_to_point;
+    use gpui::{Font, FontFeatures, FontStyle, FontWeight, SharedString, TextRun};
+
+    let history = term.history_size() as i32;
+    let display_offset = term.grid().display_offset();
+    let num_lines = term.screen_lines();
+    let color = theme::TEXT_DISABLED;
+    let draw_size = font_size * 0.85;
+    let base_height = cell_h / line_height_multiplier;
+    let vertical_offset = (cell_h - base_height) / 2.0;
+
+    let sep_x = bounds.origin.x + pad.left + px(gutter) - px(1.0);
+    window.paint_quad(quad(
+        Bounds {
+            origin: Point {
+                x: sep_x,
+                y: bounds.origin.y + pad.top,
+            },
+            size: Size {
+                width: px(1.0),
+                height: (bounds.size.height - pad.top - pad.bottom).max(px(0.0)),
+            },
+        },
+        px(0.0),
+        hsla(0.0, 0.0, 1.0, 0.06),
+        Edges::default(),
+        transparent_black(),
+        Default::default(),
+    ));
+
+    for line_idx in 0..num_lines {
+        let point = viewport_to_point(display_offset, AlacPoint::new(line_idx, Column(0)));
+        let number = (point.line.0 + history + 1).max(1) as usize;
+        let label = number.to_string();
+        let text_run = TextRun {
+            len: label.len(),
+            font: Font {
+                family: SharedString::from(font_family.to_string()),
+                features: FontFeatures::default(),
+                fallbacks: None,
+                weight: FontWeight::NORMAL,
+                style: FontStyle::Normal,
+            },
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped =
+            window
+                .text_system()
+                .shape_line(SharedString::from(label), draw_size, &[text_run], None);
+        let text_w: f32 = shaped.width.into();
+        let x = bounds.origin.x + pad.left + px(gutter - LINE_NUMBER_PAD - text_w);
+        let y = bounds.origin.y + pad.top + cell_h * (line_idx as f32) + vertical_offset;
+        let _ = shaped.paint(Point { x, y }, cell_h, window, cx);
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
@@ -1422,11 +1519,16 @@ impl Render for TerminalView {
                         use alacritty_terminal::grid::Dimensions;
 
                         let measured_renderer = view_paint.read(cx).renderer.clone();
+                        let line_gutter = px(view_paint.read(cx).line_number_gutter_width());
 
-                        // Leave a gutter for the overlay scrollbar so glyphs aren't clipped under it.
-                        let gutter = px(SCROLLBAR_WIDTH + 2.0);
-                        let available_width: f32 =
-                            (bounds.size.width - padding.left - padding.right - gutter).into();
+                        // Leave gutters for line numbers (left) and overlay scrollbar (right).
+                        let scrollbar_gutter = px(SCROLLBAR_WIDTH + 2.0);
+                        let available_width: f32 = (bounds.size.width
+                            - padding.left
+                            - padding.right
+                            - line_gutter
+                            - scrollbar_gutter)
+                            .into();
                         let available_height: f32 =
                             (bounds.size.height - padding.top - padding.bottom).into();
                         let cell_width_f32: f32 = measured_renderer.cell_width.into();
@@ -1460,6 +1562,24 @@ impl Render for TerminalView {
                             }
                         }
 
+                        // Gather paint config before / without nested term locks.
+                        // `state_arc` is already held below — never call `with_term` here.
+                        let show_line_numbers = view_paint.read(cx).config.show_line_numbers;
+                        let base_pad = view_paint.read(cx).config.padding;
+                        let line_gutter_w = view_paint.read(cx).line_number_gutter_width();
+                        let line_nums = show_line_numbers.then(|| {
+                            (
+                                line_gutter_w,
+                                base_pad,
+                                view_paint.read(cx).renderer.font_family.clone(),
+                                view_paint.read(cx).renderer.font_size,
+                                view_paint.read(cx).renderer.cell_height,
+                                view_paint.read(cx).renderer.line_height_multiplier,
+                            )
+                        });
+                        let mut content_pad = base_pad;
+                        content_pad.left = content_pad.left + px(line_gutter_w);
+
                         let mut term = state_arc.lock();
                         let current_cols = term.columns();
                         let current_rows = term.screen_lines();
@@ -1476,7 +1596,21 @@ impl Render for TerminalView {
                             term = state_arc.lock();
                         }
 
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        measured_renderer.paint(bounds, content_pad, &term, window, cx);
+                        if let Some((gutter, pad, family, font_size, cell_h, mult)) = line_nums {
+                            paint_line_number_gutter(
+                                bounds,
+                                &term,
+                                pad,
+                                gutter,
+                                &family,
+                                font_size,
+                                cell_h,
+                                mult,
+                                window,
+                                cx,
+                            );
+                        }
                         drop(term);
 
                         let scrollbar = view_paint.read(cx).scrollbar_paint_info();

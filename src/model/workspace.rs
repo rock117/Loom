@@ -123,6 +123,13 @@ pub struct SettingsFile {
     pub default_shell: Option<String>,
     pub font_family: String,
     pub font_size: f32,
+    /// Left gutter with absolute scrollback line numbers (1 = oldest in buffer).
+    #[serde(default = "default_show_line_numbers")]
+    pub show_line_numbers: bool,
+}
+
+fn default_show_line_numbers() -> bool {
+    true
 }
 
 impl Default for SettingsFile {
@@ -132,6 +139,7 @@ impl Default for SettingsFile {
             default_shell: None,
             font_family: crate::platform::monospace_font_family().into(),
             font_size: 14.0,
+            show_line_numbers: true,
         }
     }
 }

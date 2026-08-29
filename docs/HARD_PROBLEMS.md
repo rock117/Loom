@@ -2,13 +2,86 @@
 
 Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does not rediscover them by trial and error.
 
-- Prefer a short **symptom → failed attempts → what worked → rule** write-up.
+- Prefer a short **symptom → failed attempts → what worked → rule** write-up for each incident.
+- Keep the standing **UI freeze checklist** (below) up to date whenever a new freeze class appears — include **GPUI framework** patterns, not only Loom bugs.
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
-- Add a new dated section whenever a feature burns more than a quick iteration on positioning, focus, paint order, or PTY lifecycle.
 
 ---
 
-## 2026-08-29 — Tab-bar split popover (GPUI paint order + anchor)
+## UI thread freezes — checklist (GPUI + Loom)
+
+**Symptom class:** Window stops painting / accepting input (“卡住”), CPU may be idle (deadlock) or pegged (spin). Often misread as “slow feature” or “SSH hang”.
+
+GPUI runs layout → prepaint → paint and input dispatch on the **window / UI thread**. Anything that **blocks** that thread, or **deadlocks** it against itself, freezes the whole app.
+
+### A. GPUI framework / element pipeline
+
+| Risk | Why it freezes | Do instead |
+| --- | --- | --- |
+| Heavy work in `Render::render`, `Element::request_layout`, `prepaint`, or `paint` | Frame cannot finish; input waits on the same thread | Keep frame callbacks O(visible work). Move I/O, crypto, DNS, large parses off-thread |
+| `entity.update` / `cx.notify` that re-enters render while still inside paint/layout | Re-entrancy; easy to nest locks or infinite notify loops | Defer state changes with `cx.defer` / next frame; never “fix then notify mid-paint” unless proven safe |
+| Blocking `.recv()`, `std::thread::park`, `sleep`, or `block_on(future)` inside click/key/`render` | UI thread waits forever or for a long time | `cx.spawn` + `recv_async` / channels; show Connecting UI immediately |
+| Synchronous file / network / keyring / dialog on the UI thread | Looks like freeze until OS returns | Background thread or async task; only apply results via `entity.update` |
+| Holding a lock across `cx.notify()`, `window.refresh()`, or painting children | Other code on the same thread needs the lock → self-deadlock | Lock → copy data → drop → then notify/paint |
+| Nested `parking_lot::Mutex` / non-reentrant lock on the UI thread | Same thread locks twice → permanent hang (CPU idle) | One lock owner per call stack; pass `&T` you already hold; cache dims outside the lock |
+| Infinite `notify` / layout thrash (size depends on content that changes every frame) | Spin: UI “alive” but unusable, high CPU | Stabilize layout inputs; avoid feedback loops in measure |
+| Huge per-frame GPU/CPU work (shaping tens of thousands of glyphs naively) | Soft freeze / multi-second frames | Cull to viewport; batch; cache shaped lines |
+| Waiting on a task that only runs on the UI executor while the UI thread is blocked | Classic async deadlock | Never block the UI executor waiting for itself |
+
+**GPUI-oriented rules of thumb:**
+
+1. **Frame path is sacred** — layout / prepaint / paint / `Render` must not block and must not take locks they might need again after calling into GPUI.
+2. **Events are still UI thread** — `on_click` / `on_key_down` / mouse handlers share the same constraint as paint for blocking work.
+3. **Prefer “snapshot then paint”** — clone the small data you need under a short lock; paint from the snapshot.
+4. **Async for anything uncertain in latency** — SSH connect, disk, keyring, spawn, DNS: `thread::spawn` or `cx.spawn`, never inline on the frame path.
+5. If it “only freezes when feature X is on” but X is cheap to draw, **suspect deadlock / re-entrancy**, not “X is too slow”.
+
+### B. Loom-specific (terminal / PTY / workspace)
+
+| Risk | Why it freezes | Do instead |
+| --- | --- | --- |
+| Canvas paint holds `term_arc.lock()`, then calls `TerminalState::with_term` / `with_term_mut` | Nested lock on same `parking_lot::Mutex` → hard deadlock | While paint owns `&Term`, use that reference only; for layout math use `cols`/`rows`/`scrollback` caches |
+| Long critical section under term lock (shape all cells, do I/O, call into GPUI) | Blocks PTY reader side effects and other UI that needs the term | Minimize lock scope; paint from grid snapshot where possible |
+| `stdin_writer.lock()` held across notify/paint | Same class of nested / ordered lock issues | Write bytes, drop guard, then notify |
+| SSH `connect_blocking` (or any russh handshake) on the UI thread | Network RTT freezes UI | Keep pattern in `tab_manager`: worker thread + `flume` + `cx.spawn` await |
+| `persist_now()` / large JSON write on every keystroke on UI thread | Stutter under load | Debounce; or write on a background task (follow-up if it becomes hot) |
+| PTY spawn + waiting for first output synchronously in open handler | Shell startup blocks open | Spawn async; show tab in Connecting; attach terminal when ready |
+| Lock order inversion (e.g. store lock then term lock vs reverse) | Cross-thread or same-thread deadlock | Document order: prefer **no nested locks**; if needed, fixed global order |
+
+**Loom rules of thumb:**
+
+1. **`term_arc` / `with_term*`:** at most one owner on a call stack. Paint already locking ⇒ no `with_term*`.
+2. **SSH / PTY / disk:** never on the frame or click stack without an async boundary (existing SSH connect path is the template).
+3. New terminal chrome (gutter, find, minimap): compute layout from **cached metrics**, draw from **already-locked** `&Term` or a snapshot.
+
+### C. How to diagnose quickly
+
+1. **Idle CPU + frozen UI** → almost always **deadlock** or **blocking wait** (lock, `recv`, OS dialog).
+2. **High CPU + frozen/janky UI** → **spin** (notify loop) or **too much per-frame work**.
+3. Bisect: disable the last feature (line numbers, find, overlay). If hang vanishes, inspect that feature’s **paint/event path for locks and blocking I/O**, not its “algorithm cost” first.
+4. On Windows, break in the debugger when hung: if the UI thread sits inside `Mutex::lock` / `recv`, you found it.
+5. Add a dated incident section below when a new freeze class is confirmed.
+
+### D. Safe patterns (copy these)
+
+```text
+# SSH / slow work
+thread::spawn { blocking_work → channel.send(result) }
+cx.spawn { result = channel.recv_async().await; entity.update(|…| apply) }
+
+# Terminal paint
+let snap = { let t = term.lock(); copy_what_you_need(&t) }; // or use &Term only inside the lock
+// drop lock before entity.update / with_term / nested GPUI that might paint again
+
+# Gutter / chrome width
+use config.scrollback + state.rows()   // no term lock
+```
+
+---
+
+## Incident log
+
+### 2026-08-29 — Tab-bar split popover (GPUI paint order + anchor)
 
 **Symptom:** Columns icon on the tab bar should open a Zed-like menu (Split Right / Left / Up / Down) **directly under the icon**. Early builds: menu invisible, under the terminal, opening then vanishing, or floating far to the left of the icon.
 
@@ -42,5 +115,19 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 - Mirror existing in-tree proof: `src/ui/sidebar.rs` context menu.
 
 **Code:** `src/ui/tab_bar.rs` (split popover). Model: `src/ui/pane_layout.rs`, `src/ui/tab_manager.rs`, `src/ui/terminal_pane.rs`.
+
+---
+
+### 2026-08-29 — Line-number gutter froze new shell / SSH (term mutex deadlock)
+
+**Symptom:** After enabling the scrollback line-number gutter (default on), opening a local shell or finishing SSH connect hung the UI (looked like a freeze / “卡住”).
+
+**Cause:** Not CPU cost. Fits checklist **A (nested non-reentrant lock)** + **B (term_arc held in paint, then `with_term`)**. The canvas paint path already held `state_arc.lock()` on the alacritty `Term`, then called `content_padding()` → `line_number_gutter_width()` → `with_term()` on the same `parking_lot::Mutex` → deadlock.
+
+**What worked:** Compute gutter width from `config.scrollback + state.rows()` (no term lock). While the paint lock is held, only read the already-locked `&Term` (for drawing numbers) — never call `with_term` / `with_term_mut`.
+
+**See also:** [UI thread freezes — checklist](#ui-thread-freezes--checklist-gpui--loom) sections A–D.
+
+**Code:** `src/terminal/gpui_emu/view/mod.rs` (`line_number_gutter_width`, canvas paint).
 
 ---

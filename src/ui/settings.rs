@@ -11,6 +11,7 @@ pub enum SettingsEvent {
     Export,
     Import,
     FontSizeChanged(f32),
+    LineNumbersChanged(bool),
 }
 
 pub struct SettingsPanel {
@@ -69,6 +70,7 @@ impl Render for SettingsPanel {
             .unwrap_or_else(|| "auto".into());
         let font_family = settings.font_family.clone();
         let font_size = settings.font_size;
+        let show_line_numbers = settings.show_line_numbers;
 
         div()
             .id("settings-overlay")
@@ -340,6 +342,69 @@ impl Render for SettingsPanel {
                                         });
                                         let size = this.store.read(cx).settings.font_size;
                                         cx.emit(SettingsEvent::FontSizeChanged(size));
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme::TEXT)
+                                                    .child("Line numbers"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_MUTED)
+                                                    .child("Scrollback gutter (1 = oldest line)"),
+                                            ),
+                                    )
+                            .child(
+                                div()
+                                    .id("settings-line-numbers")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded(px(4.0))
+                                    .bg(if show_line_numbers {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::BG
+                                    })
+                                    .border_1()
+                                    .border_color(if show_line_numbers {
+                                        theme::ACCENT
+                                    } else {
+                                        theme::BORDER
+                                    })
+                                    .text_sm()
+                                    .text_color(if show_line_numbers {
+                                        rgb(0xffffff).into()
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    })
+                                    .cursor_pointer()
+                                    .child(if show_line_numbers { "On" } else { "Off" })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let enabled = this.store.update(cx, |s, cx| {
+                                            s.settings.show_line_numbers =
+                                                !s.settings.show_line_numbers;
+                                            let v = s.settings.show_line_numbers;
+                                            s.mark_dirty();
+                                            s.persist_now();
+                                            cx.notify();
+                                            v
+                                        });
+                                        cx.emit(SettingsEvent::LineNumbersChanged(enabled));
+                                        cx.notify();
                                     })),
                             ),
                     )

@@ -5,7 +5,7 @@ This document captures the target architecture for Loom: learn from [Zed](https:
 It is a design guide, not a license to copy Zed source. Do not paste Zed crates or GPL-covered files into this tree.
 
 For **why we chose X over Y**, see [DECISIONS.md](./DECISIONS.md).  
-For **non-obvious GPUI/platform pitfalls**, see [HARD_PROBLEMS.md](./HARD_PROBLEMS.md).  
+For **non-obvious GPUI/platform pitfalls** (including UI-thread freeze / deadlock checklist), see [HARD_PROBLEMS.md](./HARD_PROBLEMS.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals
@@ -186,5 +186,6 @@ Started on the GPUI tree (post Slint rollback):
 - [x] Terminal reply events + paste (`ColorRequest`, `TextAreaSizeRequest`, clipboard, Ctrl+V)
 - [x] Mouse selection + auto-copy on release; Ctrl+C copies when selected; right-click paste
 - [x] Scrollback wheel + overlay scrollbar; Ctrl+F find over scrollback/grid
+- [x] Optional line-number gutter (Settings toggle; 1 = oldest scrollback line)
 - [x] Zed-style pane splits (binary tree, sash resize, Ctrl+W closes focused pane)
 - [ ] macOS / Linux runtime validation

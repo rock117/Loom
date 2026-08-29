@@ -56,14 +56,16 @@ pub struct TabManager {
     pub tabs: Vec<TabSession>,
     pub active: Option<Uuid>,
     pub font_size: f32,
+    pub show_line_numbers: bool,
 }
 
 impl TabManager {
-    pub fn new(font_size: f32) -> Self {
+    pub fn new(font_size: f32, show_line_numbers: bool) -> Self {
         Self {
             tabs: Vec::new(),
             active: None,
             font_size,
+            show_line_numbers,
         }
     }
 
@@ -232,6 +234,7 @@ impl TabManager {
             font_family.to_string()
         };
         let font_size = self.font_size;
+        let show_line_numbers = self.show_line_numbers;
         let label = format!("{user}@{host}:{port}");
 
         let (tx, rx) = flume::bounded(1);
@@ -253,7 +256,7 @@ impl TabManager {
                 };
                 match result {
                     Ok(Ok(handles)) => {
-                        let config = terminal_config(font_size, &family);
+                        let config = terminal_config(font_size, &family, show_line_numbers);
                         let resize = handles.resize.clone();
                         let terminal = cx.new(|cx| {
                             TerminalView::new(handles.writer, handles.reader, config, cx)
@@ -303,7 +306,7 @@ impl TabManager {
         } else {
             font_family
         };
-        let config = terminal_config(self.font_size, family);
+        let config = terminal_config(self.font_size, family, self.show_line_numbers);
         let terminal = cx.new(|cx| {
             TerminalView::new(pty.writer, pty.reader, config, cx).with_resize_callback(resize)
         });
@@ -715,6 +718,22 @@ impl TabManager {
         cx.notify();
     }
 
+    pub fn set_show_line_numbers(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.show_line_numbers = enabled;
+        for tab in &self.tabs {
+            for pane in tab.panes.values() {
+                if let Some(term) = &pane.terminal {
+                    term.update(cx, |terminal, cx| {
+                        let mut config = terminal.config().clone();
+                        config.show_line_numbers = enabled;
+                        terminal.update_config(config, cx);
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
     pub fn snapshot_for_persist(&self) -> (Vec<(Uuid, Option<String>)>, usize) {
         let tabs = self
             .tabs
@@ -787,7 +806,7 @@ fn resolve_ssh_auth(
     }
 }
 
-fn terminal_config(font_size: f32, font_family: &str) -> TerminalConfig {
+fn terminal_config(font_size: f32, font_family: &str, show_line_numbers: bool) -> TerminalConfig {
     let colors = ColorPalette::builder()
         .background(0x1A, 0x1A, 0x1C)
         .foreground(0xE8, 0xE6, 0xE3)
@@ -818,6 +837,7 @@ fn terminal_config(font_size: f32, font_family: &str) -> TerminalConfig {
         scrollback: 10_000,
         line_height_multiplier: 1.2,
         padding: Edges::all(px(theme::SPACE_2)),
+        show_line_numbers,
         colors,
     }
 }

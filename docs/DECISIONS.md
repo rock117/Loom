@@ -4,7 +4,7 @@ Record **trade-offs and why**, so future reviews do not re-litigate from scratch
 
 - **Architecture** (`ARCHITECTURE.md`) = what the system is / should be  
 - **This file** = options considered, choice, rationale, follow-ups  
-- **Hard problems** (`HARD_PROBLEMS.md`) = non-obvious GPUI/platform pitfalls (symptom → failed attempts → fix)  
+- **Hard problems** (`HARD_PROBLEMS.md`) = non-obvious GPUI/platform pitfalls; starts with a standing **UI freeze checklist (GPUI + Loom)** plus dated incident write-ups   
 - **Backlog** (`BACKLOG.md`) = low-priority icebox features (not decisions; do not implement unless explicitly ordered)  
 
 Add a new section when a non-trivial option is chosen (stack, license boundary, terminal path, UX IA, etc.). Prefer facts over slogans. When a feature turns into a multi-hour positioning/focus/PTY fight, also add a dated entry under `HARD_PROBLEMS.md`.
