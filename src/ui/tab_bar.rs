@@ -101,6 +101,8 @@ impl Render for TabBar {
         let manager = self.tabs.read(cx);
         let active = manager.active;
         let has_session = active.is_some();
+        let can_zoom = manager.can_zoom_active();
+        let is_zoomed = manager.active_zoomed();
         let items: Vec<(Uuid, String, ConnectionState, bool)> = manager
             .tabs
             .iter()
@@ -245,6 +247,48 @@ impl Render for TabBar {
                         }),
                     )
                     .on_click(cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                    })),
+            )
+            .child(
+                div()
+                    .id("tab-zoom")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(SPLIT_BTN))
+                    .rounded(px(theme::RADIUS_SM))
+                    .cursor_pointer()
+                    .when(is_zoomed, |d| d.bg(theme::HOVER))
+                    .when(can_zoom, |d| {
+                        d.hover(|s| s.bg(theme::HOVER)).child(Self::svg_icon(
+                            if is_zoomed {
+                                "icons/ui/minimize-2.svg"
+                            } else {
+                                "icons/ui/maximize-2.svg"
+                            },
+                            ICON,
+                            if is_zoomed {
+                                theme::TEXT
+                            } else {
+                                theme::TEXT_MUTED
+                            },
+                        ))
+                    })
+                    .when(!can_zoom, |d| {
+                        d.child(Self::svg_icon(
+                            "icons/ui/maximize-2.svg",
+                            ICON,
+                            theme::TEXT_DISABLED,
+                        ))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if !this.tabs.read(cx).can_zoom_active() {
+                            return;
+                        }
+                        this.close_split_menu(cx);
+                        this.tabs.update(cx, |m, cx| m.toggle_zoom_focused(cx));
+                        cx.emit(TabBarEvent::Changed);
                         cx.stop_propagation();
                     })),
             )

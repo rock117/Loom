@@ -35,6 +35,8 @@ pub struct TabSession {
     pub panes: HashMap<Uuid, PaneSession>,
     pub layout: PaneLayout,
     pub focused: Uuid,
+    /// When set, only this leaf is shown full-size (Zed zoom); layout tree is kept.
+    pub zoomed: Option<Uuid>,
 }
 
 impl TabSession {
@@ -470,6 +472,9 @@ impl TabManager {
             return;
         }
         tab.focused = pane_id;
+        if tab.zoomed.is_some() {
+            tab.zoomed = Some(pane_id);
+        }
         if let Some(term) = tab.panes.get(&pane_id).and_then(|p| p.terminal.as_ref()) {
             term.read(cx).focus_handle().focus(window);
         }
@@ -611,11 +616,43 @@ impl TabManager {
         for tab in &mut self.tabs {
             if tab.panes.contains_key(&pane_id) {
                 tab.focused = pane_id;
+                // While zoomed, follow focus so the visible pane matches.
+                if tab.zoomed.is_some() {
+                    tab.zoomed = Some(pane_id);
+                }
                 self.active = Some(tab.id);
                 cx.notify();
                 return;
             }
         }
+    }
+
+    /// Toggle Zed-style zoom: focused pane fills the tab; layout tree stays intact.
+    pub fn toggle_zoom_focused(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        if tab.layout.leaf_count() <= 1 {
+            tab.zoomed = None;
+            cx.notify();
+            return;
+        }
+        if tab.zoomed == Some(tab.focused) {
+            tab.zoomed = None;
+        } else {
+            tab.zoomed = Some(tab.focused);
+        }
+        cx.notify();
+    }
+
+    pub fn active_zoomed(&self) -> bool {
+        self.active_tab()
+            .is_some_and(|t| t.zoomed.is_some() && t.layout.leaf_count() > 1)
+    }
+
+    pub fn can_zoom_active(&self) -> bool {
+        self.active_tab()
+            .is_some_and(|t| t.layout.leaf_count() > 1 || t.zoomed.is_some())
     }
 
     /// Close a specific pane (or its tab when it is the last pane).
@@ -644,6 +681,12 @@ impl TabManager {
                     drop(pane.terminal);
                 }
                 self.tabs[tab_idx].focused = focus;
+                // Drop zoom if the zoomed leaf is gone or only one pane remains.
+                let clear_zoom = self.tabs[tab_idx].zoomed == Some(pane_id)
+                    || self.tabs[tab_idx].layout.leaf_count() <= 1;
+                if clear_zoom {
+                    self.tabs[tab_idx].zoomed = None;
+                }
                 if let Some(window) = window {
                     if let Some(term) = self.tabs[tab_idx]
                         .panes
@@ -861,6 +904,7 @@ fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
         panes,
         layout: PaneLayout::leaf(pane_id),
         focused: pane_id,
+        zoomed: None,
     }
 }
 

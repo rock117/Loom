@@ -56,7 +56,7 @@ impl Render for TerminalPane {
                         )
                     })
                     .collect();
-                (t.layout.clone(), panes, t.focused)
+                (t.layout.clone(), panes, t.focused, t.zoomed)
             })
         });
         let view = cx.entity();
@@ -106,9 +106,15 @@ impl Render for TerminalPane {
             }))
             .child(match tab_snap {
                 None => empty_state().into_any_element(),
-                Some((layout, panes, focused)) => {
-                    let multi_pane = layout.leaf_count() > 1;
-                    render_layout(&layout, &panes, focused, multi_pane, &view, &tabs, cx)
+                Some((layout, panes, focused, zoomed)) => {
+                    // Zoom: show one leaf full-bleed; keep split tree for restore.
+                    if let Some(z) = zoomed.filter(|z| panes.contains_key(z)) {
+                        // Full-bleed like Zed zoom — no multi-pane chrome.
+                        render_pane(z, panes.get(&z), true, false, &tabs, cx)
+                    } else {
+                        let multi_pane = layout.leaf_count() > 1;
+                        render_layout(&layout, &panes, focused, multi_pane, &view, &tabs, cx)
+                    }
                 }
             })
     }
