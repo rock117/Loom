@@ -26,6 +26,7 @@ pub struct WorkspaceView {
     ssh_form: Entity<SshForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
     sidebar_width: f32,
+    sidebar_visible: bool,
     resizing_sidebar: bool,
     show_settings: bool,
     show_ssh_form: bool,
@@ -44,6 +45,7 @@ impl WorkspaceView {
             .ui_state
             .sidebar_width
             .clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX);
+        let sidebar_visible = store.read(cx).ui_state.sidebar_visible;
         let restore_profiles: Vec<uuid::Uuid> = store
             .read(cx)
             .ui_state
@@ -73,6 +75,7 @@ impl WorkspaceView {
             ssh_form: ssh_form.clone(),
             password_prompt: None,
             sidebar_width,
+            sidebar_visible,
             resizing_sidebar: false,
             show_settings: false,
             show_ssh_form: false,
@@ -206,6 +209,9 @@ impl WorkspaceView {
                     cx.defer_in(window, |this, window, cx| {
                         this.ssh_form.read(cx).focus(window);
                     });
+                }
+                StatusBarEvent::ToggleSidebar => {
+                    this.toggle_sidebar(window, cx);
                 }
             },
         ));
@@ -372,6 +378,7 @@ impl WorkspaceView {
 
     fn persist_tabs(&mut self, cx: &mut Context<Self>) {
         let sidebar_width = self.sidebar_width;
+        let sidebar_visible = self.sidebar_visible;
         let (tabs, active, font_size) = {
             let manager = self.tabs.read(cx);
             let (tabs, active) = manager.snapshot_for_persist();
@@ -379,11 +386,34 @@ impl WorkspaceView {
         };
         self.store.update(cx, |s, _cx| {
             s.ui_state.sidebar_width = sidebar_width;
+            s.ui_state.sidebar_visible = sidebar_visible;
             s.ui_state.font_size = font_size;
             s.settings.font_size = font_size;
             s.sync_open_tabs(&tabs, active);
             s.persist_now();
         });
+    }
+
+    fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sidebar_visible = !self.sidebar_visible;
+        let visible = self.sidebar_visible;
+        self.store.update(cx, |s, cx| {
+            s.ui_state.sidebar_visible = visible;
+            s.persist_now();
+            cx.notify();
+        });
+        if visible {
+            self.sidebar.read(cx).focus_handle(cx).focus(window);
+        } else if let Some(term) = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .and_then(|t| t.focused_pane())
+            .and_then(|p| p.terminal.as_ref())
+        {
+            term.read(cx).focus_handle().focus(window);
+        }
+        cx.notify();
     }
 
     fn set_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -593,6 +623,9 @@ impl Render for WorkspaceView {
                 this.show_settings = !this.show_settings;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
+                this.toggle_sidebar(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ExportWorkspace, _, cx| {
                 this.export_workspace(cx);
             }))
@@ -662,27 +695,29 @@ impl Render for WorkspaceView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .child(
-                        div()
-                            .w(px(self.sidebar_width))
-                            .h_full()
-                            .child(self.sidebar.clone()),
-                    )
-                    .child(
-                        div()
-                            .id("sidebar-resizer")
-                            .w(px(4.0))
-                            .h_full()
-                            .cursor(CursorStyle::ResizeColumn)
-                            .hover(|s| s.bg(theme::ACCENT))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.resizing_sidebar = true;
-                                    cx.notify();
-                                }),
-                            ),
-                    )
+                    .when(self.sidebar_visible, |d| {
+                        d.child(
+                            div()
+                                .w(px(self.sidebar_width))
+                                .h_full()
+                                .child(self.sidebar.clone()),
+                        )
+                        .child(
+                            div()
+                                .id("sidebar-resizer")
+                                .w(px(4.0))
+                                .h_full()
+                                .cursor(CursorStyle::ResizeColumn)
+                                .hover(|s| s.bg(theme::ACCENT))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.resizing_sidebar = true;
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex()

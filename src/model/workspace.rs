@@ -100,9 +100,16 @@ pub struct OpenTabRef {
 pub struct UiStateFile {
     pub version: u32,
     pub sidebar_width: f32,
+    /// When false, the profiles sidebar is hidden (Zed-style toggle).
+    #[serde(default = "default_sidebar_visible")]
+    pub sidebar_visible: bool,
     pub font_size: f32,
     pub open_tabs: Vec<OpenTabRef>,
     pub active_tab_index: usize,
+}
+
+fn default_sidebar_visible() -> bool {
+    true
 }
 
 impl Default for UiStateFile {
@@ -110,6 +117,7 @@ impl Default for UiStateFile {
         Self {
             version: 1,
             sidebar_width: 240.0,
+            sidebar_visible: true,
             font_size: 14.0,
             open_tabs: Vec::new(),
             active_tab_index: 0,

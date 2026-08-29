@@ -25,6 +25,8 @@ actions!(
         ZoomReset,
         /// Toggle the settings overlay.
         ToggleSettings,
+        /// Show or hide the profiles sidebar (Zed project-panel toggle).
+        ToggleSidebar,
         /// Export workspace JSON via file dialog.
         ExportWorkspace,
         /// Import workspace JSON (replaces current).

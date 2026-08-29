@@ -25,6 +25,8 @@ pub enum StatusBarEvent {
     Reconnect(Uuid),
     OpenSettings,
     EditSshProfile(Uuid),
+    /// Toggle profiles sidebar visibility (Zed left-dock).
+    ToggleSidebar,
 }
 
 impl StatusBar {
@@ -122,13 +124,14 @@ impl Render for StatusBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let manager = self.tabs.read(cx);
         let font_size = manager.font_size;
+        let sidebar_visible = self.store.read(cx).ui_state.sidebar_visible;
         let active = manager
             .active
             .and_then(|id| manager.tabs.iter().find(|t| t.id == id));
 
         let toast = self.toast.clone();
 
-        let (left, right_geom) = if let Some(tab) = active {
+        let (session_left, right_geom) = if let Some(tab) = active {
             let tab_id = tab.id;
             let pane = tab.focused_pane();
             let state = pane
@@ -276,6 +279,30 @@ impl Render for StatusBar {
             (left.into_any_element(), String::new())
         };
 
+        // Zed-style: panel toggle is the leftmost status-bar control.
+        let panel_toggle = div()
+            .id("sb-sidebar")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_full()
+            .px(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_SM))
+            .cursor_pointer()
+            .when(sidebar_visible, |d| d.bg(theme::HOVER))
+            .hover(|s| s.bg(theme::HOVER))
+            .child(Self::svg(
+                "icons/ui/panel-left.svg",
+                if sidebar_visible {
+                    theme::TEXT
+                } else {
+                    theme::TEXT_MUTED
+                },
+            ))
+            .on_click(cx.listener(|_, _, _, cx| {
+                cx.emit(StatusBarEvent::ToggleSidebar);
+            }));
+
         div()
             .id("status-bar")
             .flex()
@@ -288,7 +315,15 @@ impl Render for StatusBar {
             .bg(theme::PANEL_BG)
             .border_t_1()
             .border_color(theme::BORDER_SUBTLE)
-            .child(left)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .gap(px(2.0))
+                    .child(panel_toggle)
+                    .child(session_left),
+            )
             .child(
                 div()
                     .flex()
