@@ -11,6 +11,7 @@ A desktop terminal client built with [GPUI](https://gpui.rs): local shell and SS
 - **Sessions**: open from a profile, duplicate tab, reconnect when disconnected
 - **Local shell** (priority): via `portable-pty` + in-house alacritty/GPUI terminal (Windows: pwsh / PowerShell / cmd)
 - **SSH**: `russh` sessions; passwords stored in the OS keyring when “Remember” is enabled
+- **Find**: Ctrl+F searches terminal scrollback (literal match)
 
 ## Layout
 

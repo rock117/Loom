@@ -47,11 +47,14 @@
 //! terminal.read(cx).focus_handle().focus(window);
 //! ```
 
+mod find;
+
 use super::colors::ColorPalette;
 use super::event::{GpuiEventProxy, TerminalEvent};
 use super::input::keystroke_to_bytes;
 use super::render::TerminalRenderer;
 use super::terminal::TerminalState;
+use gpui::prelude::FluentBuilder;
 use gpui::{Edges, *};
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -420,6 +423,12 @@ pub struct TerminalView {
 
     /// Active scrollbar thumb drag (window Y → display offset).
     scrollbar_drag: Option<ScrollbarDrag>,
+
+    /// Ctrl+F find bar over scrollback / viewport.
+    find: Option<find::FindState>,
+
+    /// Keeps the find-bar caret blink loop alive while find is open.
+    _find_caret_blink: Option<Task<()>>,
 }
 
 struct ScrollbarDrag {
@@ -572,6 +581,8 @@ impl TerminalView {
             selecting: false,
             last_bounds: Bounds::default(),
             scrollbar_drag: None,
+            find: None,
+            _find_caret_blink: None,
         }
     }
 
@@ -755,12 +766,40 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
         {
             return; // Event consumed by handler
+        }
+
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+
+        // Ctrl+F opens find (do not forward 0x06 to the PTY).
+        if mods.control
+            && !mods.alt
+            && !mods.shift
+            && key.eq_ignore_ascii_case("f")
+        {
+            self.open_find(window, cx);
+            return;
+        }
+
+        if self.is_find_open() {
+            if key == "escape" {
+                self.close_find(window, cx);
+                return;
+            }
+            if key == "f3" {
+                if mods.shift {
+                    self.find_prev(cx);
+                } else {
+                    self.find_next(cx);
+                }
+                return;
+            }
         }
 
         if self.is_paste_keystroke(&event.keystroke) {
@@ -769,8 +808,6 @@ impl TerminalView {
         }
 
         // With an active selection, Ctrl+C copies (Windows Terminal style) instead of SIGINT.
-        let key = event.keystroke.key.as_str();
-        let mods = &event.keystroke.modifiers;
         if mods.control
             && !mods.alt
             && key.eq_ignore_ascii_case("c")
@@ -1476,6 +1513,7 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when_some(self.render_find_bar(cx), |d, bar| d.child(bar))
     }
 }
 

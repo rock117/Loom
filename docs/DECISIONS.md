@@ -130,6 +130,20 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-08-29 — Terminal find uses literal RegexSearch
+
+**Status:** accepted  
+
+**Context:** Ctrl+F over scrollback needs match + scroll; alacritty exposes `RegexSearch` / `search_next`.
+
+**Decision:** Escape user input as a literal pattern; highlight via existing selection; overlay find bar on the terminal view (not a global Loom action yet).
+
+**Why:** Matches common terminal UX; avoids building a separate highlighter; reuses selection paint.
+
+**Consequences / follow-ups:** Regex mode / match count / highlight-all can come later if needed.
+
+---
+
 ## How to use this file in review
 
 1. Before changing terminal stack, UI toolkit, or license boundary, read matching sections here.  

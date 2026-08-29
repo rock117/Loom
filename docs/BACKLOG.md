@@ -23,7 +23,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| T1 | **Output search** | Ctrl+F (or similar) over scrollback/grid. (Wheel + scrollbar scrollback already shipped.) |
+| T1 | **Output search** | **Shipped** — Ctrl+F find bar over scrollback/grid (literal match, Enter/F3 next, Shift+Enter/Shift+F3 prev, Esc closes). |
 | T2 | **Selection polish** | Double-click word, triple-click line, optional block select. |
 | T3 | **Link detection** | Clickable paths / URLs in output. |
 | T4 | **Notifications** | Long-running command done, bell, disconnect toasts. |
