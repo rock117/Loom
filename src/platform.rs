@@ -48,3 +48,20 @@ pub fn resolve_shell(configured: Option<&str>) -> String {
 pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     native_reveal_in_file_manager(path)
 }
+
+/// Live cwd of a local process (Zed-style), used when OSC hooks are missing or stale.
+///
+/// Returns `None` if the pid is gone, inaccessible, or the OS cannot report cwd.
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let mut sys = System::new();
+    let pid = Pid::from_u32(pid);
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    sys.process(pid)
+        .and_then(|p| p.cwd().map(|p| p.to_path_buf()))
+}

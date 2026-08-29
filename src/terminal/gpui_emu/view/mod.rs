@@ -441,8 +441,12 @@ pub struct TerminalView {
     /// Right-click context menu anchor (window coordinates).
     context_menu: Option<Point<Pixels>>,
 
-    /// Local working directory for Copy Path / Reveal (unset for SSH).
+    /// Best-known working directory for Copy Path / Reveal.
+    /// Updated by OSC 7/9;9 and (for local shells) process cwd refresh.
     working_directory: Option<std::path::PathBuf>,
+
+    /// Local shell PID for Zed-style cwd refresh; `None` for SSH.
+    shell_pid: Option<u32>,
 }
 
 struct ScrollbarDrag {
@@ -603,7 +607,14 @@ impl TerminalView {
             _find_caret_blink: None,
             context_menu: None,
             working_directory: None,
+            shell_pid: None,
         }
+    }
+
+    /// Attach the local shell PID so Copy Path / Reveal can refresh cwd from the process.
+    pub fn with_shell_pid(mut self, pid: Option<u32>) -> Self {
+        self.shell_pid = pid;
+        self
     }
 
     /// Set a callback to be invoked when the terminal is resized.

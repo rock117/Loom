@@ -17,6 +17,8 @@ pub struct LocalPty {
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
     pub killer: Box<dyn ChildKiller + Send + Sync>,
+    /// Shell process id (for live cwd via PEB /proc — Zed-style fallback to OSC).
+    pub shell_pid: Option<u32>,
 }
 
 impl LocalPty {
@@ -50,6 +52,7 @@ impl LocalPty {
             .with_context(|| format!("spawn shell `{shell}`"))?;
         drop(pair.slave);
 
+        let shell_pid = child.process_id();
         let killer = child.clone_killer();
         // Keep the Child alive on a background wait thread so Drop does not
         // block the UI; killer is used for explicit teardown.
@@ -70,6 +73,7 @@ impl LocalPty {
             reader,
             writer,
             killer,
+            shell_pid,
         })
     }
 
@@ -110,6 +114,9 @@ pub fn teardown_pty(
 }
 
 /// Ask common local shells to emit OSC cwd reports after each prompt.
+///
+/// OSC still matters for SSH / when process cwd is unavailable. Local Reveal/Copy
+/// Path also refresh via [`crate::platform::process_cwd`] (Zed-style).
 fn configure_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
     let stem = Path::new(shell)
         .file_stem()
@@ -122,11 +129,12 @@ fn configure_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
         "cmd" => {
             cmd.env("PROMPT", "$E]9;9;$P$E\\$P$G");
         }
-        // Wrap the existing prompt so user profiles still run; emit OSC 7 each time.
+        // Wrap the existing prompt so user profiles still run; emit OSC 7 + 9;9.
+        // One-liner + -EncodedCommand avoids CreateProcess mangling multiline -Command.
         "pwsh" | "powershell" => {
             cmd.arg("-NoExit");
-            cmd.arg("-Command");
-            cmd.arg(PWSH_OSC7_HOOK);
+            cmd.arg("-EncodedCommand");
+            cmd.arg(pwsh_encoded_osc_hook());
         }
         "bash" => {
             let existing = std::env::var("PROMPT_COMMAND").unwrap_or_default();
@@ -147,23 +155,57 @@ fn configure_cwd_reporting(cmd: &mut CommandBuilder, shell: &str) {
     }
 }
 
-/// PowerShell: preserve prior `prompt`, prepend OSC 7 with `file:///C:/...` URI.
-const PWSH_OSC7_HOOK: &str = r#"
-if (-not $global:__LoomOsc7Hooked) {
-  $global:__LoomOsc7Hooked = $true
+/// PowerShell: preserve prior `prompt`; emit OSC 7 (file URI) and OSC 9;9 (Win path).
+const PWSH_OSC_HOOK: &str = r#"
+if (-not $global:__LoomOscHooked) {
+  $global:__LoomOscHooked = $true
   $global:__LoomPrevPrompt = $function:prompt
   function global:prompt {
     try {
       $p = (Get-Location).ProviderPath
       $uriPath = ($p -replace '\\', '/')
       if ($uriPath -match '^[A-Za-z]:') { $uriPath = '/' + $uriPath }
-      $uri = 'file://' + $uriPath
-      [Console]::Write([char]27 + ']7;' + $uri + [char]7)
+      $esc = [char]27; $bel = [char]7
+      [Console]::Out.Write("$esc]7;file://$uriPath$bel")
+      [Console]::Out.Write("$esc]9;9;$p$bel")
     } catch {}
     if ($global:__LoomPrevPrompt) { & $global:__LoomPrevPrompt } else { 'PS> ' }
   }
 }
 "#;
+
+fn pwsh_encoded_osc_hook() -> String {
+    // PowerShell -EncodedCommand expects UTF-16LE bytes, base64-encoded.
+    let utf16: Vec<u8> = PWSH_OSC_HOOK
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    base64_encode(&utf16)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 /// Resolve default shell executable for this platform.
 pub fn resolve_shell(configured: Option<&str>) -> String {

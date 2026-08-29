@@ -26,6 +26,15 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Prefer live process cwd (local), else keep OSC / spawn cwd.
+    pub(super) fn refresh_working_directory(&mut self) {
+        if let Some(pid) = self.shell_pid {
+            if let Some(cwd) = platform::process_cwd(pid) {
+                self.working_directory = Some(cwd);
+            }
+        }
+    }
+
     pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.is_some() {
             self.context_menu = None;
@@ -34,6 +43,7 @@ impl TerminalView {
     }
 
     pub(super) fn open_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.refresh_working_directory();
         self.context_menu = Some(position);
         cx.notify();
     }
@@ -63,7 +73,8 @@ impl TerminalView {
         cx.notify();
     }
 
-    fn copy_working_directory(&self, cx: &mut Context<Self>) {
+    fn copy_working_directory(&mut self, cx: &mut Context<Self>) {
+        self.refresh_working_directory();
         let Some(path) = self.working_directory.as_ref() else {
             return;
         };
@@ -72,7 +83,8 @@ impl TerminalView {
         ));
     }
 
-    fn reveal_working_directory(&self) {
+    fn reveal_working_directory(&mut self) {
+        self.refresh_working_directory();
         let Some(path) = self.working_directory.as_ref() else {
             return;
         };

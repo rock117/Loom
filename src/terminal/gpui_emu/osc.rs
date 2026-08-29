@@ -1,7 +1,11 @@
 //! Side-channel OSC observer (cwd via OSC 7 / OSC 9;9).
 //!
-//! `alacritty_terminal` does not surface OSC 7, so we run a second VTE parser on
-//! the same PTY byte stream (same approach as Zed/okena-style sidecars).
+//! `alacritty_terminal` does not surface OSC 7 on its event API, so we run a second
+//! VTE parser on the same PTY byte stream. OSC itself is standard (shells / Windows
+//! Terminal emit it); the gap is the Alacritty crate, not the protocol.
+//!
+//! For **local** shells Loom also refreshes cwd from the process (Zed-style via
+//! `sysinfo`) when opening Copy Path / Reveal — OSC remains important for SSH.
 
 use std::path::{Path, PathBuf};
 

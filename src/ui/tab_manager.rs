@@ -316,7 +316,9 @@ impl TabManager {
             .clone()
             .or_else(|| LocalPty::default_cwd());
         let terminal = cx.new(|cx| {
-            TerminalView::new(pty.writer, pty.reader, config, cx).with_resize_callback(resize)
+            TerminalView::new(pty.writer, pty.reader, config, cx)
+                .with_resize_callback(resize)
+                .with_shell_pid(pty.shell_pid)
         });
         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
         terminal.read(cx).focus_handle().focus(window);
