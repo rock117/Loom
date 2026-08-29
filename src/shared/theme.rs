@@ -107,6 +107,28 @@ pub const SELECTION: Hsla = Hsla {
     a: 1.0,
 };
 
+/// Local shell / terminal glyph in the sidebar.
+pub const ICON_LOCAL: Hsla = Hsla {
+    h: 0.48,
+    s: 0.42,
+    l: 0.55,
+    a: 1.0,
+};
+/// SSH / remote glyph in the sidebar.
+pub const ICON_REMOTE: Hsla = Hsla {
+    h: 0.62,
+    s: 0.40,
+    l: 0.58,
+    a: 1.0,
+};
+/// Group / folder glyph.
+pub const ICON_GROUP: Hsla = Hsla {
+    h: 0.12,
+    s: 0.35,
+    l: 0.58,
+    a: 1.0,
+};
+
 // --- Type / spacing (logical px) ---
 
 pub const FONT_UI: f32 = 13.0;

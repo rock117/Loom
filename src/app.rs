@@ -1,10 +1,11 @@
 use gpui::*;
 
+use crate::assets::Assets;
 use crate::shared::actions::*;
 use crate::ui::workspace_view::WorkspaceView;
 
 pub fn run() {
-    let app = Application::new();
+    let app = Application::new().with_assets(Assets);
 
     app.run(|cx| {
         cx.bind_keys([

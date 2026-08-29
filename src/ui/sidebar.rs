@@ -4,8 +4,13 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
+use crate::model::ProfileKind;
 use crate::shared::theme;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
+
+const ICON_TREE: f32 = 14.0;
+const ICON_HEADER: f32 = 13.0;
+const ROW_H: f32 = 26.0;
 
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
@@ -32,39 +37,48 @@ impl Sidebar {
         }
     }
 
-    fn ghost_icon(
+    fn svg_icon(path: &'static str, size: f32, color: Hsla) -> impl IntoElement {
+        svg()
+            .path(path)
+            .size(px(size))
+            .flex_shrink_0()
+            .text_color(color)
+    }
+
+    fn ghost_svg(
         &self,
         id: impl Into<ElementId>,
-        label: &'static str,
+        icon: &'static str,
         muted: bool,
         cx: &mut Context<Self>,
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
+        let color = if muted {
+            theme::TEXT_DISABLED
+        } else {
+            theme::TEXT_MUTED
+        };
         div()
             .id(id)
-            .px(px(theme::SPACE_1 + 2.0))
-            .py(px(2.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(24.0))
             .rounded(px(theme::RADIUS_SM))
-            .text_xs()
-            .font_family("Segoe UI")
-            .text_color(if muted {
-                theme::TEXT_DISABLED
-            } else {
-                theme::TEXT_MUTED
-            })
             .cursor_pointer()
-            .hover(|s| {
-                s.bg(theme::HOVER).text_color(if muted {
-                    theme::TEXT_MUTED
-                } else {
-                    theme::TEXT
-                })
-            })
-            .child(label)
+            .hover(|s| s.bg(theme::HOVER))
+            .child(Self::svg_icon(icon, ICON_HEADER, color))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.context_menu = None;
                 on_click(this, window, cx);
             }))
+    }
+
+    fn profile_icon(kind: &ProfileKind) -> (&'static str, Hsla) {
+        match kind {
+            ProfileKind::Local { .. } => ("icons/ui/terminal.svg", theme::ICON_LOCAL),
+            ProfileKind::Ssh { .. } => ("icons/ui/remote.svg", theme::ICON_REMOTE),
+        }
     }
 
     fn menu_item(
@@ -148,18 +162,42 @@ impl Render for Sidebar {
                             .flex()
                             .items_center()
                             .gap(px(2.0))
-                            .child(self.ghost_icon("btn-group", "+", false, cx, |this, _, cx| {
-                                this.store.update(cx, |s, cx| s.add_group(cx));
-                            }))
-                            .child(self.ghost_icon("btn-shell", ">_", false, cx, |this, _, cx| {
-                                this.store.update(cx, |s, cx| {
-                                    s.add_local_profile(cx);
-                                });
-                            }))
-                            .child(self.ghost_icon("btn-ssh", "SSH", true, cx, |_, _, _| {}))
-                            .child(self.ghost_icon("btn-settings", "⚙", false, cx, |_, _, cx| {
-                                cx.emit(SidebarEvent::OpenSettings);
-                            })),
+                            .child(self.ghost_svg(
+                                "btn-group",
+                                "icons/ui/folder.svg",
+                                false,
+                                cx,
+                                |this, _, cx| {
+                                    this.store.update(cx, |s, cx| s.add_group(cx));
+                                },
+                            ))
+                            .child(self.ghost_svg(
+                                "btn-shell",
+                                "icons/ui/terminal.svg",
+                                false,
+                                cx,
+                                |this, _, cx| {
+                                    this.store.update(cx, |s, cx| {
+                                        s.add_local_profile(cx);
+                                    });
+                                },
+                            ))
+                            .child(self.ghost_svg(
+                                "btn-ssh",
+                                "icons/ui/remote.svg",
+                                true,
+                                cx,
+                                |_, _, _| {},
+                            ))
+                            .child(self.ghost_svg(
+                                "btn-settings",
+                                "icons/ui/settings.svg",
+                                false,
+                                cx,
+                                |_, _, cx| {
+                                    cx.emit(SidebarEvent::OpenSettings);
+                                },
+                            )),
                     ),
             )
             // Tree
@@ -173,6 +211,16 @@ impl Render for Sidebar {
                     .pb(px(theme::SPACE_2))
                     .children(groups.into_iter().map(|(gid, gname, collapsed, profiles)| {
                         let selected_group = selection == Selection::Group(gid);
+                        let folder_icon = if collapsed {
+                            "icons/ui/folder.svg"
+                        } else {
+                            "icons/ui/folder-open.svg"
+                        };
+                        let chevron = if collapsed {
+                            "icons/ui/chevron-right.svg"
+                        } else {
+                            "icons/ui/chevron-down.svg"
+                        };
                         div()
                             .mb(px(2.0))
                             .child(
@@ -181,19 +229,22 @@ impl Render for Sidebar {
                                     .flex()
                                     .items_center()
                                     .gap(px(theme::SPACE_1))
-                                    .h(px(24.0))
+                                    .h(px(ROW_H))
                                     .px(px(theme::SPACE_1))
                                     .rounded(px(theme::RADIUS_SM))
                                     .when(selected_group, |d| d.bg(theme::SELECTION))
                                     .hover(|s| s.bg(theme::HOVER))
                                     .cursor_pointer()
-                                    .child(
-                                        div()
-                                            .w(px(12.0))
-                                            .text_xs()
-                                            .text_color(theme::TEXT_MUTED)
-                                            .child(if collapsed { "▸" } else { "▾" }),
-                                    )
+                                    .child(Self::svg_icon(
+                                        chevron,
+                                        12.0,
+                                        theme::TEXT_DISABLED,
+                                    ))
+                                    .child(Self::svg_icon(
+                                        folder_icon,
+                                        ICON_TREE,
+                                        theme::ICON_GROUP,
+                                    ))
                                     .child(
                                         div()
                                             .flex_1()
@@ -221,6 +272,8 @@ impl Render for Sidebar {
                                 d.children(profiles.into_iter().map(|profile| {
                                     let pid = profile.id;
                                     let selected = selection == Selection::Profile(pid);
+                                    let (icon_path, icon_color) =
+                                        Self::profile_icon(&profile.kind);
                                     let label = if renaming.is_some() && selected {
                                         format!("{}|", renaming.clone().unwrap_or_default())
                                     } else {
@@ -231,19 +284,14 @@ impl Render for Sidebar {
                                         .flex()
                                         .items_center()
                                         .gap(px(theme::SPACE_1))
-                                        .h(px(24.0))
-                                        .pl(px(theme::SPACE_4))
+                                        .h(px(ROW_H))
+                                        .pl(px(theme::SPACE_4 + 4.0))
                                         .pr(px(theme::SPACE_1))
                                         .rounded(px(theme::RADIUS_SM))
                                         .when(selected, |d| d.bg(theme::SELECTION))
                                         .hover(|s| s.bg(theme::HOVER))
                                         .cursor_pointer()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(theme::TEXT_MUTED)
-                                                .child("›"),
-                                        )
+                                        .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
                                         .child(
                                             div()
                                                 .flex_1()
