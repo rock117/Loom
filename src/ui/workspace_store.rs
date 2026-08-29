@@ -294,7 +294,12 @@ impl WorkspaceStore {
         cx.notify();
     }
 
-    pub fn move_profile_to_group(&mut self, profile_id: Uuid, target_group: Uuid, cx: &mut Context<Self>) {
+    pub fn move_profile_to_group(
+        &mut self,
+        profile_id: Uuid,
+        target_group: Uuid,
+        cx: &mut Context<Self>,
+    ) {
         let Some(profile) = self.workspace.remove_profile(profile_id) else {
             return;
         };
@@ -302,6 +307,62 @@ impl WorkspaceStore {
             g.profiles.push(profile);
             g.collapsed = false;
         }
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+    }
+
+    /// Move a profile into the group of `before_profile`, inserting before it.
+    pub fn move_profile_before(
+        &mut self,
+        profile_id: Uuid,
+        before_profile: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if profile_id == before_profile {
+            return;
+        }
+        let Some(target_group) = self.workspace.group_id_for_profile(before_profile) else {
+            return;
+        };
+        let Some(profile) = self.workspace.remove_profile(profile_id) else {
+            return;
+        };
+        if let Some(g) = self.workspace.find_group_mut(target_group) {
+            let pos = g
+                .profiles
+                .iter()
+                .position(|p| p.id == before_profile)
+                .unwrap_or(g.profiles.len());
+            g.profiles.insert(pos, profile);
+            g.collapsed = false;
+        }
+        self.selection = Selection::Profile(profile_id);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+    }
+
+    /// Reorder groups: place `dragged` immediately before `before`.
+    pub fn reorder_group_before(
+        &mut self,
+        dragged: Uuid,
+        before: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if dragged == before {
+            return;
+        }
+        let Some(from) = self.workspace.groups.iter().position(|g| g.id == dragged) else {
+            return;
+        };
+        let group = self.workspace.groups.remove(from);
+        let Some(to) = self.workspace.groups.iter().position(|g| g.id == before) else {
+            self.workspace.groups.insert(from, group);
+            return;
+        };
+        self.workspace.groups.insert(to, group);
+        self.selection = Selection::Group(dragged);
         self.mark_dirty();
         self.persist_now();
         cx.notify();

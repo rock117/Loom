@@ -32,6 +32,41 @@ struct ContextMenuState {
     position: Point<Pixels>,
 }
 
+/// Payload for sidebar drag-and-drop (profiles ↔ groups, group reorder).
+#[derive(Clone, Debug)]
+enum DraggedSidebarItem {
+    Profile { id: Uuid, name: SharedString },
+    Group { id: Uuid, name: SharedString },
+}
+
+struct DragPreview {
+    label: SharedString,
+}
+
+impl DragPreview {
+    fn new(label: impl Into<SharedString>) -> Self {
+        Self {
+            label: label.into(),
+        }
+    }
+}
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(theme::ELEVATED)
+            .border_1()
+            .border_color(theme::ACCENT)
+            .shadow_md()
+            .text_xs()
+            .text_color(theme::TEXT)
+            .child(self.label.clone())
+    }
+}
+
 impl Sidebar {
     pub fn new(store: Entity<WorkspaceStore>, cx: &mut Context<Self>) -> Self {
         let _observe_store = cx.observe(&store, |_this, _store, cx| cx.notify());
@@ -417,6 +452,9 @@ impl Render for Sidebar {
                                     .rounded(px(theme::RADIUS_SM))
                                     .when(selected_group, |d| d.bg(theme::SELECTION))
                                     .hover(|s| s.bg(theme::HOVER))
+                                    .drag_over::<DraggedSidebarItem>(|style, _, _, _| {
+                                        style.bg(theme::ACCENT.opacity(0.25))
+                                    })
                                     .cursor_pointer()
                                     .child(Self::svg_icon(
                                         chevron,
@@ -463,7 +501,46 @@ impl Render for Sidebar {
                                             cx.notify();
                                             cx.stop_propagation();
                                         }),
-                                    ),
+                                    )
+                                    .on_drag(
+                                        DraggedSidebarItem::Group {
+                                            id: gid,
+                                            name: gname.clone().into(),
+                                        },
+                                        |item, _offset, _, cx| {
+                                            let label = match item {
+                                                DraggedSidebarItem::Group { name, .. } => {
+                                                    name.clone()
+                                                }
+                                                DraggedSidebarItem::Profile { name, .. } => {
+                                                    name.clone()
+                                                }
+                                            };
+                                            cx.new(|_| DragPreview::new(label))
+                                        },
+                                    )
+                                    .can_drop(|dragged: &dyn std::any::Any, _, _| {
+                                        dragged.is::<DraggedSidebarItem>()
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |this, item: &DraggedSidebarItem, _, cx| {
+                                            this.context_menu = None;
+                                            match item {
+                                                DraggedSidebarItem::Profile { id, .. } => {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.move_profile_to_group(*id, gid, cx);
+                                                    });
+                                                }
+                                                DraggedSidebarItem::Group { id, .. } => {
+                                                    if *id != gid {
+                                                        this.store.update(cx, |s, cx| {
+                                                            s.reorder_group_before(*id, gid, cx);
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    )),
                             )
                             .when(!collapsed, |d| {
                                 d.children(profiles.into_iter().map(|profile| {
@@ -476,6 +553,7 @@ impl Render for Sidebar {
                                     } else {
                                         profile.name.clone()
                                     };
+                                    let drag_name: SharedString = profile.name.clone().into();
                                     div()
                                         .id(SharedString::from(format!("profile-{pid}")))
                                         .flex()
@@ -487,6 +565,9 @@ impl Render for Sidebar {
                                         .rounded(px(theme::RADIUS_SM))
                                         .when(selected, |d| d.bg(theme::SELECTION))
                                         .hover(|s| s.bg(theme::HOVER))
+                                        .drag_over::<DraggedSidebarItem>(|style, _, _, _| {
+                                            style.bg(theme::ACCENT.opacity(0.25))
+                                        })
                                         .cursor_pointer()
                                         .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
                                         .child(
@@ -526,6 +607,42 @@ impl Render for Sidebar {
                                                 },
                                             ),
                                         )
+                                        .on_drag(
+                                            DraggedSidebarItem::Profile {
+                                                id: pid,
+                                                name: drag_name,
+                                            },
+                                            |item, _offset, _, cx| {
+                                                let label = match item {
+                                                    DraggedSidebarItem::Profile { name, .. } => {
+                                                        name.clone()
+                                                    }
+                                                    DraggedSidebarItem::Group { name, .. } => {
+                                                        name.clone()
+                                                    }
+                                                };
+                                                cx.new(|_| DragPreview::new(label))
+                                            },
+                                        )
+                                        .can_drop(|dragged: &dyn std::any::Any, _, _| {
+                                            matches!(
+                                                dragged.downcast_ref::<DraggedSidebarItem>(),
+                                                Some(DraggedSidebarItem::Profile { .. })
+                                            )
+                                        })
+                                        .on_drop(cx.listener(
+                                            move |this, item: &DraggedSidebarItem, _, cx| {
+                                                this.context_menu = None;
+                                                if let DraggedSidebarItem::Profile { id, .. } = item
+                                                {
+                                                    if *id != pid {
+                                                        this.store.update(cx, |s, cx| {
+                                                            s.move_profile_before(*id, pid, cx);
+                                                        });
+                                                    }
+                                                }
+                                            },
+                                        ))
                                 }))
                             })
                     })),
@@ -539,7 +656,7 @@ impl Render for Sidebar {
                     .border_color(theme::BORDER_SUBTLE)
                     .text_xs()
                     .text_color(theme::TEXT_DISABLED)
-                    .child("↵ open · F2 rename · Del · right-click"),
+                    .child("↵ open · drag to move · F2 · Del · right-click"),
             )
             // Context menu — anchored to right-click point (window coords)
             .when_some(context_menu, |this, (target, position)| {
