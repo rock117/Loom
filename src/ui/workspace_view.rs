@@ -50,17 +50,9 @@ impl WorkspaceView {
         let font_size = store.read(cx).ui_state.font_size.max(
             store.read(cx).settings.font_size,
         );
-        let sidebar_width = store
-            .read(cx)
-            .ui_state
-            .sidebar_width
-            .clamp(theme::SIDEBAR_MIN, theme::SIDEBAR_MAX);
+        let sidebar_width = store.read(cx).ui_state.sidebar_width.max(0.0);
         let sidebar_visible = store.read(cx).ui_state.sidebar_visible;
-        let context_panel_width = store
-            .read(cx)
-            .ui_state
-            .context_panel_width
-            .clamp(theme::CONTEXT_PANEL_MIN, theme::CONTEXT_PANEL_MAX);
+        let context_panel_width = store.read(cx).ui_state.context_panel_width.max(0.0);
         let context_panel_visible = store.read(cx).ui_state.context_panel_visible;
         let restore_profiles: Vec<uuid::Uuid> = store
             .read(cx)
@@ -740,18 +732,13 @@ impl Render for WorkspaceView {
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 if this.resizing_sidebar {
-                    this.sidebar_width = event
-                        .position
-                        .x
-                        .clamp(px(theme::SIDEBAR_MIN), px(theme::SIDEBAR_MAX))
-                        .into();
+                    this.sidebar_width = f32::from(event.position.x).max(0.0);
                     cx.notify();
                 }
                 if let Some(drag) = this.context_resize.as_ref() {
                     let x: f32 = event.position.x.into();
                     let dx = drag.start_x - x;
-                    this.context_panel_width = (drag.start_width + dx)
-                        .clamp(theme::CONTEXT_PANEL_MIN, theme::CONTEXT_PANEL_MAX);
+                    this.context_panel_width = (drag.start_width + dx).max(0.0);
                     cx.notify();
                 }
             }))

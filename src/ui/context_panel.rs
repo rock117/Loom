@@ -7,6 +7,7 @@ use gpui::*;
 use uuid::Uuid;
 
 use crate::model::{ConnectionState, ProfileKind};
+use crate::platform;
 use crate::session::sftp::{
     RemoteEntry, SftpHandle, SftpRequest, TransferProgress, parent_remote,
 };
@@ -31,8 +32,16 @@ enum TransferDir {
 
 #[derive(Clone)]
 enum TransferStatus {
-    Running { done: u64, total: Option<u64> },
-    Done,
+    Running {
+        done: u64,
+        total: Option<u64>,
+        files_done: Option<u32>,
+        files_total: Option<u32>,
+    },
+    Done {
+        /// Present for folder transfers (file count).
+        files: Option<u32>,
+    },
     Failed(String),
 }
 
@@ -41,6 +50,14 @@ struct TransferRow {
     label: String,
     direction: TransferDir,
     status: TransferStatus,
+    /// Local path for Reveal (download destination or upload source).
+    local_path: Option<PathBuf>,
+    is_dir: bool,
+}
+
+struct TransferMenu {
+    id: Uuid,
+    position: Point<Pixels>,
 }
 
 pub struct ContextPanel {
@@ -57,6 +74,11 @@ pub struct ContextPanel {
     /// Pane id we last bound SFTP state to.
     bound_pane: Option<Uuid>,
     transfers: Vec<TransferRow>,
+    transfer_menu: Option<TransferMenu>,
+    /// Height share for the file list vs Transfers footer (0.35..=0.9).
+    list_ratio: f32,
+    files_body_bounds: Option<Bounds<Pixels>>,
+    files_sash_drag: bool,
     focus_handle: FocusHandle,
     _observe_store: Subscription,
     _observe_tabs: Subscription,
@@ -80,6 +102,11 @@ impl ContextPanel {
             this.sync_session(cx);
             cx.notify();
         });
+        let list_ratio = store
+            .read(cx)
+            .ui_state
+            .context_files_list_ratio
+            .clamp(0.35, 0.9);
         let mut panel = Self {
             store,
             tabs,
@@ -92,6 +119,10 @@ impl ContextPanel {
             error: None,
             bound_pane: None,
             transfers: Vec::new(),
+            transfer_menu: None,
+            list_ratio,
+            files_body_bounds: None,
+            files_sash_drag: false,
             focus_handle: cx.focus_handle(),
             _observe_store,
             _observe_tabs,
@@ -255,7 +286,11 @@ impl ContextPanel {
                 status: TransferStatus::Running {
                     done: 0,
                     total: if is_dir { None } else { Some(entry.size) },
+                    files_done: if is_dir { Some(0) } else { None },
+                    files_total: None,
                 },
+                local_path: None,
+                is_dir,
             },
         );
         cx.notify();
@@ -284,6 +319,14 @@ impl ContextPanel {
                 .ok();
                 return;
             };
+
+            this.update(cx, |this, cx| {
+                if let Some(row) = this.transfers.iter_mut().find(|t| t.id == id) {
+                    row.local_path = Some(local.clone());
+                }
+                cx.notify();
+            })
+            .ok();
 
             let (progress_tx, progress_rx) = flume::unbounded::<TransferProgress>();
             let (reply_tx, reply_rx) = flume::bounded(1);
@@ -321,7 +364,14 @@ impl ContextPanel {
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
                             match result {
-                                Ok(Ok(())) => this.finish_transfer(id),
+                                Ok(Ok(outcome)) => {
+                                    let files = if is_dir {
+                                        Some(outcome.files)
+                                    } else {
+                                        None
+                                    };
+                                    this.finish_transfer(id, files);
+                                }
                                 Ok(Err(err)) => this.fail_transfer(id, format!("{err:#}")),
                                 Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
                             }
@@ -372,7 +422,11 @@ impl ContextPanel {
                         status: TransferStatus::Running {
                             done: 0,
                             total: None,
+                            files_done: None,
+                            files_total: None,
                         },
+                        local_path: Some(local.clone()),
+                        is_dir: false,
                     },
                 );
                 cx.notify();
@@ -415,8 +469,8 @@ impl ContextPanel {
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
                             match result {
-                                Ok(Ok(())) => {
-                                    this.finish_transfer(id);
+                                Ok(Ok(_)) => {
+                                    this.finish_transfer(id, None);
                                     if let Some(cwd) = this.cwd.clone() {
                                         this.load_dir(cwd, cx);
                                     }
@@ -436,16 +490,31 @@ impl ContextPanel {
 
     fn update_transfer_progress(&mut self, p: TransferProgress) {
         if let Some(row) = self.transfers.iter_mut().find(|t| t.id == p.id) {
+            let (prev_files, prev_total) = match &row.status {
+                TransferStatus::Running {
+                    files_done,
+                    files_total,
+                    ..
+                } => (*files_done, *files_total),
+                TransferStatus::Done { files } => (*files, *files),
+                TransferStatus::Failed(_) => (None, None),
+            };
             row.status = TransferStatus::Running {
                 done: p.done,
                 total: p.total,
+                files_done: p.files_done.or(prev_files),
+                files_total: p.files_total.or(prev_total),
             };
         }
     }
 
-    fn finish_transfer(&mut self, id: Uuid) {
+    fn finish_transfer(&mut self, id: Uuid, files: Option<u32>) {
         if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
-            row.status = TransferStatus::Done;
+            let files = files.or_else(|| match &row.status {
+                TransferStatus::Running { files_done, .. } if row.is_dir => *files_done,
+                _ => None,
+            });
+            row.status = TransferStatus::Done { files };
         }
     }
 
@@ -453,6 +522,30 @@ impl ContextPanel {
         if let Some(row) = self.transfers.iter_mut().find(|t| t.id == id) {
             row.status = TransferStatus::Failed(msg);
         }
+    }
+
+    fn remove_transfer(&mut self, id: Uuid) {
+        self.transfers.retain(|t| t.id != id);
+        if self.transfer_menu.as_ref().is_some_and(|m| m.id == id) {
+            self.transfer_menu = None;
+        }
+    }
+
+    fn clear_transfers(&mut self) {
+        self.transfers.clear();
+        self.transfer_menu = None;
+    }
+
+    fn reveal_transfer(&self, id: Uuid) {
+        let Some(path) = self
+            .transfers
+            .iter()
+            .find(|t| t.id == id)
+            .and_then(|t| t.local_path.as_ref())
+        else {
+            return;
+        };
+        let _ = platform::reveal_in_file_manager(path);
     }
 
     fn tab_btn(
@@ -622,10 +715,45 @@ impl ContextPanel {
                         .child("Loading…"),
                 )
             })
+            .child(self.render_files_split(entries, selected, cx))
+            .into_any_element()
+    }
+
+    /// File list + Transfers with a draggable vertical sash.
+    fn render_files_split(
+        &self,
+        entries: Vec<RemoteEntry>,
+        selected: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let list_ratio = self.list_ratio.clamp(0.35, 0.9);
+        let view = cx.entity();
+
+        div()
+            .id("ctx-files-body")
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        view.update(cx, |this, _| {
+                            this.files_body_bounds = Some(bounds);
+                        });
+                        bounds
+                    },
+                    |_bounds, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .child(
                 div()
                     .id("ctx-file-list")
-                    .flex_1()
+                    .h(relative(list_ratio))
+                    .w_full()
                     .min_h_0()
                     .overflow_y_scroll()
                     .border_1()
@@ -676,25 +804,69 @@ impl ContextPanel {
                             }))
                     })),
             )
-            .child(self.render_transfers())
-            .into_any_element()
+            .child(
+                div()
+                    .id("ctx-files-sash")
+                    .h(px(4.0))
+                    .w_full()
+                    .flex_shrink_0()
+                    .cursor(CursorStyle::ResizeRow)
+                    .bg(theme::BORDER)
+                    .hover(|s| s.bg(theme::ACCENT))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.files_sash_drag = true;
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(self.render_transfers(1.0 - list_ratio, cx))
     }
 
-    fn render_transfers(&self) -> impl IntoElement {
+    fn render_transfers(&self, height_ratio: f32, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_transfers = !self.transfers.is_empty();
         div()
+            .id("ctx-transfers")
+            .h(relative(height_ratio.clamp(0.1, 0.65)))
+            .w_full()
             .flex()
             .flex_col()
-            .max_h(px(120.0))
-            .border_t_1()
-            .border_color(theme::BORDER_SUBTLE)
+            .min_h_0()
+            .overflow_y_scroll()
             .pt(px(theme::SPACE_1))
             .gap(px(2.0))
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::TEXT_MUTED)
-                    .child("Transfers"),
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::TEXT_MUTED)
+                            .child("Transfers"),
+                    )
+                    .when(has_transfers, |d| {
+                        d.child(
+                            div()
+                                .id("ctx-transfers-clear")
+                                .px(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                .child("Clear")
+                                .tooltip(|_, cx| Tooltip::text("Clear all transfers", cx))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_transfers();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .when(self.transfers.is_empty(), |d| {
                 d.child(
@@ -704,38 +876,38 @@ impl ContextPanel {
                         .child("No transfers yet"),
                 )
             })
-            .children(self.transfers.iter().take(6).map(|row| {
+            .children(self.transfers.iter().map(|row| {
+                let id = row.id;
                 let arrow = match row.direction {
                     TransferDir::Download => "↓",
                     TransferDir::Upload => "↑",
                 };
-                let status = match &row.status {
-                    TransferStatus::Running { done, total } => match total {
-                        Some(t) if *t > 0 => {
-                            format!("{}%", ((*done as f64 / *t as f64) * 100.0) as u32)
-                        }
-                        _ => format_size(*done),
-                    },
-                    TransferStatus::Done => "Done".into(),
-                    TransferStatus::Failed(msg) => {
-                        let short = if msg.len() > 24 {
-                            format!("{}…", &msg[..24])
-                        } else {
-                            msg.clone()
-                        };
-                        short
-                    }
-                };
+                let status = transfer_status_label(row);
                 let color = match &row.status {
                     TransferStatus::Failed(_) => theme::DANGER,
-                    TransferStatus::Done => theme::ICON_LOCAL,
+                    TransferStatus::Done { .. } => theme::ICON_LOCAL,
                     _ => theme::TEXT_MUTED,
                 };
                 div()
+                    .id(SharedString::from(format!("xfer-{id}")))
                     .flex()
                     .items_center()
                     .gap(px(theme::SPACE_1))
+                    .px(px(2.0))
+                    .rounded(px(theme::RADIUS_SM))
                     .text_xs()
+                    .hover(|s| s.bg(theme::HOVER))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.transfer_menu = Some(TransferMenu {
+                                id,
+                                position: event.position,
+                            });
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(div().text_color(theme::TEXT_MUTED).child(arrow))
                     .child(
                         div()
@@ -746,6 +918,110 @@ impl ContextPanel {
                             .child(row.label.clone()),
                     )
                     .child(div().text_color(color).child(status))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("xfer-rm-{id}")))
+                            .px(px(4.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                            .child("×")
+                            .tooltip(|_, cx| Tooltip::text("Remove", cx))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_transfer(id);
+                                cx.notify();
+                            })),
+                    )
+            }))
+    }
+
+    fn render_transfer_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.transfer_menu.as_ref()?;
+        let id = menu.id;
+        let position = menu.position;
+        let row = self.transfers.iter().find(|t| t.id == id)?;
+        let can_reveal = row
+            .local_path
+            .as_ref()
+            .is_some_and(|p| p.exists());
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(Edges {
+                        top: px(4.0),
+                        right: px(4.0),
+                        bottom: px(4.0),
+                        left: px(4.0),
+                    })
+                    .child(
+                        div()
+                            .min_w(px(180.0))
+                            .p(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .shadow_md()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "xfer-ctx-reveal",
+                                "Reveal in File Explorer",
+                                can_reveal,
+                                cx,
+                                move |this, _cx| {
+                                    this.reveal_transfer(id);
+                                },
+                            ))
+                            .child(self.transfer_menu_item(
+                                "xfer-ctx-remove",
+                                "Remove",
+                                true,
+                                cx,
+                                move |this, cx| {
+                                    this.remove_transfer(id);
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn transfer_menu_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w_full()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
+            .text_sm()
+            .when(enabled, |d| {
+                d.text_color(theme::TEXT)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme::HOVER))
+            })
+            .when(!enabled, |d| d.text_color(theme::TEXT_DISABLED))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !enabled {
+                    return;
+                }
+                on_click(this, cx);
+                this.transfer_menu = None;
+                cx.notify();
             }))
     }
 
@@ -859,6 +1135,42 @@ fn format_size(n: u64) -> String {
     }
 }
 
+fn transfer_status_label(row: &TransferRow) -> String {
+    match &row.status {
+        TransferStatus::Running {
+            done,
+            total,
+            files_done,
+            files_total,
+        } => {
+            if row.is_dir || files_total.is_some() || files_done.is_some() {
+                let d = files_done.unwrap_or(0);
+                return match files_total {
+                    Some(t) => format!("{d}/{t}"),
+                    None => format!("{d}/…"),
+                };
+            }
+            match total {
+                Some(t) if *t > 0 => {
+                    format!("{}%", ((*done as f64 / *t as f64) * 100.0) as u32)
+                }
+                _ => format_size(*done),
+            }
+        }
+        TransferStatus::Done { files } => match files {
+            Some(n) => format!("Done · {n}/{n}"),
+            None => "Done".into(),
+        },
+        TransferStatus::Failed(msg) => {
+            if msg.len() > 24 {
+                format!("{}…", &msg[..24])
+            } else {
+                msg.clone()
+            }
+        }
+    }
+}
+
 impl Focusable for ContextPanel {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -869,6 +1181,7 @@ impl Render for ContextPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep Files browser in sync when the focused pane changes.
         self.sync_session(cx);
+        let transfer_menu = self.render_transfer_menu(cx);
 
         div()
             .flex()
@@ -878,6 +1191,53 @@ impl Render for ContextPanel {
             .border_l_1()
             .border_color(theme::BORDER)
             .track_focus(&self.focus_handle)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.transfer_menu.is_some() {
+                        this.transfer_menu = None;
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key.as_str() == "escape" && this.transfer_menu.is_some() {
+                    this.transfer_menu = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if !this.files_sash_drag {
+                        return;
+                    }
+                    this.files_sash_drag = false;
+                    let ratio = this.list_ratio.clamp(0.35, 0.9);
+                    this.list_ratio = ratio;
+                    this.store.update(cx, |s, _| {
+                        s.ui_state.context_files_list_ratio = ratio;
+                        s.persist_now();
+                    });
+                    cx.notify();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !this.files_sash_drag {
+                    return;
+                }
+                let Some(bounds) = this.files_body_bounds else {
+                    return;
+                };
+                let h: f32 = bounds.size.height.into();
+                if h <= 0.0 {
+                    return;
+                }
+                let y: f32 = (event.position.y - bounds.origin.y).into();
+                this.list_ratio = (y / h).clamp(0.35, 0.9);
+                cx.notify();
+            }))
             .child(
                 div()
                     .flex()
@@ -925,6 +1285,7 @@ impl Render for ContextPanel {
                         PanelTab::Info => self.render_info(cx),
                     }),
             )
+            .when_some(transfer_menu, |d, menu| d.child(menu))
     }
 }
 

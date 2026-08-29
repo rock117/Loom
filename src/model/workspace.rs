@@ -109,6 +109,9 @@ pub struct UiStateFile {
     /// When false, the context panel is hidden.
     #[serde(default = "default_context_panel_visible")]
     pub context_panel_visible: bool,
+    /// Share of Files tab height for the file list (rest is Transfers).
+    #[serde(default = "default_context_files_list_ratio")]
+    pub context_files_list_ratio: f32,
     pub font_size: f32,
     pub open_tabs: Vec<OpenTabRef>,
     pub active_tab_index: usize,
@@ -126,6 +129,10 @@ fn default_context_panel_visible() -> bool {
     false
 }
 
+fn default_context_files_list_ratio() -> f32 {
+    0.72
+}
+
 impl Default for UiStateFile {
     fn default() -> Self {
         Self {
@@ -134,6 +141,7 @@ impl Default for UiStateFile {
             sidebar_visible: true,
             context_panel_width: 280.0,
             context_panel_visible: false,
+            context_files_list_ratio: 0.72,
             font_size: 14.0,
             open_tabs: Vec::new(),
             active_tab_index: 0,
