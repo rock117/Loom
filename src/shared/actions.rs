@@ -17,8 +17,6 @@ actions!(
         RenameFocused,
         /// Persist workspace and UI state immediately.
         SaveWorkspace,
-        /// Focus the sidebar search field.
-        FocusSearch,
         /// Increase terminal font size.
         ZoomIn,
         /// Decrease terminal font size.

@@ -69,7 +69,6 @@ Passwords and key passphrases are kept in memory only and are never written to d
 | `Ctrl+E` | Export workspace |
 | `Ctrl+Shift+I` | Import workspace |
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Font size |
-| `Ctrl+F` | Focus sidebar search |
 
 ## Project layout
 

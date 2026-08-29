@@ -23,10 +23,12 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| T1 | **Scrollback + output search** | History buffer; Ctrl+F (or similar) over grid/output. |
+| T1 | **Output search** | Ctrl+F (or similar) over scrollback/grid. (Wheel + scrollbar scrollback already shipped.) |
 | T2 | **Selection polish** | Double-click word, triple-click line, optional block select. |
 | T3 | **Link detection** | Clickable paths / URLs in output. |
 | T4 | **Notifications** | Long-running command done, bell, disconnect toasts. |
+| T5 | **Output syntax color via external tools** | Prefer `bat` / highlighters that emit ANSI; do **not** build in-app language highlighters for PTY output. Optional: docs or settings hints. Low priority. |
+| T6 | **Directory listing icons via external tools** | Prefer `eza` / `lsd` (+ Nerd Font); Loom only needs solid Unicode/Nerd Font rendering. Do **not** intercept `ls`. Low priority. |
 
 ## Appearance
 
@@ -47,7 +49,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| E1 | **Plugin mechanism** | Do **after** core (SSH, scrollback/search, themes) is stable. |
+| E1 | **Plugin mechanism** | Do **after** core (SSH, scrollback search, themes) is stable. |
 
 ### Plugin scope (when E1 is ordered)
 

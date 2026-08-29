@@ -18,7 +18,6 @@ pub struct WorkspaceStore {
     pub ui_state: UiStateFile,
     pub settings: SettingsFile,
     pub selection: Selection,
-    pub search: String,
     pub rename_buffer: Option<String>,
     dirty: bool,
 }
@@ -33,7 +32,6 @@ impl WorkspaceStore {
             ui_state,
             settings,
             selection: Selection::None,
-            search: String::new(),
             rename_buffer: None,
             dirty: false,
         }
@@ -60,11 +58,6 @@ impl WorkspaceStore {
         if self.dirty {
             self.persist_now();
         }
-    }
-
-    pub fn set_search(&mut self, q: String, cx: &mut Context<Self>) {
-        self.search = q;
-        cx.notify();
     }
 
     pub fn select_group(&mut self, id: Uuid, cx: &mut Context<Self>) {
@@ -251,31 +244,11 @@ impl WorkspaceStore {
         cx.notify();
     }
 
-    pub fn filtered_groups(&self) -> Vec<(Uuid, String, bool, Vec<Profile>)> {
-        let q = self.search.trim().to_lowercase();
+    pub fn sidebar_groups(&self) -> Vec<(Uuid, String, bool, Vec<Profile>)> {
         self.workspace
             .groups
             .iter()
-            .filter_map(|g| {
-                let profiles: Vec<Profile> = g
-                    .profiles
-                    .iter()
-                    .filter(|p| {
-                        if q.is_empty() {
-                            return true;
-                        }
-                        p.name.to_lowercase().contains(&q)
-                            || p.kind.search_haystack().to_lowercase().contains(&q)
-                    })
-                    .cloned()
-                    .collect();
-                if q.is_empty() || !profiles.is_empty() || g.name.to_lowercase().contains(&q) {
-                    let collapsed = if !q.is_empty() { false } else { g.collapsed };
-                    Some((g.id, g.name.clone(), collapsed, profiles))
-                } else {
-                    None
-                }
-            })
+            .map(|g| (g.id, g.name.clone(), g.collapsed, g.profiles.clone()))
             .collect()
     }
 

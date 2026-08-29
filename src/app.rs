@@ -15,7 +15,6 @@ pub fn run() {
             KeyBinding::new("ctrl-shift-d", DuplicateTab, Some("Loom")),
             KeyBinding::new("f2", RenameFocused, Some("Loom")),
             KeyBinding::new("ctrl-s", SaveWorkspace, Some("Loom")),
-            KeyBinding::new("ctrl-f", FocusSearch, Some("Loom")),
             KeyBinding::new("ctrl-,", ToggleSettings, Some("Loom")),
             KeyBinding::new("ctrl-e", ExportWorkspace, Some("Loom")),
             KeyBinding::new("ctrl-shift-i", ImportWorkspace, Some("Loom")),

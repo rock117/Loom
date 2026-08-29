@@ -10,7 +10,6 @@ use crate::ui::workspace_store::{Selection, WorkspaceStore};
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
-    search_focused: bool,
     /// Right-click context menu for a profile (Zed-style; actions not always-visible).
     context_menu: Option<ContextMenuState>,
     _observe_store: Subscription,
@@ -28,17 +27,9 @@ impl Sidebar {
         Self {
             store,
             focus_handle: cx.focus_handle(),
-            search_focused: false,
             context_menu: None,
             _observe_store,
         }
-    }
-
-    pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.search_focused = true;
-        self.context_menu = None;
-        self.focus_handle.focus(window);
-        cx.notify();
     }
 
     fn ghost_icon(
@@ -112,10 +103,9 @@ impl Focusable for Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
-        let search = store.search.clone();
         let renaming = store.rename_buffer.clone();
         let selection = store.selection;
-        let groups = store.filtered_groups();
+        let groups = store.sidebar_groups();
         let other_groups: Vec<(Uuid, String)> = store
             .workspace
             .groups
@@ -171,74 +161,6 @@ impl Render for Sidebar {
                                 cx.emit(SidebarEvent::OpenSettings);
                             })),
                     ),
-            )
-            // Filter — understated, no heavy chrome
-            .child(
-                div()
-                    .id("sidebar-search")
-                    .mx(px(theme::SPACE_2))
-                    .mb(px(theme::SPACE_1))
-                    .px(px(theme::SPACE_2))
-                    .py(px(theme::SPACE_1))
-                    .rounded(px(theme::RADIUS_SM))
-                    .bg(if self.search_focused {
-                        theme::ELEVATED
-                    } else {
-                        theme::SIDEBAR_BG
-                    })
-                    .border_1()
-                    .border_color(if self.search_focused {
-                        theme::BORDER
-                    } else {
-                        theme::BORDER_SUBTLE
-                    })
-                    .text_xs()
-                    .text_color(if search.is_empty() && !self.search_focused {
-                        theme::TEXT_DISABLED
-                    } else {
-                        theme::TEXT
-                    })
-                    .child(if search.is_empty() && !self.search_focused {
-                        SharedString::from("Filter…")
-                    } else {
-                        SharedString::from(search.clone())
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.search_focused = true;
-                        this.context_menu = None;
-                        this.focus_handle.focus(window);
-                        cx.notify();
-                    }))
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                        if !this.search_focused {
-                            return;
-                        }
-                        let key = &event.keystroke.key;
-                        if key == "backspace" {
-                            this.store.update(cx, |s, cx| {
-                                let mut q = s.search.clone();
-                                q.pop();
-                                s.set_search(q, cx);
-                            });
-                            cx.stop_propagation();
-                        } else if key == "escape" {
-                            this.search_focused = false;
-                            this.store.update(cx, |s, cx| s.set_search(String::new(), cx));
-                            cx.notify();
-                            cx.stop_propagation();
-                        } else if event.keystroke.modifiers.control {
-                            // let global shortcuts through
-                        } else if let Some(ch) = key.chars().next() {
-                            if key.len() == 1 && !ch.is_control() {
-                                this.store.update(cx, |s, cx| {
-                                    let mut q = s.search.clone();
-                                    q.push(ch);
-                                    s.set_search(q, cx);
-                                });
-                                cx.stop_propagation();
-                            }
-                        }
-                    })),
             )
             // Tree
             .child(
@@ -493,13 +415,6 @@ impl Render for Sidebar {
                         cx.stop_propagation();
                         return;
                     }
-                    if this.search_focused {
-                        this.search_focused = false;
-                        this.store.update(cx, |s, cx| s.set_search(String::new(), cx));
-                        cx.notify();
-                        cx.stop_propagation();
-                        return;
-                    }
                 }
 
                 if renaming {
@@ -518,10 +433,6 @@ impl Render for Sidebar {
                             cx.stop_propagation();
                         }
                     }
-                    return;
-                }
-
-                if this.search_focused {
                     return;
                 }
 

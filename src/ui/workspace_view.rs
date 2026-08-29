@@ -304,9 +304,6 @@ impl Render for WorkspaceView {
                 this.status_message = Some("Workspace saved".into());
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                this.sidebar.update(cx, |s, cx| s.focus_search(window, cx));
-            }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
                 this.show_settings = !this.show_settings;
                 cx.notify();

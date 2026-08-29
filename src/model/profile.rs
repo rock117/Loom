@@ -52,21 +52,6 @@ impl ProfileKind {
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local { .. })
     }
-
-    pub fn search_haystack(&self) -> String {
-        match self {
-            Self::Local { shell, cwd, .. } => {
-                format!(
-                    "{} {}",
-                    shell.as_deref().unwrap_or(""),
-                    cwd.as_ref()
-                        .map(|c| c.display().to_string())
-                        .unwrap_or_default()
-                )
-            }
-            Self::Ssh { host, user, .. } => format!("{user} {host}"),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
