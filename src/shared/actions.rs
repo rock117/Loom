@@ -13,7 +13,7 @@ actions!(
         PrevTab,
         /// Duplicate the active tab session.
         DuplicateTab,
-        /// Rename the focused profile, group, or tab.
+        /// Rename the selected sidebar profile or group (F2 in Renamable context).
         RenameFocused,
         /// Persist workspace and UI state immediately.
         SaveWorkspace,

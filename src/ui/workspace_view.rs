@@ -706,6 +706,7 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &RenameFocused, window, cx| {
+                // Binding is `Renamable` (profile/group selected + sidebar focused).
                 match this.store.read(cx).selection {
                     Selection::Profile(_) | Selection::Group(_) => {
                         this.sidebar.update(cx, |s, cx| {
@@ -713,16 +714,7 @@ impl Render for WorkspaceView {
                         });
                         this.sidebar.read(cx).focus_handle(cx).focus(window);
                     }
-                    Selection::None => {
-                        if let Some(title) =
-                            this.tabs.update(cx, |m, cx| m.begin_rename_active(cx))
-                        {
-                            this.tabs.update(cx, |m, cx| {
-                                m.apply_rename_active(format!("{title}*"), cx);
-                            });
-                            this.persist_tabs(cx);
-                        }
-                    }
+                    Selection::None => {}
                 }
             }))
             .on_mouse_up(

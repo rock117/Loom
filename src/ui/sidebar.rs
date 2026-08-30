@@ -388,7 +388,18 @@ impl Render for Sidebar {
             .as_ref()
             .map(|m| (m.target, m.position));
 
+        // F2 is bound to `Renamable` only — present when a profile/group is selected.
+        let key_ctx = if matches!(
+            selection,
+            Selection::Profile(_) | Selection::Group(_)
+        ) {
+            "Sidebar Renamable"
+        } else {
+            "Sidebar"
+        };
+
         div()
+            .key_context(key_ctx)
             .track_focus(&self.focus_handle)
             .relative()
             .flex()
@@ -529,11 +540,12 @@ impl Render for Sidebar {
                                                 .into_any_element()
                                         }
                                     })
-                                    .on_click(cx.listener(move |this, _event: &ClickEvent, _, cx| {
+                                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                                         this.context_menu = None;
                                         if this.store.read(cx).rename.is_some() {
                                             return;
                                         }
+                                        this.focus_handle.focus(window);
                                         this.store.update(cx, |s, cx| {
                                             s.select_group(gid, cx);
                                             s.toggle_group(gid, cx);
@@ -541,7 +553,8 @@ impl Render for Sidebar {
                                     }))
                                     .on_mouse_down(
                                         MouseButton::Right,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                            this.focus_handle.focus(window);
                                             this.store.update(cx, |s, cx| {
                                                 s.select_group(gid, cx);
                                             });
@@ -632,8 +645,9 @@ impl Render for Sidebar {
                                         .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
                                         .child(name_el)
                                         .on_click(cx.listener(
-                                            move |this, event: &ClickEvent, _window, cx| {
+                                            move |this, event: &ClickEvent, window, cx| {
                                                 this.context_menu = None;
+                                                this.focus_handle.focus(window);
                                                 this.store.update(cx, |s, cx| {
                                                     s.select_profile(pid, cx)
                                                 });
@@ -645,7 +659,8 @@ impl Render for Sidebar {
                                         .on_mouse_down(
                                             MouseButton::Right,
                                             cx.listener(
-                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                move |this, event: &MouseDownEvent, window, cx| {
+                                                    this.focus_handle.focus(window);
                                                     this.store.update(cx, |s, cx| {
                                                         s.select_profile(pid, cx)
                                                     });

@@ -14,7 +14,7 @@ pub fn run() {
             KeyBinding::new("ctrl-tab", NextTab, Some("Loom")),
             KeyBinding::new("ctrl-shift-tab", PrevTab, Some("Loom")),
             KeyBinding::new("ctrl-shift-d", DuplicateTab, Some("Loom")),
-            KeyBinding::new("f2", RenameFocused, Some("Loom")),
+            KeyBinding::new("f2", RenameFocused, Some("Renamable")),
             KeyBinding::new("ctrl-s", SaveWorkspace, Some("Loom")),
             KeyBinding::new("ctrl-,", ToggleSettings, Some("Loom")),
             KeyBinding::new("ctrl-b", ToggleSidebar, Some("Loom")),
