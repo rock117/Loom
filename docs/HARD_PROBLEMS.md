@@ -131,3 +131,17 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **Code:** `src/terminal/gpui_emu/view/mod.rs` (`line_number_gutter_width`, canvas paint).
 
 ---
+
+### 2026-08-30 — 终端 IME（中文）与接入后回车失效
+
+**现象：**（1）中文输入法组字确认后，汉字进不了 PTY。（2）接上 GPUI `InputHandler` 后，中英文按 Enter 都没反应。
+
+**原因归类：** 输入要拆成两条管道。可打印 / CJK 走 `Window::handle_input`（IME / `WM_CHAR`）；Enter 必须走 KeyDown——Windows 的 `WM_CHAR` 会丢掉控制字符（`\r`）。用「凡有 `key_char` 就交给 IME」会误伤 Enter。
+
+**有效做法：** 双管道——`keystroke_to_bytes` 只返回 Escape/控制序列；`EntityInputHandler` 提交可打印与 IME 文本；仅在 KeyDown 真正写入序列时 `stop_propagation`。
+
+**完整过程（失败尝试 + 规则）：** [TERMINAL_IME.md](./TERMINAL_IME.md)。
+
+**代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/terminal/gpui_emu/input.rs`。
+
+---

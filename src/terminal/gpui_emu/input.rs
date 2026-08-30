@@ -121,11 +121,28 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
             if keystroke.modifiers.control {
                 return Some(b"\x00".to_vec()); // Ctrl+Space = NUL
             }
-            return Some(b" ".to_vec());
+            // Plain space is printable — delivered via IME / WM_CHAR (Zed model).
+            return None;
         }
-        "enter" => return Some(b"\r".to_vec()),
+        "enter" => {
+            if keystroke.modifiers.alt {
+                return Some(b"\x1b\r".to_vec());
+            }
+            if keystroke.modifiers.shift {
+                return Some(b"\n".to_vec());
+            }
+            return Some(b"\r".to_vec());
+        }
         "escape" => return Some(b"\x1b".to_vec()),
-        "backspace" => return Some(b"\x7f".to_vec()),
+        "backspace" => {
+            if keystroke.modifiers.control {
+                return Some(b"\x08".to_vec());
+            }
+            if keystroke.modifiers.alt {
+                return Some(b"\x1b\x7f".to_vec());
+            }
+            return Some(b"\x7f".to_vec());
+        }
         "tab" => {
             // Shift+Tab sends a different sequence
             if keystroke.modifiers.shift {
@@ -231,35 +248,8 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         }
     }
 
-    // Handle regular printable characters
-    // Use key_char if available (contains the actual typed character with modifiers like Shift)
-    if let Some(key_char) = &keystroke.key_char
-        && !keystroke.modifiers.control
-        && !keystroke.modifiers.alt
-    {
-        return Some(key_char.as_bytes().to_vec());
-    }
-
-    // Fallback to key for single characters
-    let key = keystroke.key.as_str();
-    if key.len() == 1 {
-        let ch = key.chars().next().unwrap();
-        if ch.is_ascii() && !keystroke.modifiers.control {
-            // Handle shift modifier for uppercase
-            let ch = if keystroke.modifiers.shift {
-                ch.to_ascii_uppercase()
-            } else {
-                ch
-            };
-            return Some(vec![ch as u8]);
-        }
-        // For non-ASCII characters, encode as UTF-8
-        if !keystroke.modifiers.control && !keystroke.modifiers.alt {
-            return Some(key.as_bytes().to_vec());
-        }
-    }
-
-    // If we get here, the keystroke doesn't produce any output
+    // Plain printable / IME text: None — like Zed `to_esc_str`. Delivered via
+    // Window InputHandler (WM_CHAR / WM_IME_COMPOSITION), not KeyDown.
     None
 }
 
@@ -414,24 +404,25 @@ mod tests {
     }
 
     #[test]
-    fn test_regular_characters() {
+    fn test_regular_characters_go_via_ime_path() {
         let mode = TermMode::empty();
 
+        // Printable keys are not mapped on KeyDown (Zed / IME model).
         let a = Keystroke::parse("a").unwrap();
-        assert_eq!(keystroke_to_bytes(&a, mode), Some(b"a".to_vec()));
+        assert_eq!(keystroke_to_bytes(&a, mode), None);
 
         let z = Keystroke::parse("z").unwrap();
-        assert_eq!(keystroke_to_bytes(&z, mode), Some(b"z".to_vec()));
+        assert_eq!(keystroke_to_bytes(&z, mode), None);
 
         let zero = Keystroke::parse("0").unwrap();
-        assert_eq!(keystroke_to_bytes(&zero, mode), Some(b"0".to_vec()));
+        assert_eq!(keystroke_to_bytes(&zero, mode), None);
     }
 
     #[test]
-    fn test_space_key() {
+    fn test_space_key_goes_via_ime_path() {
         let mode = TermMode::empty();
 
         let space = Keystroke::parse("space").unwrap();
-        assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+        assert_eq!(keystroke_to_bytes(&space, mode), None);
     }
 }

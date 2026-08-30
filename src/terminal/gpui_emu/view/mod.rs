@@ -454,6 +454,10 @@ pub struct TerminalView {
 
     /// Local shell PID for Zed-style cwd refresh; `None` for SSH.
     shell_pid: Option<u32>,
+
+    /// IME marked (composing) text as UTF-16 length range into a virtual buffer.
+    /// When `Some`, Windows routes keys through TranslateMessage / IME composition.
+    ime_marked: Option<(String, std::ops::Range<usize>)>,
 }
 
 struct ScrollbarDrag {
@@ -617,6 +621,7 @@ impl TerminalView {
             context_menu: None,
             working_directory: None,
             shell_pid: None,
+            ime_marked: None,
         }
     }
 
@@ -868,15 +873,24 @@ impl TerminalView {
 
         // Scrollback navigation (Zed / Windows Terminal style).
         if self.handle_scroll_key(&event.keystroke, cx) {
+            cx.stop_propagation();
             return;
         }
 
+        // Zed model: KeyDown only handles escape/control sequences. Printable
+        // text (and IME commit) comes from InputHandler. When handled, stop
+        // propagation so Windows does not also TranslateMessage (avoids dupes).
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            // Enter/Esc end any stuck IME mark so the next KeyDown is delivered.
+            if matches!(key, "enter" | "escape") {
+                self.ime_marked = None;
+            }
             self.state.with_term_mut(|term| {
                 term.selection = None;
                 term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             });
             self.write_to_pty(&bytes);
+            cx.stop_propagation();
             cx.notify();
         }
     }
@@ -1376,6 +1390,56 @@ impl TerminalView {
         let _ = writer.flush();
     }
 
+    fn utf16_len(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
+    /// Commit text from IME / WM_CHAR (not bracketed paste).
+    fn insert_composed_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            self.ime_marked = None;
+            return;
+        }
+        self.state.with_term_mut(|term| {
+            term.selection = None;
+            term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        });
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        self.write_to_pty(normalized.as_bytes());
+        self.ime_marked = None;
+        cx.notify();
+    }
+
+    /// Cursor cell bounds in window coordinates (for IME candidate window).
+    fn cursor_bounds_window(&self) -> Option<Bounds<Pixels>> {
+        use alacritty_terminal::term::point_to_viewport;
+        let cell_w = self.renderer.cell_width;
+        let cell_h = self.renderer.cell_height;
+        if cell_w <= px(0.0) || cell_h <= px(0.0) {
+            return None;
+        }
+        let gutter = self.line_number_gutter_width();
+        let (col, row) = self.state.with_term(|term| {
+            let grid = term.grid();
+            let cursor = grid.cursor.point;
+            let display_offset = grid.display_offset();
+            let vp = point_to_viewport(display_offset, cursor)?;
+            Some((cursor.column.0, vp.line))
+        })?;
+        let origin_x = self.last_bounds.origin.x + self.config.padding.left + px(gutter);
+        let origin_y = self.last_bounds.origin.y + self.config.padding.top;
+        Some(Bounds {
+            origin: Point {
+                x: origin_x + cell_w * (col as f32),
+                y: origin_y + cell_h * (row as f32),
+            },
+            size: Size {
+                width: cell_w,
+                height: cell_h,
+            },
+        })
+    }
+
     /// Insert text into the PTY (uses bracketed paste when the shell enables it).
     pub fn paste_text(&mut self, text: &str) {
         use alacritty_terminal::grid::Scroll;
@@ -1546,6 +1610,103 @@ fn paint_line_number_gutter(
     }
 }
 
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted_range: &mut Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (text, _) = self.ime_marked.as_ref()?;
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let start = range.start.min(utf16.len());
+        let end = range.end.min(utf16.len());
+        *adjusted_range = Some(start..end);
+        String::from_utf16(&utf16[start..end]).ok()
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // Zed terminal: always report a caret at 0 when not in alt-screen; keeps
+        // IME candidate positioning stable and avoids a “stuck composing” empty range.
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        self.ime_marked.as_ref().and_then(|(text, range)| {
+            if text.is_empty() {
+                None
+            } else {
+                Some(range.clone())
+            }
+        })
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.ime_marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.insert_composed_text(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let len = Self::utf16_len(new_text);
+        let marked = new_selected_range.unwrap_or(0..len);
+        if new_text.is_empty() {
+            self.ime_marked = None;
+        } else {
+            self.ime_marked = Some((new_text.to_string(), marked));
+        }
+        // Preedit is not written to the PTY; candidacy UI is owned by the OS IME.
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: std::ops::Range<usize>,
+        _element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        self.cursor_bounds_window()
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
@@ -1580,6 +1741,14 @@ impl Render for TerminalView {
                     },
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
+
+                        // Register IME / text input handler while this terminal is focused.
+                        let focus = view_paint.read(cx).focus_handle.clone();
+                        window.handle_input(
+                            &focus,
+                            ElementInputHandler::new(bounds, view_paint.clone()),
+                            cx,
+                        );
 
                         let measured_renderer = view_paint.read(cx).renderer.clone();
                         let line_gutter = px(view_paint.read(cx).line_number_gutter_width());
