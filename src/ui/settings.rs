@@ -3,6 +3,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::session::local_proxy::{self, LocalProxyMode};
 use crate::shared::theme;
 use crate::ui::workspace_store::WorkspaceStore;
 
@@ -20,6 +21,8 @@ pub struct SettingsPanel {
     focus_handle: FocusHandle,
     editing_shell: bool,
     editing_font: bool,
+    editing_proxy_url: bool,
+    editing_no_proxy: bool,
     _observe_store: Subscription,
 }
 
@@ -31,6 +34,8 @@ impl SettingsPanel {
             focus_handle: cx.focus_handle(),
             editing_shell: false,
             editing_font: false,
+            editing_proxy_url: false,
+            editing_no_proxy: false,
             _observe_store,
         }
     }
@@ -135,16 +140,24 @@ impl Focusable for SettingsPanel {
 }
 
 impl Render for SettingsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.store.read(cx).settings.clone();
         let shell_value = settings.default_shell.clone();
         let shell_display = shell_value.clone().unwrap_or_default();
         let font_family = settings.font_family.clone();
         let font_size = settings.font_size;
         let show_line_numbers = settings.show_line_numbers;
+        let proxy_mode = settings.local_proxy_mode;
+        let proxy_url = settings.local_proxy_url.clone().unwrap_or_default();
+        let no_proxy = settings.local_proxy_no_proxy.clone().unwrap_or_default();
+        let detected = (proxy_mode == LocalProxyMode::Auto)
+            .then(|| local_proxy::detect_proxy().map(|p| p.url))
+            .flatten();
         let shell_is_custom = shell_value
             .as_ref()
             .is_some_and(|s| !matches!(s.as_str(), "pwsh" | "powershell" | "cmd"));
+        // Cap card height so short laptop viewports can still reach Workspace via scroll.
+        let card_max_h = window.viewport_size().height * 0.9;
 
         div()
             .id("settings-overlay")
@@ -162,6 +175,7 @@ impl Render for SettingsPanel {
                 div()
                     .id("settings-card")
                     .w(px(440.0))
+                    .max_h(card_max_h)
                     .p_5()
                     .rounded(px(theme::RADIUS))
                     .bg(theme::PANEL_BG)
@@ -169,7 +183,8 @@ impl Render for SettingsPanel {
                     .border_color(theme::BORDER)
                     .flex()
                     .flex_col()
-                    .gap_5()
+                    .gap_4()
+                    .overflow_hidden()
                     .track_focus(&self.focus_handle)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -237,6 +252,78 @@ impl Render for SettingsPanel {
                                     }
                                 }
                             }
+                        } else if this.editing_proxy_url {
+                            if key == "enter" {
+                                this.editing_proxy_url = false;
+                                this.store.update(cx, |s, _| s.persist_now());
+                                cx.notify();
+                                cx.stop_propagation();
+                            } else if key == "backspace" {
+                                this.store.update(cx, |s, cx| {
+                                    if let Some(url) = &mut s.settings.local_proxy_url {
+                                        url.pop();
+                                        if url.is_empty() {
+                                            s.settings.local_proxy_url = None;
+                                        }
+                                    }
+                                    s.mark_dirty();
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            } else if key.len() == 1 {
+                                if let Some(ch) = key.chars().next() {
+                                    if !ch.is_control() {
+                                        this.store.update(cx, |s, cx| {
+                                            let mut cur = s
+                                                .settings
+                                                .local_proxy_url
+                                                .clone()
+                                                .unwrap_or_default();
+                                            cur.push(ch);
+                                            s.settings.local_proxy_url = Some(cur);
+                                            s.mark_dirty();
+                                            cx.notify();
+                                        });
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            }
+                        } else if this.editing_no_proxy {
+                            if key == "enter" {
+                                this.editing_no_proxy = false;
+                                this.store.update(cx, |s, _| s.persist_now());
+                                cx.notify();
+                                cx.stop_propagation();
+                            } else if key == "backspace" {
+                                this.store.update(cx, |s, cx| {
+                                    if let Some(np) = &mut s.settings.local_proxy_no_proxy {
+                                        np.pop();
+                                        if np.is_empty() {
+                                            s.settings.local_proxy_no_proxy = None;
+                                        }
+                                    }
+                                    s.mark_dirty();
+                                    cx.notify();
+                                });
+                                cx.stop_propagation();
+                            } else if key.len() == 1 {
+                                if let Some(ch) = key.chars().next() {
+                                    if !ch.is_control() {
+                                        this.store.update(cx, |s, cx| {
+                                            let mut cur = s
+                                                .settings
+                                                .local_proxy_no_proxy
+                                                .clone()
+                                                .unwrap_or_default();
+                                            cur.push(ch);
+                                            s.settings.local_proxy_no_proxy = Some(cur);
+                                            s.mark_dirty();
+                                            cx.notify();
+                                        });
+                                        cx.stop_propagation();
+                                    }
+                                }
+                            }
                         }
                     }))
                     // Header
@@ -256,8 +343,17 @@ impl Render for SettingsPanel {
                                 cx.emit(SettingsEvent::Close);
                             })),
                     )
-                    // Terminal
                     .child(
+                        div()
+                            .id("settings-body")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            // Terminal
+                            .child(
                         div()
                             .flex()
                             .flex_col()
@@ -550,6 +646,178 @@ impl Render for SettingsPanel {
                                     ),
                             ),
                     )
+                    // Local proxy
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(Self::section_title("LOCAL PROXY"))
+                            .child(Self::field_label(
+                                "Injected into new Local shells only (not SSH)",
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .children(
+                                        [
+                                            LocalProxyMode::Off,
+                                            LocalProxyMode::Auto,
+                                            LocalProxyMode::Manual,
+                                        ]
+                                        .into_iter()
+                                        .map(|mode| {
+                                            let selected = proxy_mode == mode;
+                                            let label = mode.as_str().to_string();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "proxy-mode-{label}"
+                                                )))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(px(theme::RADIUS_SM))
+                                                .bg(if selected {
+                                                    theme::SELECTION
+                                                } else {
+                                                    theme::BG
+                                                })
+                                                .border_1()
+                                                .border_color(if selected {
+                                                    theme::ACCENT
+                                                } else {
+                                                    theme::BORDER
+                                                })
+                                                .text_xs()
+                                                .text_color(if selected {
+                                                    theme::TEXT
+                                                } else {
+                                                    theme::TEXT_MUTED
+                                                })
+                                                .cursor_pointer()
+                                                .child(label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.settings.local_proxy_mode = mode;
+                                                        s.mark_dirty();
+                                                        s.persist_now();
+                                                        cx.notify();
+                                                    });
+                                                    this.editing_proxy_url = false;
+                                                    cx.notify();
+                                                }))
+                                        }),
+                                    ),
+                            )
+                            .when(proxy_mode == LocalProxyMode::Auto, |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child(match &detected {
+                                            Some(url) => format!("Detected: {url}"),
+                                            None => "Detected: (none)".into(),
+                                        }),
+                                )
+                            })
+                            .when(proxy_mode == LocalProxyMode::Manual, |d| {
+                                d.child(Self::field_label("Proxy URL"))
+                                    .child(
+                                        div()
+                                            .id("settings-proxy-url")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(theme::BG)
+                                            .border_1()
+                                            .border_color(if self.editing_proxy_url {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::BORDER
+                                            })
+                                            .text_sm()
+                                            .text_color(if proxy_url.is_empty()
+                                                && !self.editing_proxy_url
+                                            {
+                                                theme::TEXT_DISABLED
+                                            } else {
+                                                theme::TEXT
+                                            })
+                                            .cursor_pointer()
+                                            .child(if self.editing_proxy_url {
+                                                format!("{proxy_url}|")
+                                            } else if proxy_url.is_empty() {
+                                                "e.g. http://127.0.0.1:7890".into()
+                                            } else {
+                                                proxy_url.clone()
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.editing_proxy_url = true;
+                                                this.editing_no_proxy = false;
+                                                this.editing_shell = false;
+                                                this.editing_font = false;
+                                                this.focus_handle.focus(window);
+                                                cx.notify();
+                                            })),
+                                    )
+                            })
+                            .when(
+                                matches!(
+                                    proxy_mode,
+                                    LocalProxyMode::Auto | LocalProxyMode::Manual
+                                ),
+                                |d| {
+                                    d.child(Self::field_label("No proxy (optional)"))
+                                        .child(
+                                            div()
+                                                .id("settings-no-proxy")
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(px(theme::RADIUS_SM))
+                                                .bg(theme::BG)
+                                                .border_1()
+                                                .border_color(if self.editing_no_proxy {
+                                                    theme::ACCENT
+                                                } else {
+                                                    theme::BORDER
+                                                })
+                                                .text_sm()
+                                                .text_color(if no_proxy.is_empty()
+                                                    && !self.editing_no_proxy
+                                                {
+                                                    theme::TEXT_DISABLED
+                                                } else {
+                                                    theme::TEXT
+                                                })
+                                                .cursor_pointer()
+                                                .child(if self.editing_no_proxy {
+                                                    format!("{no_proxy}|")
+                                                } else if no_proxy.is_empty() {
+                                                    "localhost,127.0.0.1".into()
+                                                } else {
+                                                    no_proxy
+                                                })
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.editing_no_proxy = true;
+                                                    this.editing_proxy_url = false;
+                                                    this.editing_shell = false;
+                                                    this.editing_font = false;
+                                                    this.focus_handle.focus(window);
+                                                    cx.notify();
+                                                })),
+                                        )
+                                },
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child(
+                                        "Applies to newly opened Local tabs (or Local Reconnect).",
+                                    ),
+                            ),
+                    )
                     // Workspace
                     .child(
                         div()
@@ -581,6 +849,7 @@ impl Render for SettingsPanel {
                                     .child(
                                         "Import replaces the current workspace after confirmation in the file dialog flow.",
                                     ),
+                            ),
                             ),
                     ),
             )

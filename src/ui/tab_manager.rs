@@ -95,12 +95,13 @@ impl TabManager {
         profile: &Profile,
         default_shell: Option<&str>,
         font_family: &str,
+        store: &Entity<WorkspaceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match &profile.kind {
             ProfileKind::Local { .. } => {
-                match self.spawn_local(profile, default_shell, font_family, window, cx) {
+                match self.spawn_local(profile, default_shell, font_family, store, window, cx) {
                     Ok(pane) => {
                         let title = self.unique_tab_title(&profile.name);
                         let tab = wrap_pane_as_tab(title, pane);
@@ -301,6 +302,7 @@ impl TabManager {
         profile: &Profile,
         default_shell: Option<&str>,
         font_family: &str,
+        store: &Entity<WorkspaceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<PaneSession> {
@@ -309,7 +311,21 @@ impl TabManager {
         };
         let configured = shell.as_deref().or(default_shell);
         let shell = resolve_shell(configured);
-        let pty = LocalPty::spawn(&shell, cwd.as_deref())?;
+        let (proxy_mode, proxy_url, proxy_no) = {
+            let s = store.read(cx);
+            (
+                s.settings.local_proxy_mode,
+                s.settings.local_proxy_url.clone(),
+                s.settings.local_proxy_no_proxy.clone(),
+            )
+        };
+        let pty = LocalPty::spawn(
+            &shell,
+            cwd.as_deref(),
+            proxy_mode,
+            proxy_url.as_deref(),
+            proxy_no.as_deref(),
+        )?;
         let master = pty.master.clone();
         let killer = pty.killer;
         let resize = LocalPty::resize_callback(master.clone());
@@ -394,6 +410,7 @@ impl TabManager {
                     &profile,
                     default_shell.as_deref(),
                     &font_family,
+                    store,
                     window,
                     cx,
                 ) {
@@ -579,6 +596,7 @@ impl TabManager {
                     &profile,
                     default_shell.as_deref(),
                     &font_family,
+                    store,
                     window,
                     cx,
                 ) {
@@ -951,6 +969,7 @@ impl TabManager {
                 &profile,
                 default_shell.as_deref(),
                 &font_family,
+                store,
                 window,
                 cx,
             );

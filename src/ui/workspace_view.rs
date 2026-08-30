@@ -300,11 +300,13 @@ impl WorkspaceView {
             return;
         }
 
+        let store = self.store.clone();
         self.tabs.update(cx, |m, cx| {
             m.open_profile(
                 &profile,
                 default_shell.as_deref(),
                 &font_family,
+                &store,
                 window,
                 cx,
             );

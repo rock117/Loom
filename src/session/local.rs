@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::platform;
+use crate::session::local_proxy::{self, LocalProxyMode};
 
 /// Spawn a local shell in a PTY and return reader/writer plus resize/teardown handles.
 pub struct LocalPty {
@@ -22,7 +23,13 @@ pub struct LocalPty {
 }
 
 impl LocalPty {
-    pub fn spawn(shell: &str, cwd: Option<&Path>) -> Result<Self> {
+    pub fn spawn(
+        shell: &str,
+        cwd: Option<&Path>,
+        proxy_mode: LocalProxyMode,
+        proxy_url: Option<&str>,
+        proxy_no_proxy: Option<&str>,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -38,6 +45,9 @@ impl LocalPty {
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Loom");
         configure_cwd_reporting(&mut cmd, shell);
+        for (k, v) in local_proxy::proxy_env_vars(proxy_mode, proxy_url, proxy_no_proxy) {
+            cmd.env(&k, &v);
+        }
 
         let resolved_cwd = cwd
             .map(Path::to_path_buf)

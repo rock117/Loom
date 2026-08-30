@@ -17,7 +17,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 | P1b | **Docker session** | Spec only — [DOCKER_SESSION.md](./DOCKER_SESSION.md). Enter container like SSH (`docker exec`); Files via `docker cp`. **Do not implement** until explicitly ordered. Phases: local exec → Files/cp → remote Docker over SSH. |
 | P1c | **SSH port forwarding** | Spec only — [PORT_FORWARD.md](./PORT_FORWARD.md). Local / Remote / SOCKS on the same russh session as shell+SFTP. **Enhancement, not core.** **Do not implement** until explicitly ordered. Phases: Local → Remote → SOCKS. |
 | P2 | **Session templates** | One action opens a defined set of tabs (e.g. API + DB + logs). |
-| P3 | **Profile env / startup** | Per-profile env vars, cwd, init command / script. |
+| P3 | **Profile env / startup** | Per-profile env vars, cwd, init command / script. Global Local proxy: [LOCAL_PROXY.md](./LOCAL_PROXY.md). |
 | P4 | **Tab layouts / splits** | **MVP shipped** — tab-bar columns popover (Split Right/Left/Up/Down), Zed-style binary tree, sash resize, Ctrl+W closes focused pane; chords kept as secondary. Still open: drag-rearrange panes, persist layouts. Popover paint/anchor lesson: `HARD_PROBLEMS.md`. |
 | P5 | **Command bookmarks / snippets** | Deferred — right panel prioritizes Files/SFTP + Info; see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md). Related shell entry: [LOOM_CLI.md](./LOOM_CLI.md) `loom snip`. |
 | P6 | **壳内 `loom …` 元命令与组合** | Spec — [LOOM_CLI.md](./LOOM_CLI.md). Intercept `loom split`/`new`/… in PTY; batch, host cmds, `&&`/`\|`. **Do not implement** until explicitly ordered. |

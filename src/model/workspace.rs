@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::profile::Profile;
+use crate::session::local_proxy::LocalProxyMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -158,6 +159,15 @@ pub struct SettingsFile {
     /// Left gutter with absolute scrollback line numbers (1 = oldest in buffer).
     #[serde(default = "default_show_line_numbers")]
     pub show_line_numbers: bool,
+    /// Off / Auto (env + OS) / Manual URL — Local shells only.
+    #[serde(default)]
+    pub local_proxy_mode: LocalProxyMode,
+    /// Used when [`local_proxy_mode`] is Manual.
+    #[serde(default)]
+    pub local_proxy_url: Option<String>,
+    /// Optional `NO_PROXY` when Auto or Manual.
+    #[serde(default)]
+    pub local_proxy_no_proxy: Option<String>,
 }
 
 fn default_show_line_numbers() -> bool {
@@ -172,6 +182,9 @@ impl Default for SettingsFile {
             font_family: crate::platform::monospace_font_family().into(),
             font_size: 14.0,
             show_line_numbers: true,
+            local_proxy_mode: LocalProxyMode::Off,
+            local_proxy_url: None,
+            local_proxy_no_proxy: None,
         }
     }
 }
