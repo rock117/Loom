@@ -505,6 +505,28 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.reconnect_inner(tab_id, store, None, Some(window), cx);
+    }
+
+    /// SSH password reconnect (no Window required — used after modal submit).
+    pub fn reconnect_with_password(
+        &mut self,
+        tab_id: Uuid,
+        password: String,
+        store: &Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconnect_inner(tab_id, store, Some(password), None, cx);
+    }
+
+    fn reconnect_inner(
+        &mut self,
+        tab_id: Uuid,
+        store: &Entity<WorkspaceStore>,
+        password: Option<String>,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
@@ -541,6 +563,14 @@ impl TabManager {
 
         match &profile.kind {
             ProfileKind::Local { .. } => {
+                let Some(window) = window else {
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = "reconnect requires window focus".into();
+                    }
+                    cx.notify();
+                    return;
+                };
                 if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
                     pane.state = ConnectionState::Connecting;
                     pane.status_message = "reconnecting…".into();
@@ -565,33 +595,75 @@ impl TabManager {
                 }
                 cx.notify();
             }
-            ProfileKind::Ssh { host, port, user, .. } => match resolve_ssh_auth(&profile, None) {
-                Ok(Some(auth)) => {
-                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                        pane.profile_id = profile.id;
-                        pane.state = ConnectionState::Connecting;
-                        pane.status_message =
-                            format!("connecting to {user}@{host}:{port}…");
+            ProfileKind::Ssh { host, port, user, .. } => {
+                match resolve_ssh_auth(&profile, password) {
+                    Ok(Some(auth)) => {
+                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                            pane.profile_id = profile.id;
+                            pane.state = ConnectionState::Connecting;
+                            pane.status_message =
+                                format!("connecting to {user}@{host}:{port}…");
+                        }
+                        cx.notify();
+                        self.spawn_ssh_connect(tab_id, focused, &profile, auth, &font_family, cx);
                     }
-                    cx.notify();
-                    self.spawn_ssh_connect(tab_id, focused, &profile, auth, &font_family, cx);
-                }
-                Ok(None) => {
-                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                        pane.state = ConnectionState::Failed;
-                        pane.status_message = "password required".into();
+                    Ok(None) => {
+                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                            pane.state = ConnectionState::Failed;
+                            pane.status_message = "password required".into();
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
-                }
-                Err(err) => {
-                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                        pane.state = ConnectionState::Failed;
-                        pane.status_message = format!("{err:#}");
+                    Err(err) => {
+                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+                            pane.state = ConnectionState::Failed;
+                            pane.status_message = format!("{err:#}");
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
                 }
-            },
+            }
         }
+    }
+
+    fn on_pane_session_ended(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        let Some(pane) = self
+            .tabs
+            .iter_mut()
+            .find_map(|t| t.panes.get_mut(&pane_id))
+        else {
+            return;
+        };
+        // Already reconnecting / failed — don't clobber a newer Connecting state.
+        if matches!(
+            pane.state,
+            ConnectionState::Connecting | ConnectionState::Failed | ConnectionState::Disconnected
+        ) {
+            // Still drop IO if a late Exit races with reconnect teardown.
+            if pane.ssh_sftp.is_some() || pane.ssh_shutdown.is_some() || pane.pty_master.is_some()
+            {
+                let master = pane.pty_master.take();
+                let killer = pane.pty_killer.take();
+                drop(pane.ssh_sftp.take());
+                if let Some(tx) = pane.ssh_shutdown.take() {
+                    let _ = tx.send(());
+                }
+                teardown_pty(killer, master);
+            }
+            cx.notify();
+            return;
+        }
+        pane.state = ConnectionState::Failed;
+        pane.status_message = "disconnected — use Reconnect in the status bar".into();
+        let master = pane.pty_master.take();
+        let killer = pane.pty_killer.take();
+        drop(pane.ssh_sftp.take());
+        if let Some(tx) = pane.ssh_shutdown.take() {
+            let _ = tx.send(());
+        }
+        teardown_pty(killer, master);
+        // Keep `terminal` so the last output and disconnect banner remain visible.
+        cx.notify();
     }
 
     pub fn close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -975,6 +1047,9 @@ fn wire_terminal_session(
             }
             TerminalViewEvent::CloseRequested => {
                 this.close_pane(pane_id, None, cx);
+            }
+            TerminalViewEvent::SessionEnded => {
+                this.on_pane_session_ended(pane_id, cx);
             }
         }
     });

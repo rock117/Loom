@@ -121,6 +121,8 @@ pub struct ContextPanel {
     /// Pane id we last bound file state to.
     bound_pane: Option<Uuid>,
     files_kind: Option<FilesKind>,
+    /// Whether the bound pane had a live SFTP handle (forces re-sync after disconnect/reconnect).
+    bound_sftp_alive: bool,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
     /// Transfers keyed by SSH pane id (not shared across servers/tabs).
@@ -178,6 +180,7 @@ impl ContextPanel {
             error: None,
             bound_pane: None,
             files_kind: None,
+            bound_sftp_alive: false,
             list_gen: 0,
             transfers_by_pane: HashMap::new(),
             transfer_menu: None,
@@ -303,20 +306,28 @@ impl ContextPanel {
         self.prune_closed_pane_transfers(cx);
         let Some((pane_id, kind, sftp)) = self.focused_files(cx) else {
             if self.bound_pane.take().is_some() || self.files_kind.take().is_some() {
+                self.bound_sftp_alive = false;
                 self.reset_files_state();
             }
             return;
         };
-        if self.bound_pane == Some(pane_id) && self.files_kind == Some(kind) {
+        let sftp_alive = sftp.is_some();
+        if self.bound_pane == Some(pane_id)
+            && self.files_kind == Some(kind)
+            && self.bound_sftp_alive == sftp_alive
+        {
             return;
         }
         self.bound_pane = Some(pane_id);
         self.files_kind = Some(kind);
+        self.bound_sftp_alive = sftp_alive;
         self.reset_files_state();
         match kind {
             FilesKind::Sftp => {
                 if let Some(sftp) = sftp {
                     self.go_home_sftp(sftp, cx);
+                } else {
+                    self.error = Some("SFTP unavailable".into());
                 }
             }
             FilesKind::Local => self.go_home_local(cx),

@@ -16,6 +16,8 @@ pub enum TerminalViewEvent {
     FocusRequested,
     /// Close the pane that owns this terminal (or its tab when it is the last pane).
     CloseRequested,
+    /// PTY / SSH channel ended — host should mark the pane failed and offer reconnect.
+    SessionEnded,
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}

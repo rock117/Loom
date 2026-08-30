@@ -32,6 +32,8 @@ pub struct WorkspaceView {
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
+    /// When set, password submit reconnects this tab instead of opening a new one.
+    pending_reconnect_tab: Option<uuid::Uuid>,
     sidebar_width: f32,
     sidebar_visible: bool,
     resizing_sidebar: bool,
@@ -84,6 +86,7 @@ impl WorkspaceView {
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
             password_prompt: None,
+            pending_reconnect_tab: None,
             sidebar_width,
             sidebar_visible,
             resizing_sidebar: false,
@@ -195,6 +198,7 @@ impl WorkspaceView {
                     };
                     if let Some(profile) = profile {
                         if TabManager::ssh_needs_password(&profile) {
+                            this.pending_reconnect_tab = Some(tab_id);
                             this.show_password_prompt(
                                 profile.id,
                                 profile.name.clone(),
@@ -204,6 +208,7 @@ impl WorkspaceView {
                             return;
                         }
                     }
+                    this.pending_reconnect_tab = None;
                     let store = this.store.clone();
                     this.tabs.update(cx, |m, cx| {
                         m.reconnect(tab_id, &store, window, cx);
@@ -356,6 +361,7 @@ impl WorkspaceView {
             move |this, _, event: &PasswordPromptEvent, cx| match event {
                 PasswordPromptEvent::Cancel => {
                     this.password_prompt = None;
+                    this.pending_reconnect_tab = None;
                     cx.notify();
                 }
                 PasswordPromptEvent::Submit {
@@ -363,6 +369,7 @@ impl WorkspaceView {
                     password,
                 } => {
                     this.password_prompt = None;
+                    let reconnect_tab = this.pending_reconnect_tab.take();
                     let (profile, font_family) = {
                         let s = this.store.read(cx);
                         (
@@ -371,15 +378,23 @@ impl WorkspaceView {
                         )
                     };
                     if let Some(profile) = profile {
-                        this.tabs.update(cx, |m, cx| {
-                            m.open_ssh_with_password(
-                                &profile,
-                                password.clone(),
-                                &font_family,
-                                cx,
-                            );
-                        });
-                        this.persist_tabs(cx);
+                        if let Some(tab_id) = reconnect_tab {
+                            let store = this.store.clone();
+                            let password = password.clone();
+                            this.tabs.update(cx, |m, cx| {
+                                m.reconnect_with_password(tab_id, password, &store, cx);
+                            });
+                        } else {
+                            this.tabs.update(cx, |m, cx| {
+                                m.open_ssh_with_password(
+                                    &profile,
+                                    password.clone(),
+                                    &font_family,
+                                    cx,
+                                );
+                            });
+                            this.persist_tabs(cx);
+                        }
                     }
                     cx.notify();
                 }

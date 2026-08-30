@@ -458,6 +458,9 @@ pub struct TerminalView {
     /// IME marked (composing) text as UTF-16 length range into a virtual buffer.
     /// When `Some`, Windows routes keys through TranslateMessage / IME composition.
     ime_marked: Option<(String, std::ops::Range<usize>)>,
+
+    /// False after PTY/SSH EOF or a broken stdin write — keys must not pretend to work.
+    session_alive: bool,
 }
 
 struct ScrollbarDrag {
@@ -622,6 +625,7 @@ impl TerminalView {
             working_directory: None,
             shell_pid: None,
             ime_marked: None,
+            session_alive: true,
         }
     }
 
@@ -889,7 +893,7 @@ impl TerminalView {
                 term.selection = None;
                 term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
             });
-            self.write_to_pty(&bytes);
+            self.write_to_pty(&bytes, cx);
             cx.stop_propagation();
             cx.notify();
         }
@@ -929,7 +933,7 @@ impl TerminalView {
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             if !text.is_empty() {
-                self.paste_text(&text);
+                self.paste_text(&text, cx);
             }
         }
     }
@@ -1349,17 +1353,17 @@ impl TerminalView {
                         Some(text) => format(&text),
                         None => format(""),
                     };
-                    self.write_to_pty(payload.as_bytes());
+                    self.write_to_pty(payload.as_bytes(), cx);
                 }
                 TerminalEvent::PtyWrite(data) => {
-                    self.write_to_pty(data.as_bytes());
+                    self.write_to_pty(data.as_bytes(), cx);
                 }
                 TerminalEvent::ColorRequest(index, format) => {
                     let color = self
                         .state
                         .with_term(|term| term.colors()[index])
                         .unwrap_or_else(|| self.config.colors.rgb_at_index(index));
-                    self.write_to_pty(format(color).as_bytes());
+                    self.write_to_pty(format(color).as_bytes(), cx);
                 }
                 TerminalEvent::TextAreaSizeRequest(format) => {
                     let font_px: f32 = self.config.font_size.into();
@@ -1371,9 +1375,10 @@ impl TerminalView {
                         cell_width: cell_w.max(1.0) as u16,
                         cell_height: cell_h.max(1.0) as u16,
                     };
-                    self.write_to_pty(format(size).as_bytes());
+                    self.write_to_pty(format(size).as_bytes(), cx);
                 }
                 TerminalEvent::Exit => {
+                    self.note_session_ended(cx);
                     if let Some(callback) = self.exit_callback.as_ref() {
                         if let Some(window) = window.as_mut() {
                             callback(window, cx);
@@ -1384,10 +1389,33 @@ impl TerminalView {
         }
     }
 
-    fn write_to_pty(&self, bytes: &[u8]) {
-        let mut writer = self.stdin_writer.lock();
-        let _ = writer.write_all(bytes);
-        let _ = writer.flush();
+    /// Mark the session dead once; emit [`TerminalViewEvent::SessionEnded`].
+    fn note_session_ended(&mut self, cx: &mut Context<Self>) {
+        if !self.session_alive {
+            return;
+        }
+        self.session_alive = false;
+        self.ime_marked = None;
+        cx.emit(crate::terminal::TerminalViewEvent::SessionEnded);
+        cx.notify();
+    }
+
+    pub fn session_alive(&self) -> bool {
+        self.session_alive
+    }
+
+    fn write_to_pty(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        if !self.session_alive || bytes.is_empty() {
+            return;
+        }
+        let result = {
+            let mut writer = self.stdin_writer.lock();
+            let w = writer.write_all(bytes).and_then(|_| writer.flush());
+            w
+        };
+        if result.is_err() {
+            self.note_session_ended(cx);
+        }
     }
 
     fn utf16_len(s: &str) -> usize {
@@ -1400,12 +1428,16 @@ impl TerminalView {
             self.ime_marked = None;
             return;
         }
+        if !self.session_alive {
+            self.ime_marked = None;
+            return;
+        }
         self.state.with_term_mut(|term| {
             term.selection = None;
             term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         });
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        self.write_to_pty(normalized.as_bytes());
+        self.write_to_pty(normalized.as_bytes(), cx);
         self.ime_marked = None;
         cx.notify();
     }
@@ -1441,9 +1473,12 @@ impl TerminalView {
     }
 
     /// Insert text into the PTY (uses bracketed paste when the shell enables it).
-    pub fn paste_text(&mut self, text: &str) {
+    pub fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) {
         use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::term::TermMode;
+        if !self.session_alive {
+            return;
+        }
         self.state
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
         let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1452,9 +1487,9 @@ impl TerminalView {
             buf.extend_from_slice(b"\x1b[200~");
             buf.extend(normalized.bytes().filter(|&b| b != 0x1b));
             buf.extend_from_slice(b"\x1b[201~");
-            self.write_to_pty(&buf);
+            self.write_to_pty(&buf, cx);
         } else {
-            self.write_to_pty(normalized.as_bytes());
+            self.write_to_pty(normalized.as_bytes(), cx);
         }
     }
 
@@ -1881,6 +1916,29 @@ impl Render for TerminalView {
             )
             .when_some(self.render_find_bar(cx), |d, bar| d.child(bar))
             .when_some(self.render_context_menu(cx), |d, menu| d.child(menu))
+            .when(!self.session_alive, |d| {
+                d.child(
+                    div()
+                        .id("term-disconnected-banner")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .px_3()
+                        .py_2()
+                        .bg(hsla(0.02, 0.45, 0.22, 0.92))
+                        .border_b_1()
+                        .border_color(hsla(0.02, 0.50, 0.40, 1.0))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xffffff))
+                                .child(
+                                    "Disconnected — click Reconnect in the status bar to restore this session.",
+                                ),
+                        ),
+                )
+            })
     }
 }
 
