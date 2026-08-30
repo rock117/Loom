@@ -1,3 +1,6 @@
+// No console window when launching loom.exe on Windows.
+#![windows_subsystem = "windows"]
+
 mod app;
 mod assets;
 mod model;
