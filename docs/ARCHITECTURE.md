@@ -13,6 +13,7 @@ For **SSH 端口转发（Local / Remote / SOCKS）**（中文规格，尚未实�
 For **主题系统（可切换 Theme / CSD / 终端 palette）**（中文规格，尚未实现）, see [THEME.md](./THEME.md).  
 For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草案，尚未实现）, see [LOOM_CLI.md](./LOOM_CLI.md).  
 For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
+For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals
@@ -196,4 +197,5 @@ Started on the GPUI tree (post Slint rollback):
 - [x] Optional line-number gutter (Settings toggle; 1 = oldest scrollback line)
 - [x] Zed-style pane splits (binary tree, sash resize, Ctrl+W closes focused pane)
 - [x] Context panel (right column): SFTP Files browser + Info — see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md)
+- [x] SSH/PTY disconnect → Failed + status-bar Reconnect (manual) — see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md)
 - [ ] macOS / Linux runtime validation

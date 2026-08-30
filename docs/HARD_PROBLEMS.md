@@ -145,3 +145,17 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/terminal/gpui_emu/input.rs`。
 
 ---
+
+### 2026-08-30 — SSH 断线后假活输入、只能重开 tab
+
+**现象：** 连接已断，prompt 仍在，按键无效果；Files 常 `SFTP unavailable`；状态栏不出 Reconnect，只能重新打开 profile。
+
+**原因归类：** Exit/写失败未反映到 `ConnectionState`；`write_to_pty` 静默吞 BrokenPipe；Reconnect UI 依赖 Failed 态；密码回调曾走「新开 tab」。
+
+**有效做法：** `SessionEnded` → pane Failed + 回收 SFTP；`session_alive` 挡写入 + 横幅；状态栏手动 Reconnect（密码走 `pending_reconnect_tab`）；Files 用 `bound_sftp_alive` 重绑。不做自动重连（主路径）。
+
+**完整说明：** [SESSION_RECONNECT.md](./SESSION_RECONNECT.md)。
+
+**代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/ui/tab_manager.rs`、`src/ui/workspace_view.rs`、`src/ui/context_panel.rs`。
+
+---
