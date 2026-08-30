@@ -1,8 +1,9 @@
+//! Settings overlay — grouped sections, restrained chrome (Zed-like density).
+
 use gpui::prelude::*;
 use gpui::*;
 
 use crate::shared::theme;
-use crate::ui::widgets::AccentButton;
 use crate::ui::workspace_store::WorkspaceStore;
 
 #[derive(Clone, Debug)]
@@ -34,7 +35,22 @@ impl SettingsPanel {
         }
     }
 
-    fn row_button(
+    fn section_title(label: impl Into<SharedString>) -> impl IntoElement {
+        div()
+            .text_xs()
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::TEXT_MUTED)
+            .child(label.into())
+    }
+
+    fn field_label(label: impl Into<SharedString>) -> impl IntoElement {
+        div()
+            .text_xs()
+            .text_color(theme::TEXT_MUTED)
+            .child(label.into())
+    }
+
+    fn ghost_icon_btn(
         id: impl Into<ElementId>,
         label: impl Into<SharedString>,
         cx: &mut Context<Self>,
@@ -42,16 +58,73 @@ impl SettingsPanel {
     ) -> impl IntoElement {
         div()
             .id(id)
-            .px_3()
-            .py_1()
-            .rounded(px(4.0))
-            .bg(theme::ACCENT)
-            .text_color(rgb(0xffffff))
+            .size(px(28.0))
+            .rounded(px(theme::RADIUS_SM))
+            .flex()
+            .items_center()
+            .justify_center()
             .text_sm()
+            .text_color(theme::TEXT_MUTED)
             .cursor_pointer()
-            .hover(|s| s.opacity(0.9))
+            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
             .child(label.into())
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+
+    fn step_btn(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w(px(28.0))
+            .h(px(28.0))
+            .rounded(px(theme::RADIUS_SM))
+            .bg(theme::BG)
+            .border_1()
+            .border_color(theme::BORDER)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(theme::TEXT)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::HOVER))
+            .child(label.into())
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+
+    fn secondary_btn(
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex_1()
+            .px_3()
+            .py_2()
+            .rounded(px(theme::RADIUS_SM))
+            .bg(theme::BG)
+            .border_1()
+            .border_color(theme::BORDER)
+            .text_sm()
+            .text_color(theme::TEXT)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::HOVER).border_color(theme::BORDER_SUBTLE))
+            .child(label.into())
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+    }
+
+    fn shell_preset_selected(current: &Option<String>, preset: &str) -> bool {
+        match (current.as_deref(), preset) {
+            (None, "auto") => true,
+            (Some(s), p) if s.eq_ignore_ascii_case(p) => true,
+            _ => false,
+        }
     }
 }
 
@@ -64,13 +137,14 @@ impl Focusable for SettingsPanel {
 impl Render for SettingsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.store.read(cx).settings.clone();
-        let shell_label = settings
-            .default_shell
-            .clone()
-            .unwrap_or_else(|| "auto".into());
+        let shell_value = settings.default_shell.clone();
+        let shell_display = shell_value.clone().unwrap_or_default();
         let font_family = settings.font_family.clone();
         let font_size = settings.font_size;
         let show_line_numbers = settings.show_line_numbers;
+        let shell_is_custom = shell_value
+            .as_ref()
+            .is_some_and(|s| !matches!(s.as_str(), "pwsh" | "powershell" | "cmd"));
 
         div()
             .id("settings-overlay")
@@ -87,15 +161,15 @@ impl Render for SettingsPanel {
             .child(
                 div()
                     .id("settings-card")
-                    .w(px(420.0))
+                    .w(px(440.0))
                     .p_5()
-                    .rounded(px(8.0))
+                    .rounded(px(theme::RADIUS))
                     .bg(theme::PANEL_BG)
                     .border_1()
                     .border_color(theme::BORDER)
                     .flex()
                     .flex_col()
-                    .gap_4()
+                    .gap_5()
                     .track_focus(&self.focus_handle)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
@@ -165,6 +239,7 @@ impl Render for SettingsPanel {
                             }
                         }
                     }))
+                    // Header
                     .child(
                         div()
                             .flex()
@@ -177,179 +252,243 @@ impl Render for SettingsPanel {
                                     .text_color(theme::TEXT)
                                     .child("Settings"),
                             )
-                            .child(AccentButton::new(
-                                "settings-close",
-                                "Close",
-                                cx.listener(|_, _, _, cx| {
-                                    cx.emit(SettingsEvent::Close);
-                                }),
-                            )),
+                            .child(Self::ghost_icon_btn("settings-close", "✕", cx, |_, _, cx| {
+                                cx.emit(SettingsEvent::Close);
+                            })),
                     )
+                    // Terminal
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme::TEXT_MUTED)
-                                    .child("Default shell (empty = auto)"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-shell")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(px(4.0))
-                                    .bg(theme::BG)
-                                    .border_1()
-                                    .border_color(if self.editing_shell {
-                                        theme::ACCENT
-                                    } else {
-                                        theme::BORDER
-                                    })
-                                    .text_sm()
-                                    .text_color(theme::TEXT)
-                                    .cursor_pointer()
-                                    .child(if self.editing_shell {
-                                        format!("{shell_label}|")
-                                    } else {
-                                        shell_label
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.editing_shell = true;
-                                        this.editing_font = false;
-                                        this.focus_handle.focus(window);
-                                        cx.notify();
-                                    })),
-                            )
+                            .gap_3()
+                            .child(Self::section_title("TERMINAL"))
                             .child(
                                 div()
                                     .flex()
-                                    .gap_1()
-                                    .children(
-                                        ["auto", "pwsh", "powershell", "cmd"].into_iter().map(
-                                            |name| {
-                                                let label = name.to_string();
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "shell-preset-{name}"
-                                                    )))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded(px(4.0))
-                                                    .bg(theme::BG)
-                                                    .border_1()
-                                                    .border_color(theme::BORDER)
-                                                    .text_xs()
-                                                    .text_color(theme::TEXT_MUTED)
-                                                    .cursor_pointer()
-                                                    .child(label.clone())
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.store.update(cx, |s, cx| {
-                                                            s.settings.default_shell =
-                                                                if name == "auto" {
-                                                                    None
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(Self::field_label("Default shell"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(
+                                                ["auto", "pwsh", "powershell", "cmd"].into_iter().map(
+                                                    |name| {
+                                                        let selected = Self::shell_preset_selected(
+                                                            &shell_value,
+                                                            name,
+                                                        );
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "shell-preset-{name}"
+                                                            )))
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded(px(theme::RADIUS_SM))
+                                                            .bg(if selected {
+                                                                theme::SELECTION
+                                                            } else {
+                                                                theme::BG
+                                                            })
+                                                            .border_1()
+                                                            .border_color(if selected {
+                                                                theme::ACCENT
+                                                            } else {
+                                                                theme::BORDER
+                                                            })
+                                                            .text_xs()
+                                                            .text_color(if selected {
+                                                                theme::TEXT
+                                                            } else {
+                                                                theme::TEXT_MUTED
+                                                            })
+                                                            .cursor_pointer()
+                                                            .hover(|s| {
+                                                                if selected {
+                                                                    s
                                                                 } else {
-                                                                    Some(name.to_string())
-                                                                };
-                                                            s.mark_dirty();
-                                                            s.persist_now();
-                                                            cx.notify();
-                                                        });
-                                                        this.editing_shell = false;
-                                                        cx.notify();
-                                                    }))
-                                            },
-                                        ),
+                                                                    s.bg(theme::HOVER)
+                                                                        .text_color(theme::TEXT)
+                                                                }
+                                                            })
+                                                            .child(name.to_string())
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.store.update(cx, |s, cx| {
+                                                                        s.settings.default_shell =
+                                                                            if name == "auto" {
+                                                                                None
+                                                                            } else {
+                                                                                Some(
+                                                                                    name.to_string(),
+                                                                                )
+                                                                            };
+                                                                        s.mark_dirty();
+                                                                        s.persist_now();
+                                                                        cx.notify();
+                                                                    });
+                                                                    this.editing_shell = false;
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                    },
+                                                ),
+                                            ),
+                                    )
+                                    .child(Self::field_label(if shell_is_custom {
+                                        "Custom executable"
+                                    } else {
+                                        "Custom executable (optional)"
+                                    }))
+                                    .child(
+                                        div()
+                                            .id("settings-shell")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(theme::BG)
+                                            .border_1()
+                                            .border_color(if self.editing_shell {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::BORDER
+                                            })
+                                            .text_sm()
+                                            .text_color(if shell_display.is_empty()
+                                                && !self.editing_shell
+                                            {
+                                                theme::TEXT_DISABLED
+                                            } else {
+                                                theme::TEXT
+                                            })
+                                            .cursor_pointer()
+                                            .child(if self.editing_shell {
+                                                format!("{shell_display}|")
+                                            } else if shell_display.is_empty() {
+                                                "e.g. C:\\Windows\\System32\\cmd.exe".into()
+                                            } else {
+                                                shell_display
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.editing_shell = true;
+                                                this.editing_font = false;
+                                                this.focus_handle.focus(window);
+                                                cx.notify();
+                                            })),
                                     ),
                             ),
                     )
+                    // Appearance
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_1()
+                            .gap_3()
+                            .child(Self::section_title("APPEARANCE"))
                             .child(
                                 div()
-                                    .text_xs()
-                                    .text_color(theme::TEXT_MUTED)
-                                    .child("Font family"),
-                            )
-                            .child(
-                                div()
-                                    .id("settings-font")
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(px(4.0))
-                                    .bg(theme::BG)
-                                    .border_1()
-                                    .border_color(if self.editing_font {
-                                        theme::ACCENT
-                                    } else {
-                                        theme::BORDER
-                                    })
-                                    .text_sm()
-                                    .text_color(theme::TEXT)
-                                    .cursor_pointer()
-                                    .child(if self.editing_font {
-                                        format!("{font_family}|")
-                                    } else {
-                                        font_family
-                                    })
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.editing_font = true;
-                                        this.editing_shell = false;
-                                        this.focus_handle.focus(window);
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme::TEXT)
-                                    .child(format!("Font size: {font_size:.0}")),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(Self::field_label("Font family"))
+                                    .child(
+                                        div()
+                                            .id("settings-font")
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(theme::BG)
+                                            .border_1()
+                                            .border_color(if self.editing_font {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::BORDER
+                                            })
+                                            .text_sm()
+                                            .text_color(theme::TEXT)
+                                            .cursor_pointer()
+                                            .child(if self.editing_font {
+                                                format!("{font_family}|")
+                                            } else {
+                                                font_family
+                                            })
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.editing_font = true;
+                                                this.editing_shell = false;
+                                                this.focus_handle.focus(window);
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
                             .child(
                                 div()
                                     .flex()
-                                    .gap_1()
-                                    .child(Self::row_button("font-minus", "−", cx, |this, _, cx| {
-                                        this.store.update(cx, |s, cx| {
-                                            s.settings.font_size =
-                                                (s.settings.font_size - 1.0).max(8.0);
-                                            s.mark_dirty();
-                                            s.persist_now();
-                                            cx.notify();
-                                        });
-                                        let size = this.store.read(cx).settings.font_size;
-                                        cx.emit(SettingsEvent::FontSizeChanged(size));
-                                    }))
-                                    .child(Self::row_button("font-plus", "+", cx, |this, _, cx| {
-                                        this.store.update(cx, |s, cx| {
-                                            s.settings.font_size =
-                                                (s.settings.font_size + 1.0).min(32.0);
-                                            s.mark_dirty();
-                                            s.persist_now();
-                                            cx.notify();
-                                        });
-                                        let size = this.store.read(cx).settings.font_size;
-                                        cx.emit(SettingsEvent::FontSizeChanged(size));
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme::TEXT)
+                                            .child("Font size"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(Self::step_btn(
+                                                "font-minus",
+                                                "−",
+                                                cx,
+                                                |this, _, cx| {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.settings.font_size =
+                                                            (s.settings.font_size - 1.0).max(8.0);
+                                                        s.mark_dirty();
+                                                        s.persist_now();
+                                                        cx.notify();
+                                                    });
+                                                    let size =
+                                                        this.store.read(cx).settings.font_size;
+                                                    cx.emit(SettingsEvent::FontSizeChanged(size));
+                                                },
+                                            ))
+                                            .child(
+                                                div()
+                                                    .min_w(px(28.0))
+                                                    .text_sm()
+                                                    .text_color(theme::TEXT)
+                                                    .text_center()
+                                                    .child(format!("{font_size:.0}")),
+                                            )
+                                            .child(Self::step_btn(
+                                                "font-plus",
+                                                "+",
+                                                cx,
+                                                |this, _, cx| {
+                                                    this.store.update(cx, |s, cx| {
+                                                        s.settings.font_size =
+                                                            (s.settings.font_size + 1.0).min(32.0);
+                                                        s.mark_dirty();
+                                                        s.persist_now();
+                                                        cx.notify();
+                                                    });
+                                                    let size =
+                                                        this.store.read(cx).settings.font_size;
+                                                    cx.emit(SettingsEvent::FontSizeChanged(size));
+                                                },
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
                                     .child(
                                         div()
                                             .flex()
@@ -365,65 +504,84 @@ impl Render for SettingsPanel {
                                                 div()
                                                     .text_xs()
                                                     .text_color(theme::TEXT_MUTED)
-                                                    .child("Scrollback gutter (1 = oldest line)"),
+                                                    .child(
+                                                        "Scrollback gutter (1 = oldest line)",
+                                                    ),
                                             ),
                                     )
-                            .child(
-                                div()
-                                    .id("settings-line-numbers")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded(px(4.0))
-                                    .bg(if show_line_numbers {
-                                        theme::ACCENT
-                                    } else {
-                                        theme::BG
-                                    })
-                                    .border_1()
-                                    .border_color(if show_line_numbers {
-                                        theme::ACCENT
-                                    } else {
-                                        theme::BORDER
-                                    })
-                                    .text_sm()
-                                    .text_color(if show_line_numbers {
-                                        rgb(0xffffff).into()
-                                    } else {
-                                        theme::TEXT_MUTED
-                                    })
-                                    .cursor_pointer()
-                                    .child(if show_line_numbers { "On" } else { "Off" })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        let enabled = this.store.update(cx, |s, cx| {
-                                            s.settings.show_line_numbers =
-                                                !s.settings.show_line_numbers;
-                                            let v = s.settings.show_line_numbers;
-                                            s.mark_dirty();
-                                            s.persist_now();
-                                            cx.notify();
-                                            v
-                                        });
-                                        cx.emit(SettingsEvent::LineNumbersChanged(enabled));
-                                        cx.notify();
-                                    })),
+                                    .child(
+                                        div()
+                                            .id("settings-line-numbers")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(if show_line_numbers {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::BG
+                                            })
+                                            .border_1()
+                                            .border_color(if show_line_numbers {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::BORDER
+                                            })
+                                            .text_sm()
+                                            .text_color(if show_line_numbers {
+                                                rgb(0xffffff).into()
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
+                                            .cursor_pointer()
+                                            .child(if show_line_numbers { "On" } else { "Off" })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                let enabled = this.store.update(cx, |s, cx| {
+                                                    s.settings.show_line_numbers =
+                                                        !s.settings.show_line_numbers;
+                                                    let v = s.settings.show_line_numbers;
+                                                    s.mark_dirty();
+                                                    s.persist_now();
+                                                    cx.notify();
+                                                    v
+                                                });
+                                                cx.emit(SettingsEvent::LineNumbersChanged(enabled));
+                                                cx.notify();
+                                            })),
+                                    ),
                             ),
                     )
+                    // Workspace
                     .child(
                         div()
                             .flex()
-                            .gap_2()
-                            .child(Self::row_button("btn-export", "Export workspace…", cx, |_, _, cx| {
-                                cx.emit(SettingsEvent::Export);
-                            }))
-                            .child(Self::row_button("btn-import", "Import workspace…", cx, |_, _, cx| {
-                                cx.emit(SettingsEvent::Import);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::TEXT_MUTED)
-                            .child("Import replaces the current workspace after confirmation in the file dialog flow."),
+                            .flex_col()
+                            .gap_3()
+                            .child(Self::section_title("WORKSPACE"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(Self::secondary_btn(
+                                        "btn-export",
+                                        "Export workspace…",
+                                        cx,
+                                        |_, _, cx| cx.emit(SettingsEvent::Export),
+                                    ))
+                                    .child(Self::secondary_btn(
+                                        "btn-import",
+                                        "Import workspace…",
+                                        cx,
+                                        |_, _, cx| cx.emit(SettingsEvent::Import),
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child(
+                                        "Import replaces the current workspace after confirmation in the file dialog flow.",
+                                    ),
+                            ),
                     ),
             )
     }
