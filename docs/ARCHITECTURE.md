@@ -12,6 +12,7 @@ For **Docker 会话（exec + Files / docker cp）**（中文规格，尚未实�
 For **SSH 端口转发（Local / Remote / SOCKS）**（中文规格，尚未实现；非核心增强）, see [PORT_FORWARD.md](./PORT_FORWARD.md).  
 For **主题系统（可切换 Theme / CSD / 终端 palette）**（中文规格，尚未实现）, see [THEME.md](./THEME.md).  
 For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草案，尚未实现）, see [LOOM_CLI.md](./LOOM_CLI.md).  
+For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals

@@ -1,6 +1,6 @@
 # Loom 壳内指令（`loom …`）与组合能力
 
-相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[BACKLOG.md](./BACKLOG.md)、[CONTEXT_PANEL.md](./CONTEXT_PANEL.md)、[THEME.md](./THEME.md)、[PORT_FORWARD.md](./PORT_FORWARD.md)、[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
+相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[BACKLOG.md](./BACKLOG.md)、[CONTEXT_PANEL.md](./CONTEXT_PANEL.md)、[THEME.md](./THEME.md)、[PORT_FORWARD.md](./PORT_FORWARD.md)、[DOCKER_SESSION.md](./DOCKER_SESSION.md)、[PLUGINS.md](./PLUGINS.md)。
 
 > **状态**：需求挖掘 / 规格草案，**尚未实现**。实现须由用户明确点名后开始（与 backlog 纪律一致）。  
 > **文档约定**：新增规格默认中文。  

@@ -54,12 +54,15 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| E1 | **Plugin mechanism** | Do **after** core (SSH, scrollback search, themes) is stable. |
+| E1 | **Plugin mechanism** | Spec — [PLUGINS.md](./PLUGINS.md). After core (SSH, search, themes) is stable. Lua sandbox MVP; WASM/sidecar later. **Do not implement** until explicitly ordered. |
 
 ### Plugin scope (when E1 is ordered)
 
-**Good candidates:** themes, status-bar fragments, snippets, custom profile kinds.  
-**Avoid initially:** arbitrary PTY byte-stream hooks (security and stability risk).
+详见 [PLUGINS.md](./PLUGINS.md)。摘要：
+
+- **Good candidates:** themes, status-bar fragments, snippets, custom profile kinds, `loom` subcommands.  
+- **Avoid initially:** arbitrary PTY byte-stream hooks (security and stability risk).  
+- **Hard requirements:** fault isolation (failed plugin must not break Loom), structured diagnostics, no untrusted in-process native DLLs as default.
 
 ---
 
