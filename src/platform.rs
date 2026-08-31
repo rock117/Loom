@@ -49,6 +49,44 @@ pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     native_reveal_in_file_manager(path)
 }
 
+/// Open a URL with the OS default handler (browser, etc.).
+///
+/// Refuses empty / oversized / control-character strings and unknown schemes so
+/// a Ctrl+click cannot feed the shell opener arbitrary input.
+pub fn open_url(url: &str) -> std::io::Result<()> {
+    if !is_safe_open_url(url) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "refusing to open unsafe or unsupported URL",
+        ));
+    }
+    native_open_url(url)
+}
+
+const OPEN_URL_SCHEMES: &[&str] = &[
+    "https://",
+    "http://",
+    "ftp://",
+    "file://",
+    "mailto:",
+    "ssh://",
+    "git://",
+];
+
+fn is_safe_open_url(url: &str) -> bool {
+    const MAX_LEN: usize = 2048;
+    if url.is_empty() || url.len() > MAX_LEN {
+        return false;
+    }
+    if url.chars().any(|c| c.is_control() || c == ' ' || c == '\t') {
+        return false;
+    }
+    let lower = url.to_ascii_lowercase();
+    OPEN_URL_SCHEMES
+        .iter()
+        .any(|scheme| lower.starts_with(scheme))
+}
+
 /// Live cwd of a local process (Zed-style), used when OSC hooks are missing or stale.
 ///
 /// Returns `None` if the pid is gone, inaccessible, or the OS cannot report cwd.

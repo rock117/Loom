@@ -3,6 +3,7 @@
 
 mod colors;
 mod event;
+mod hyperlink;
 mod input;
 mod osc;
 mod render;

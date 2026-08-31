@@ -21,3 +21,14 @@ pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<
         .spawn()?;
     Ok(())
 }
+
+pub fn native_open_url(url: &str) -> std::io::Result<()> {
+    use std::process::Stdio;
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}

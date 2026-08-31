@@ -436,21 +436,14 @@ impl TerminalRenderer {
 
     /// Paint terminal content to the window.
     ///
-    /// This is the main rendering method that draws the terminal grid,
-    /// including backgrounds, text, and cursor.
-    ///
-    /// # Arguments
-    ///
-    /// * `bounds` - The bounding box to render within
-    /// * `padding` - Padding around the terminal content
-    /// * `term` - The terminal state
-    /// * `window` - The GPUI window
-    /// * `cx` - The application context
+    /// `hover_url` is `(grid_line, start_col, end_col)` for the URL under the
+    /// pointer while Ctrl/Cmd is held — only that span is highlighted.
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
+        hover_url: Option<(alacritty_terminal::index::Line, usize, usize)>,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -508,6 +501,71 @@ impl TerminalRenderer {
 
             // Layout the row for backgrounds
             let (backgrounds, _) = self.layout_row(line_idx, cells.iter().cloned(), colors);
+
+            // Only the hovered URL (Ctrl/Cmd + mouse over) gets accent + underline.
+            let mut url_cols = vec![false; num_cols];
+            if let Some((hover_line, start_col, end_col)) = hover_url {
+                let line_point = viewport_to_point(
+                    display_offset,
+                    AlacPoint::new(line_idx, Column(0)),
+                );
+                if line_point.line == hover_line {
+                    let start = start_col.min(num_cols);
+                    let end = end_col.min(num_cols).max(start);
+                    for c in start..end {
+                        url_cols[c] = true;
+                    }
+                    let link_bg = Hsla {
+                        h: 0.58,
+                        s: 0.45,
+                        l: 0.28,
+                        a: 0.55,
+                    };
+                    let link_underline = Hsla {
+                        h: 0.58,
+                        s: 0.70,
+                        l: 0.62,
+                        a: 1.0,
+                    };
+                    if start < end {
+                        let x = origin.x + self.cell_width * (start as f32);
+                        let y = origin.y + self.cell_height * (line_idx as f32);
+                        let width = self.cell_width * ((end - start) as f32);
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point { x, y },
+                                size: Size {
+                                    width,
+                                    height: self.cell_height,
+                                },
+                            },
+                            px(0.0),
+                            link_bg,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                        let underline_h = px(1.5);
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point {
+                                    x,
+                                    y: y + self.cell_height - underline_h - px(1.0),
+                                },
+                                size: Size {
+                                    width,
+                                    height: underline_h,
+                                },
+                            },
+                            px(0.0),
+                            link_underline,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
+            }
 
             // Paint backgrounds
             for bg_rect in backgrounds {
@@ -610,13 +668,23 @@ impl TerminalRenderer {
                 let y = origin.y + self.cell_height * (line_idx as f32) + vertical_offset;
 
                 // Get cell colors
-                let fg_color = self.palette.resolve(cell.fg, colors);
+                let mut fg_color = self.palette.resolve(cell.fg, colors);
+                let is_link = url_cols.get(col_idx).copied().unwrap_or(false);
+                if is_link {
+                    fg_color = Hsla {
+                        h: 0.58,
+                        s: 0.72,
+                        l: 0.68,
+                        a: 1.0,
+                    };
+                }
 
                 // Get cell flags for styling
                 let flags = cell.flags;
                 let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
                 let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
+                let underline = is_link
+                    || flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
 
                 // Create font with styling
                 let font = Font {

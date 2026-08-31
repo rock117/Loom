@@ -54,9 +54,11 @@ pub use context_menu::TerminalViewEvent;
 
 use super::colors::ColorPalette;
 use super::event::{GpuiEventProxy, TerminalEvent};
+use super::hyperlink;
 use super::input::keystroke_to_bytes;
 use super::render::TerminalRenderer;
 use super::terminal::TerminalState;
+use crate::platform;
 use crate::shared::theme;
 use gpui::prelude::FluentBuilder;
 use gpui::{Edges, *};
@@ -433,6 +435,13 @@ pub struct TerminalView {
     /// Cell where the current selection press started.
     selection_anchor: Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)>,
 
+    /// True while Ctrl (or macOS Cmd) is held — enable clickable URL hover.
+    hyperlink_mods: bool,
+    /// Pointer is over a URL while `hyperlink_mods` is active.
+    hover_hyperlink: bool,
+    /// Grid line + exclusive column range of the hovered URL (for paint).
+    hover_url_span: Option<(alacritty_terminal::index::Line, usize, usize)>,
+
     /// Last painted terminal bounds (window space) for hit-testing.
     last_bounds: Bounds<Pixels>,
 
@@ -618,6 +627,9 @@ impl TerminalView {
             selecting: false,
             selection_dragged: false,
             selection_anchor: None,
+            hyperlink_mods: false,
+            hover_hyperlink: false,
+            hover_url_span: None,
             last_bounds: Bounds::default(),
             scrollbar_drag: None,
             find: None,
@@ -966,6 +978,14 @@ impl TerminalView {
             return;
         }
 
+        // Ctrl+click (Cmd on macOS): open URL under cursor in the browser.
+        if event.modifiers.control || event.modifiers.platform {
+            if self.open_url_at(event.position, cx) {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         let Some((point, side)) = self.cell_at(event.position) else {
             return;
         };
@@ -1031,6 +1051,24 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on = event.modifiers.control || event.modifiers.platform;
+        if self.hyperlink_mods == on {
+            return;
+        }
+        self.hyperlink_mods = on;
+        if !on {
+            self.hover_hyperlink = false;
+            self.hover_url_span = None;
+        }
+        cx.notify();
+    }
+
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -1043,6 +1081,17 @@ impl TerminalView {
         }
 
         if !self.selecting {
+            if self.hyperlink_mods {
+                let span = self
+                    .cell_at(event.position)
+                    .and_then(|(point, _)| self.url_col_span_at(point));
+                let over = span.is_some();
+                if over != self.hover_hyperlink || span != self.hover_url_span {
+                    self.hover_hyperlink = over;
+                    self.hover_url_span = span;
+                    cx.notify();
+                }
+            }
             return;
         }
         let Some((point, side)) = self.cell_at(event.position) else {
@@ -1098,6 +1147,107 @@ impl TerminalView {
             .with_term(|term| term.grid().display_offset());
         let point = viewport_to_point(display_offset, AlacPoint::new(row, Column(col)));
         Some((point, side))
+    }
+
+    /// Ctrl/Cmd+click: open http(s)/… URL under the cell, if any.
+    ///
+    /// Opens **synchronously on the UI thread** via [`platform::open_url`].
+    /// GPUI's `cx.open_url` runs on a background executor, which on Windows
+    /// often prevents the browser from taking foreground (taskbar flash only).
+    fn open_url_at(&self, position: Point<Pixels>, _cx: &App) -> bool {
+        let Some((point, _)) = self.cell_at(position) else {
+            return false;
+        };
+        let Some(url) = self.url_at_point(point) else {
+            return false;
+        };
+        if !hyperlink::is_safe_open_url(&url) {
+            return false;
+        }
+        if let Err(err) = platform::open_url(&url) {
+            eprintln!("loom: failed to open URL {url}: {err}");
+        }
+        // Consume the click either way so we don't start a selection mid-Ctrl.
+        true
+    }
+
+    fn url_at_point(&self, point: alacritty_terminal::index::Point) -> Option<String> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::cell::Flags;
+
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            let cols = term.columns();
+            if cols == 0 || point.column.0 >= cols {
+                return None;
+            }
+            if point.line < grid.topmost_line() || point.line > grid.bottommost_line() {
+                return None;
+            }
+
+            let mut text = String::new();
+            let mut col_to_char: Vec<Option<usize>> = vec![None; cols];
+            for col in 0..cols {
+                let cell = &grid[alacritty_terminal::index::Point::new(point.line, Column(col))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                let idx = text.chars().count();
+                text.push(ch);
+                col_to_char[col] = Some(idx);
+            }
+            let char_idx = col_to_char.get(point.column.0).copied().flatten()?;
+            hyperlink::url_covering_char(&text, char_idx)
+        })
+    }
+
+    /// Column range (exclusive end) of the URL under `point`, if any.
+    fn url_col_span_at(
+        &self,
+        point: alacritty_terminal::index::Point,
+    ) -> Option<(alacritty_terminal::index::Line, usize, usize)> {
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::cell::Flags;
+
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            let cols = term.columns();
+            if cols == 0 || point.column.0 >= cols {
+                return None;
+            }
+            if point.line < grid.topmost_line() || point.line > grid.bottommost_line() {
+                return None;
+            }
+
+            let mut text = String::new();
+            let mut col_to_char: Vec<Option<usize>> = vec![None; cols];
+            let mut char_to_col: Vec<usize> = Vec::new();
+            for col in 0..cols {
+                let cell = &grid[alacritty_terminal::index::Point::new(point.line, Column(col))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let ch = if cell.c == '\0' { ' ' } else { cell.c };
+                let idx = text.chars().count();
+                text.push(ch);
+                col_to_char[col] = Some(idx);
+                char_to_col.push(col);
+            }
+            let char_idx = col_to_char.get(point.column.0).copied().flatten()?;
+            let (start_c, end_c) = hyperlink::url_char_spans(&text)
+                .into_iter()
+                .find(|(s, e)| char_idx >= *s && char_idx < *e)?;
+            let start_col = *char_to_col.get(start_c)?;
+            let end_col = char_to_col
+                .get(end_c.saturating_sub(1))
+                .map(|c| c + 1)
+                .unwrap_or(cols)
+                .min(cols);
+            Some((point.line, start_col, end_col))
+        })
     }
 
     /// Width in pixels of the optional left line-number gutter (0 when disabled).
@@ -1760,7 +1910,14 @@ impl Render for TerminalView {
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
+            .when(self.hyperlink_mods && self.hover_hyperlink, |d| {
+                d.cursor(CursorStyle::PointingHand)
+            })
+            .when(!(self.hyperlink_mods && self.hover_hyperlink), |d| {
+                d.cursor(CursorStyle::IBeam)
+            })
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1864,7 +2021,15 @@ impl Render for TerminalView {
                             term = state_arc.lock();
                         }
 
-                        measured_renderer.paint(bounds, content_pad, &term, window, cx);
+                        let hover_url_span = view_paint.read(cx).hover_url_span;
+                        measured_renderer.paint(
+                            bounds,
+                            content_pad,
+                            &term,
+                            hover_url_span,
+                            window,
+                            cx,
+                        );
                         if let Some((gutter, pad, family, font_size, cell_h, mult)) = line_nums {
                             paint_line_number_gutter(
                                 bounds,
