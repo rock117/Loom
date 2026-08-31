@@ -170,8 +170,15 @@ impl WorkspaceView {
                         m.split_focused(direction, &store, window, cx);
                     });
                 }
-                TabBarEvent::DuplicateProfile(profile_id) => {
-                    this.open_profile_id(*profile_id, window, cx);
+                TabBarEvent::DuplicateProfile(_profile_id) => {
+                    let store = this.store.clone();
+                    this.tabs.update(cx, |m, cx| {
+                        m.duplicate_active_ephemeral(&store, window, cx);
+                    });
+                    this.persist_tabs(cx);
+                }
+                TabBarEvent::SaveTab { tab_id, group_id } => {
+                    this.save_tab_to_group(*tab_id, *group_id, cx);
                 }
             },
         ));
@@ -189,11 +196,13 @@ impl WorkspaceView {
                             .find(|t| t.id == tab_id)
                             .and_then(|t| t.focused_pane())
                             .and_then(|p| {
-                                this.store
-                                    .read(cx)
-                                    .workspace
-                                    .find_profile(p.profile_id)
-                                    .cloned()
+                                p.profile_id.and_then(|pid| {
+                                    this.store
+                                        .read(cx)
+                                        .workspace
+                                        .find_profile(pid)
+                                        .cloned()
+                                })
                             })
                     };
                     if let Some(profile) = profile {
@@ -414,12 +423,76 @@ impl WorkspaceView {
     }
 
     fn new_local_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.store.read(cx).default_local_profile_id().or_else(|| {
-            self.store.update(cx, |s, cx| s.add_local_profile(cx))
+        let store = self.store.clone();
+        self.tabs.update(cx, |m, cx| {
+            m.open_ephemeral_local(&store, window, cx);
         });
-        if let Some(id) = id {
-            self.open_profile_id(id, window, cx);
+        self.persist_tabs(cx);
+    }
+
+    /// Persist an ephemeral tab as a Profile under root or a group.
+    fn save_tab_to_group(
+        &mut self,
+        tab_id: uuid::Uuid,
+        group_id: Option<uuid::Uuid>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::model::Profile;
+        use crate::ui::workspace_store::InsertTarget;
+
+        let Some((kind, label)) = self.tabs.read(cx).tabs.iter().find(|t| t.id == tab_id).and_then(
+            |t| {
+                t.panes.get(&t.focused).map(|p| {
+                    (p.kind.clone(), p.label.clone())
+                })
+            },
+        ) else {
+            return;
+        };
+        // Already bound — nothing to save.
+        if self
+            .tabs
+            .read(cx)
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.panes.get(&t.focused))
+            .and_then(|p| p.profile_id)
+            .is_some()
+        {
+            return;
         }
+
+        let names = self.store.read(cx).workspace.all_profile_names();
+        let mut name = label;
+        if names.iter().any(|n| n == &name) {
+            let mut n = 2u32;
+            loop {
+                let candidate = format!("{name} ({n})");
+                if !names.iter().any(|e| e == &candidate) {
+                    name = candidate;
+                    break;
+                }
+                n += 1;
+            }
+        }
+        let profile = Profile {
+            id: uuid::Uuid::new_v4(),
+            name: name.clone(),
+            kind,
+        };
+        let pid = profile.id;
+        let target = match group_id {
+            Some(gid) => InsertTarget::Group(gid),
+            None => InsertTarget::Root,
+        };
+        self.store.update(cx, |s, cx| {
+            s.place_profile(profile, target, cx);
+        });
+        self.tabs.update(cx, |m, cx| {
+            m.bind_focused_to_profile(tab_id, pid, name, cx);
+        });
+        self.persist_tabs(cx);
     }
 
     fn persist_tabs(&mut self, cx: &mut Context<Self>) {
@@ -671,18 +744,11 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &DuplicateTab, window, cx| {
-                let profile_id = this
-                    .tabs
-                    .read(cx)
-                    .active_tab()
-                    .and_then(|t| {
-                        t.focused_pane()
-                            .map(|p| p.profile_id)
-                            .or_else(|| t.panes.values().next().map(|p| p.profile_id))
-                    });
-                if let Some(pid) = profile_id {
-                    this.open_profile_id(pid, window, cx);
-                }
+                let store = this.store.clone();
+                this.tabs.update(cx, |m, cx| {
+                    m.duplicate_active_ephemeral(&store, window, cx);
+                });
+                this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &SaveWorkspace, _, cx| {
                 this.persist_tabs(cx);

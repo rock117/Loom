@@ -219,6 +219,18 @@ impl Sidebar {
             .find_profile(pid)
             .map(|p| matches!(p.kind, ProfileKind::Ssh { .. }))
             .unwrap_or(false);
+        let in_group = self
+            .store
+            .read(cx)
+            .workspace
+            .group_id_for_profile(pid)
+            .is_some();
+        let moves: Vec<(Uuid, String)> = moves
+            .into_iter()
+            .filter(|(gid, _)| {
+                self.store.read(cx).workspace.group_id_for_profile(pid) != Some(*gid)
+            })
+            .collect();
 
         self.menu_shell()
             .child(self.menu_item(
@@ -262,6 +274,21 @@ impl Sidebar {
                     });
                 },
             ))
+            .when(in_group, |d| {
+                d.child(self.menu_item(
+                    "ctx-move-root",
+                    "Move → / (root)",
+                    false,
+                    cx,
+                    move |this, _, cx| {
+                        this.store.update(cx, |s, cx| {
+                            s.move_profile_to_root(pid, cx);
+                        });
+                        this.context_menu = None;
+                        cx.notify();
+                    },
+                ))
+            })
             .children(moves.into_iter().take(4).map(|(gid, name)| {
                 let label: SharedString = format!("Move → {name}").into();
                 div()
@@ -376,12 +403,12 @@ impl Render for Sidebar {
         let store = self.store.read(cx);
         let renaming = store.rename.clone();
         let selection = store.selection;
-        let groups = store.sidebar_groups();
+        let entries = store.workspace.sidebar_entries();
         let other_groups: Vec<(Uuid, String)> = store
             .workspace
-            .groups
-            .iter()
-            .map(|g| (g.id, g.name.clone()))
+            .walk_groups_all()
+            .into_iter()
+            .map(|(id, name, _, _)| (id, name))
             .collect();
         let context_menu = self
             .context_menu
@@ -483,28 +510,34 @@ impl Render for Sidebar {
                     .overflow_y_scroll()
                     .px(px(theme::SPACE_1))
                     .pb(px(theme::SPACE_2))
-                    .children(groups.into_iter().map(|(gid, gname, collapsed, profiles)| {
-                        let selected_group = selection == Selection::Group(gid);
-                        let folder_icon = if collapsed {
-                            "icons/ui/folder.svg"
-                        } else {
-                            "icons/ui/folder-open.svg"
-                        };
-                        let chevron = if collapsed {
-                            "icons/ui/chevron-right.svg"
-                        } else {
-                            "icons/ui/chevron-down.svg"
-                        };
-                        div()
-                            .mb(px(2.0))
-                            .child(
+                    .children(entries.into_iter().map(|entry| {
+                        match entry {
+                            crate::model::SidebarEntry::Group {
+                                id: gid,
+                                name: gname,
+                                depth,
+                                collapsed,
+                            } => {
+                                let selected_group = selection == Selection::Group(gid);
+                                let folder_icon = if collapsed {
+                                    "icons/ui/folder.svg"
+                                } else {
+                                    "icons/ui/folder-open.svg"
+                                };
+                                let chevron = if collapsed {
+                                    "icons/ui/chevron-right.svg"
+                                } else {
+                                    "icons/ui/chevron-down.svg"
+                                };
+                                let indent = theme::SPACE_1 + depth as f32 * 12.0;
                                 div()
                                     .id(SharedString::from(format!("group-{gid}")))
                                     .flex()
                                     .items_center()
                                     .gap(px(theme::SPACE_1))
                                     .h(px(ROW_H))
-                                    .px(px(theme::SPACE_1))
+                                    .pl(px(indent))
+                                    .pr(px(theme::SPACE_1))
                                     .rounded(px(theme::RADIUS_SM))
                                     .when(selected_group, |d| d.bg(theme::SELECTION))
                                     .hover(|s| s.bg(theme::HOVER))
@@ -512,16 +545,8 @@ impl Render for Sidebar {
                                         style.bg(theme::ACCENT.opacity(0.25))
                                     })
                                     .cursor_pointer()
-                                    .child(Self::svg_icon(
-                                        chevron,
-                                        12.0,
-                                        theme::TEXT_DISABLED,
-                                    ))
-                                    .child(Self::svg_icon(
-                                        folder_icon,
-                                        ICON_TREE,
-                                        theme::ICON_GROUP,
-                                    ))
+                                    .child(Self::svg_icon(chevron, 12.0, theme::TEXT_DISABLED))
+                                    .child(Self::svg_icon(folder_icon, ICON_TREE, theme::ICON_GROUP))
                                     .child({
                                         if let Some(edit) =
                                             renaming.as_ref().filter(|_| selected_group)
@@ -573,12 +598,8 @@ impl Render for Sidebar {
                                         },
                                         |item, _offset, _, cx| {
                                             let label = match item {
-                                                DraggedSidebarItem::Group { name, .. } => {
-                                                    name.clone()
-                                                }
-                                                DraggedSidebarItem::Profile { name, .. } => {
-                                                    name.clone()
-                                                }
+                                                DraggedSidebarItem::Group { name, .. } => name.clone(),
+                                                DraggedSidebarItem::Profile { name, .. } => name.clone(),
                                             };
                                             cx.new(|_| DragPreview::new(label))
                                         },
@@ -604,113 +625,117 @@ impl Render for Sidebar {
                                                 }
                                             }
                                         },
-                                    )),
-                            )
-                            .when(!collapsed, |d| {
-                                d.children(profiles.into_iter().map(|profile| {
-                                    let pid = profile.id;
-                                    let selected = selection == Selection::Profile(pid);
-                                    let (icon_path, icon_color) =
-                                        Self::profile_icon(&profile.kind);
-                                    let drag_name: SharedString = profile.name.clone().into();
-                                    let name_el: AnyElement =
-                                        if let Some(edit) = renaming.as_ref().filter(|_| selected) {
-                                            edit.into_element()
-                                        } else {
-                                            div()
-                                                .flex_1()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_xs()
-                                                .text_color(theme::TEXT)
-                                                .child(profile.name.clone())
-                                                .into_any_element()
-                                        };
-                                    div()
-                                        .id(SharedString::from(format!("profile-{pid}")))
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(theme::SPACE_1))
-                                        .h(px(ROW_H))
-                                        .pl(px(theme::SPACE_4 + 4.0))
-                                        .pr(px(theme::SPACE_1))
-                                        .rounded(px(theme::RADIUS_SM))
-                                        .when(selected, |d| d.bg(theme::SELECTION))
-                                        .hover(|s| s.bg(theme::HOVER))
-                                        .drag_over::<DraggedSidebarItem>(|style, _, _, _| {
-                                            style.bg(theme::ACCENT.opacity(0.25))
-                                        })
-                                        .cursor_pointer()
-                                        .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
-                                        .child(name_el)
-                                        .on_click(cx.listener(
-                                            move |this, event: &ClickEvent, window, cx| {
-                                                this.context_menu = None;
+                                    ))
+                                    .into_any_element()
+                            }
+                            crate::model::SidebarEntry::Profile {
+                                id: pid,
+                                name: pname,
+                                depth,
+                                is_local,
+                            } => {
+                                let selected = selection == Selection::Profile(pid);
+                                let (icon_path, icon_color) = if is_local {
+                                    ("icons/ui/terminal.svg", theme::ICON_LOCAL)
+                                } else {
+                                    ("icons/ui/remote.svg", theme::ICON_REMOTE)
+                                };
+                                let drag_name: SharedString = pname.clone().into();
+                                let indent = theme::SPACE_1 + depth as f32 * 12.0;
+                                let name_el: AnyElement =
+                                    if let Some(edit) = renaming.as_ref().filter(|_| selected) {
+                                        edit.into_element()
+                                    } else {
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .text_xs()
+                                            .text_color(theme::TEXT)
+                                            .child(pname.clone())
+                                            .into_any_element()
+                                    };
+                                div()
+                                    .id(SharedString::from(format!("profile-{pid}")))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .h(px(ROW_H))
+                                    .pl(px(indent + 4.0))
+                                    .pr(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .when(selected, |d| d.bg(theme::SELECTION))
+                                    .hover(|s| s.bg(theme::HOVER))
+                                    .drag_over::<DraggedSidebarItem>(|style, _, _, _| {
+                                        style.bg(theme::ACCENT.opacity(0.25))
+                                    })
+                                    .cursor_pointer()
+                                    .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
+                                    .child(name_el)
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            this.context_menu = None;
+                                            this.focus_handle.focus(window);
+                                            this.store.update(cx, |s, cx| {
+                                                s.select_profile(pid, cx)
+                                            });
+                                            if event.click_count() >= 2 {
+                                                cx.emit(SidebarEvent::OpenProfile(pid));
+                                            }
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(
+                                            move |this, event: &MouseDownEvent, window, cx| {
                                                 this.focus_handle.focus(window);
                                                 this.store.update(cx, |s, cx| {
                                                     s.select_profile(pid, cx)
                                                 });
-                                                if event.click_count() >= 2 {
-                                                    cx.emit(SidebarEvent::OpenProfile(pid));
-                                                }
+                                                this.context_menu = Some(ContextMenuState {
+                                                    target: ContextTarget::Profile(pid),
+                                                    position: event.position,
+                                                });
+                                                cx.notify();
+                                                cx.stop_propagation();
                                             },
-                                        ))
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(
-                                                move |this, event: &MouseDownEvent, window, cx| {
-                                                    this.focus_handle.focus(window);
+                                        ),
+                                    )
+                                    .on_drag(
+                                        DraggedSidebarItem::Profile {
+                                            id: pid,
+                                            name: drag_name,
+                                        },
+                                        |item, _offset, _, cx| {
+                                            let label = match item {
+                                                DraggedSidebarItem::Profile { name, .. } => name.clone(),
+                                                DraggedSidebarItem::Group { name, .. } => name.clone(),
+                                            };
+                                            cx.new(|_| DragPreview::new(label))
+                                        },
+                                    )
+                                    .can_drop(|dragged: &dyn std::any::Any, _, _| {
+                                        matches!(
+                                            dragged.downcast_ref::<DraggedSidebarItem>(),
+                                            Some(DraggedSidebarItem::Profile { .. })
+                                        )
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |this, item: &DraggedSidebarItem, _, cx| {
+                                            this.context_menu = None;
+                                            if let DraggedSidebarItem::Profile { id, .. } = item {
+                                                if *id != pid {
                                                     this.store.update(cx, |s, cx| {
-                                                        s.select_profile(pid, cx)
+                                                        s.move_profile_before(*id, pid, cx);
                                                     });
-                                                    this.context_menu = Some(ContextMenuState {
-                                                        target: ContextTarget::Profile(pid),
-                                                        position: event.position,
-                                                    });
-                                                    cx.notify();
-                                                    cx.stop_propagation();
-                                                },
-                                            ),
-                                        )
-                                        .on_drag(
-                                            DraggedSidebarItem::Profile {
-                                                id: pid,
-                                                name: drag_name,
-                                            },
-                                            |item, _offset, _, cx| {
-                                                let label = match item {
-                                                    DraggedSidebarItem::Profile { name, .. } => {
-                                                        name.clone()
-                                                    }
-                                                    DraggedSidebarItem::Group { name, .. } => {
-                                                        name.clone()
-                                                    }
-                                                };
-                                                cx.new(|_| DragPreview::new(label))
-                                            },
-                                        )
-                                        .can_drop(|dragged: &dyn std::any::Any, _, _| {
-                                            matches!(
-                                                dragged.downcast_ref::<DraggedSidebarItem>(),
-                                                Some(DraggedSidebarItem::Profile { .. })
-                                            )
-                                        })
-                                        .on_drop(cx.listener(
-                                            move |this, item: &DraggedSidebarItem, _, cx| {
-                                                this.context_menu = None;
-                                                if let DraggedSidebarItem::Profile { id, .. } = item
-                                                {
-                                                    if *id != pid {
-                                                        this.store.update(cx, |s, cx| {
-                                                            s.move_profile_before(*id, pid, cx);
-                                                        });
-                                                    }
                                                 }
-                                            },
-                                        ))
-                                }))
-                            })
+                                            }
+                                        },
+                                    ))
+                                    .into_any_element()
+                            }
+                        }
                     })),
             )
             // Hint footer — shortcuts instead of button wall

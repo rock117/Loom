@@ -216,6 +216,27 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-08-31 — Session / Profile / Group IA（Unix 根隐喻）
+
+**Status:** accepted（实施中）  
+
+**Context:** 侧栏强制「Profile 必须属于 Group」、Tab 与 Profile 强绑定，导致 Ctrl+T / Duplicate 语义拧巴。
+
+**Decision:**
+- 工作区根像 `/`：可挂 **Profile（文件）** 与 **Group（目录，可嵌套）**。  
+- 侧栏 New* / Duplicate Profile → 只改收藏，**不**自动开 Session。  
+- Ctrl+T / Tab Duplicate / Split → **Ephemeral** Session；重启不恢复。  
+- 点侧栏打开 → Bound；Tab「Save to…」升级为 Profile。  
+- 文案统一 **Duplicate**，靠 context 区分。  
+
+规格：[SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md)。
+
+**Why:** 对齐 Unix 文件哲学与 Postman「收藏 vs 运行中会话」；临时会话不污染侧栏。
+
+**Consequences / follow-ups:** Group 跨层 DnD、删目录级联 UI 可后续增强。
+
+---
+
 ## How to use this file in review
 
 1. Before changing terminal stack, UI toolkit, or license boundary, read matching sections here.  

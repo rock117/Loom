@@ -14,6 +14,15 @@ pub enum Selection {
     Profile(Uuid),
 }
 
+/// Where to place a newly created profile or group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertTarget {
+    /// Workspace root (`/`).
+    Root,
+    /// Inside this group.
+    Group(Uuid),
+}
+
 pub struct WorkspaceStore {
     pub workspace: WorkspaceFile,
     pub ui_state: UiStateFile,
@@ -61,6 +70,18 @@ impl WorkspaceStore {
         }
     }
 
+    /// New* placement from current selection (Unix `/` rules).
+    pub fn insert_target(&self) -> InsertTarget {
+        match self.selection {
+            Selection::Group(id) => InsertTarget::Group(id),
+            Selection::Profile(pid) => match self.workspace.group_id_for_profile(pid) {
+                Some(gid) => InsertTarget::Group(gid),
+                None => InsertTarget::Root,
+            },
+            Selection::None => InsertTarget::Root,
+        }
+    }
+
     pub fn select_group(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if self.selection != Selection::Group(id) {
             self.rename = None;
@@ -86,18 +107,28 @@ impl WorkspaceStore {
     }
 
     pub fn add_group(&mut self, cx: &mut Context<Self>) {
-        let name = unique_name(
-            "Group",
-            &self
+        let sibling_names: Vec<String> = match self.insert_target() {
+            InsertTarget::Root => self.workspace.groups.iter().map(|g| g.name.clone()).collect(),
+            InsertTarget::Group(gid) => self
                 .workspace
-                .groups
-                .iter()
-                .map(|g| g.name.clone())
-                .collect::<Vec<_>>(),
-        );
+                .find_group(gid)
+                .map(|g| g.children.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default(),
+        };
+        let name = unique_name("Group", &sibling_names);
         let group = Group::new(name);
         let id = group.id;
-        self.workspace.groups.push(group);
+        match self.insert_target() {
+            InsertTarget::Root => self.workspace.groups.push(group),
+            InsertTarget::Group(gid) => {
+                if let Some(parent) = self.workspace.find_group_mut(gid) {
+                    parent.children.push(group);
+                    parent.collapsed = false;
+                } else {
+                    self.workspace.groups.push(group);
+                }
+            }
+        }
         self.selection = Selection::Group(id);
         self.mark_dirty();
         self.persist_now();
@@ -105,23 +136,20 @@ impl WorkspaceStore {
     }
 
     pub fn add_local_profile(&mut self, cx: &mut Context<Self>) -> Option<Uuid> {
-        let group_id = match self.selection {
-            Selection::Group(id) => id,
-            Selection::Profile(pid) => self.workspace.group_id_for_profile(pid)?,
-            Selection::None => self.workspace.groups.first().map(|g| g.id)?,
-        };
-        let names: Vec<String> = self
-            .workspace
-            .groups
-            .iter()
-            .flat_map(|g| g.profiles.iter().map(|p| p.name.clone()))
-            .collect();
+        let names = self.workspace.all_profile_names();
         let name = unique_name("Shell", &names);
         let profile = Profile::new_local(name);
         let id = profile.id;
-        if let Some(g) = self.workspace.find_group_mut(group_id) {
-            g.profiles.push(profile);
-            g.collapsed = false;
+        match self.insert_target() {
+            InsertTarget::Root => self.workspace.profiles.push(profile),
+            InsertTarget::Group(gid) => {
+                if let Some(g) = self.workspace.find_group_mut(gid) {
+                    g.profiles.push(profile);
+                    g.collapsed = false;
+                } else {
+                    self.workspace.profiles.push(profile);
+                }
+            }
         }
         self.selection = Selection::Profile(id);
         self.mark_dirty();
@@ -131,29 +159,49 @@ impl WorkspaceStore {
     }
 
     pub fn add_ssh_profile(&mut self, profile: Profile, cx: &mut Context<Self>) -> bool {
-        let group_id = match self.selection {
-            Selection::Group(id) => id,
-            Selection::Profile(pid) => match self.workspace.group_id_for_profile(pid) {
-                Some(id) => id,
-                None => return false,
-            },
-            Selection::None => match self.workspace.groups.first().map(|g| g.id) {
-                Some(id) => id,
-                None => return false,
-            },
-        };
         let id = profile.id;
-        if let Some(g) = self.workspace.find_group_mut(group_id) {
-            g.profiles.push(profile);
-            g.collapsed = false;
-        } else {
-            return false;
+        match self.insert_target() {
+            InsertTarget::Root => self.workspace.profiles.push(profile),
+            InsertTarget::Group(gid) => {
+                if let Some(g) = self.workspace.find_group_mut(gid) {
+                    g.profiles.push(profile);
+                    g.collapsed = false;
+                } else {
+                    self.workspace.profiles.push(profile);
+                }
+            }
         }
         self.selection = Selection::Profile(id);
         self.mark_dirty();
         self.persist_now();
         cx.notify();
         true
+    }
+
+    /// Insert an existing profile into root or a group (Save to… / move).
+    pub fn place_profile(
+        &mut self,
+        profile: Profile,
+        target: InsertTarget,
+        cx: &mut Context<Self>,
+    ) -> Uuid {
+        let id = profile.id;
+        match target {
+            InsertTarget::Root => self.workspace.profiles.push(profile),
+            InsertTarget::Group(gid) => {
+                if let Some(g) = self.workspace.find_group_mut(gid) {
+                    g.profiles.push(profile);
+                    g.collapsed = false;
+                } else {
+                    self.workspace.profiles.push(profile);
+                }
+            }
+        }
+        self.selection = Selection::Profile(id);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        id
     }
 
     /// Update an existing SSH profile's connection fields (keeps id / group).
@@ -188,14 +236,25 @@ impl WorkspaceStore {
     }
 
     pub fn duplicate_profile(&mut self, id: Uuid, cx: &mut Context<Self>) -> Option<Uuid> {
-        let group_id = self.workspace.group_id_for_profile(id)?;
+        let parent = self.workspace.group_id_for_profile(id);
         let dup = self.workspace.find_profile(id)?.duplicate();
         let new_id = dup.id;
-        if let Some(g) = self.workspace.find_group_mut(group_id) {
-            if let Some(pos) = g.profiles.iter().position(|p| p.id == id) {
-                g.profiles.insert(pos + 1, dup);
-            } else {
-                g.profiles.push(dup);
+        match parent {
+            None => {
+                if let Some(pos) = self.workspace.profiles.iter().position(|p| p.id == id) {
+                    self.workspace.profiles.insert(pos + 1, dup);
+                } else {
+                    self.workspace.profiles.push(dup);
+                }
+            }
+            Some(gid) => {
+                if let Some(g) = self.workspace.find_group_mut(gid) {
+                    if let Some(pos) = g.profiles.iter().position(|p| p.id == id) {
+                        g.profiles.insert(pos + 1, dup);
+                    } else {
+                        g.profiles.push(dup);
+                    }
+                }
             }
         }
         self.selection = Selection::Profile(new_id);
@@ -216,13 +275,11 @@ impl WorkspaceStore {
                 cx.notify();
             }
             Selection::Group(id) => {
-                if let Some(g) = self.workspace.groups.iter().find(|g| g.id == id) {
-                    for p in &g.profiles {
-                        let _ = crate::session::credentials::delete_password(p.id);
-                    }
+                for pid in self.workspace.profile_ids_in_group(id) {
+                    let _ = crate::session::credentials::delete_password(pid);
                 }
-                self.workspace.groups.retain(|g| g.id != id);
-                if self.workspace.groups.is_empty() {
+                self.workspace.remove_group(id);
+                if self.workspace.groups.is_empty() && self.workspace.profiles.is_empty() {
                     self.workspace = WorkspaceFile::default_workspace();
                 }
                 self.selection = Selection::None;
@@ -237,12 +294,7 @@ impl WorkspaceStore {
     pub fn begin_rename(&mut self, cx: &mut Context<Self>) {
         let name = match self.selection {
             Selection::Profile(id) => self.workspace.find_profile(id).map(|p| p.name.clone()),
-            Selection::Group(id) => self
-                .workspace
-                .groups
-                .iter()
-                .find(|g| g.id == id)
-                .map(|g| g.name.clone()),
+            Selection::Group(id) => self.workspace.find_group(id).map(|g| g.name.clone()),
             Selection::None => None,
         };
         if let Some(name) = name {
@@ -309,13 +361,27 @@ impl WorkspaceStore {
         if let Some(g) = self.workspace.find_group_mut(target_group) {
             g.profiles.push(profile);
             g.collapsed = false;
+        } else {
+            self.workspace.profiles.push(profile);
         }
         self.mark_dirty();
         self.persist_now();
         cx.notify();
     }
 
+    pub fn move_profile_to_root(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
+        let Some(profile) = self.workspace.remove_profile(profile_id) else {
+            return;
+        };
+        self.workspace.profiles.push(profile);
+        self.selection = Selection::Profile(profile_id);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+    }
+
     /// Move a profile into the group of `before_profile`, inserting before it.
+    /// If `before_profile` is at root, insert before it among root profiles.
     pub fn move_profile_before(
         &mut self,
         profile_id: Uuid,
@@ -325,20 +391,33 @@ impl WorkspaceStore {
         if profile_id == before_profile {
             return;
         }
-        let Some(target_group) = self.workspace.group_id_for_profile(before_profile) else {
-            return;
-        };
+        let parent = self.workspace.group_id_for_profile(before_profile);
         let Some(profile) = self.workspace.remove_profile(profile_id) else {
             return;
         };
-        if let Some(g) = self.workspace.find_group_mut(target_group) {
-            let pos = g
-                .profiles
-                .iter()
-                .position(|p| p.id == before_profile)
-                .unwrap_or(g.profiles.len());
-            g.profiles.insert(pos, profile);
-            g.collapsed = false;
+        match parent {
+            None => {
+                let pos = self
+                    .workspace
+                    .profiles
+                    .iter()
+                    .position(|p| p.id == before_profile)
+                    .unwrap_or(self.workspace.profiles.len());
+                self.workspace.profiles.insert(pos, profile);
+            }
+            Some(gid) => {
+                if let Some(g) = self.workspace.find_group_mut(gid) {
+                    let pos = g
+                        .profiles
+                        .iter()
+                        .position(|p| p.id == before_profile)
+                        .unwrap_or(g.profiles.len());
+                    g.profiles.insert(pos, profile);
+                    g.collapsed = false;
+                } else {
+                    self.workspace.profiles.push(profile);
+                }
+            }
         }
         self.selection = Selection::Profile(profile_id);
         self.mark_dirty();
@@ -346,7 +425,7 @@ impl WorkspaceStore {
         cx.notify();
     }
 
-    /// Reorder groups: place `dragged` immediately before `before`.
+    /// Reorder root-level groups only (MVP): place `dragged` immediately before `before`.
     pub fn reorder_group_before(
         &mut self,
         dragged: Uuid,
@@ -369,14 +448,6 @@ impl WorkspaceStore {
         self.mark_dirty();
         self.persist_now();
         cx.notify();
-    }
-
-    pub fn sidebar_groups(&self) -> Vec<(Uuid, String, bool, Vec<Profile>)> {
-        self.workspace
-            .groups
-            .iter()
-            .map(|g| (g.id, g.name.clone(), g.collapsed, g.profiles.clone()))
-            .collect()
     }
 
     pub fn sync_open_tabs(&mut self, tabs: &[(Uuid, Option<String>)], active: usize) {

@@ -19,7 +19,12 @@ use crate::ui::workspace_store::WorkspaceStore;
 
 pub struct PaneSession {
     pub id: Uuid,
-    pub profile_id: Uuid,
+    /// `None` = ephemeral (not in sidebar, not restored on restart).
+    pub profile_id: Option<Uuid>,
+    /// Connection snapshot for spawn / reconnect / Save to….
+    pub kind: ProfileKind,
+    /// Display name (profile name or ephemeral label).
+    pub label: String,
     pub state: ConnectionState,
     pub status_message: String,
     pub terminal: Option<Entity<TerminalView>>,
@@ -101,7 +106,17 @@ impl TabManager {
     ) {
         match &profile.kind {
             ProfileKind::Local { .. } => {
-                match self.spawn_local(profile, default_shell, font_family, store, window, cx) {
+                match self.spawn_local(
+                    Some(profile.id),
+                    &profile.kind,
+                    &profile.name,
+                    default_shell,
+                    font_family,
+                    store,
+                    None,
+                    window,
+                    cx,
+                ) {
                     Ok(pane) => {
                         let title = self.unique_tab_title(&profile.name);
                         let tab = wrap_pane_as_tab(title, pane);
@@ -162,7 +177,9 @@ impl TabManager {
     fn push_failed(&mut self, profile: &Profile, message: String, cx: &mut Context<Self>) {
         let pane = PaneSession {
             id: Uuid::new_v4(),
-            profile_id: profile.id,
+            profile_id: Some(profile.id),
+            kind: profile.kind.clone(),
+            label: profile.name.clone(),
             state: ConnectionState::Failed,
             status_message: message,
             terminal: None,
@@ -196,7 +213,9 @@ impl TabManager {
         let pane_id = Uuid::new_v4();
         let pane = PaneSession {
             id: pane_id,
-            profile_id: profile.id,
+            profile_id: Some(profile.id),
+            kind: profile.kind.clone(),
+            label: profile.name.clone(),
             state: ConnectionState::Connecting,
             status_message: format!("connecting to {user}@{host}:{port}…"),
             terminal: None,
@@ -224,9 +243,21 @@ impl TabManager {
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
+        self.spawn_ssh_connect_kind(tab_id, pane_id, &profile.kind, auth, font_family, cx);
+    }
+
+    fn spawn_ssh_connect_kind(
+        &mut self,
+        tab_id: Uuid,
+        pane_id: Uuid,
+        kind: &ProfileKind,
+        auth: SshAuthMaterial,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
         let ProfileKind::Ssh {
             host, port, user, ..
-        } = &profile.kind
+        } = kind
         else {
             return;
         };
@@ -299,14 +330,17 @@ impl TabManager {
 
     fn spawn_local(
         &self,
-        profile: &Profile,
+        profile_id: Option<Uuid>,
+        kind: &ProfileKind,
+        label: &str,
         default_shell: Option<&str>,
         font_family: &str,
         store: &Entity<WorkspaceStore>,
+        cwd_override: Option<std::path::PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<PaneSession> {
-        let ProfileKind::Local { shell, cwd, .. } = &profile.kind else {
+        let ProfileKind::Local { shell, cwd, .. } = kind else {
             anyhow::bail!("not a local profile");
         };
         let configured = shell.as_deref().or(default_shell);
@@ -319,9 +353,10 @@ impl TabManager {
                 s.settings.local_proxy_no_proxy.clone(),
             )
         };
+        let spawn_cwd = cwd_override.as_deref().or(cwd.as_deref());
         let pty = LocalPty::spawn(
             &shell,
-            cwd.as_deref(),
+            spawn_cwd,
             proxy_mode,
             proxy_url.as_deref(),
             proxy_no.as_deref(),
@@ -336,8 +371,8 @@ impl TabManager {
             font_family
         };
         let config = terminal_config(self.font_size, family, self.show_line_numbers);
-        let working_dir = cwd
-            .clone()
+        let working_dir = spawn_cwd
+            .map(std::path::Path::to_path_buf)
             .or_else(|| LocalPty::default_cwd());
         let terminal = cx.new(|cx| {
             TerminalView::new(pty.writer, pty.reader, config, cx)
@@ -356,9 +391,19 @@ impl TabManager {
             .and_then(|s| s.to_str())
             .unwrap_or(&shell);
 
+        let mut kind = kind.clone();
+        if let ProfileKind::Local {
+            cwd: ref mut c, ..
+        } = kind
+        {
+            *c = working_dir.clone();
+        }
+
         Ok(PaneSession {
             id: Uuid::new_v4(),
-            profile_id: profile.id,
+            profile_id,
+            kind,
+            label: label.to_string(),
             state: ConnectionState::Connected,
             status_message: format!("{shell_short} · {cwd_label}"),
             terminal: Some(terminal),
@@ -384,33 +429,35 @@ impl TabManager {
             return;
         };
         let focused = self.tabs[tab_idx].focused;
-        let Some(profile_id) = self.tabs[tab_idx]
-            .panes
-            .get(&focused)
-            .map(|p| p.profile_id)
-        else {
-            return;
-        };
-
-        let (profile, default_shell, font_family) = {
-            let s = store.read(cx);
+        let Some(source) = self.tabs[tab_idx].panes.get(&focused).map(|p| {
             (
-                s.workspace.find_profile(profile_id).cloned(),
-                s.settings.default_shell.clone(),
-                s.settings.font_family.clone(),
+                p.kind.clone(),
+                p.label.clone(),
+                p.profile_id,
+                p.terminal
+                    .as_ref()
+                    .and_then(|t| t.read(cx).working_directory()),
             )
-        };
-        let Some(profile) = profile else {
+        }) else {
             return;
         };
+        let (kind, label, auth_profile_id, live_cwd) = source;
 
-        match &profile.kind {
+        let (default_shell, font_family) = {
+            let s = store.read(cx);
+            (s.settings.default_shell.clone(), s.settings.font_family.clone())
+        };
+
+        match &kind {
             ProfileKind::Local { .. } => {
                 match self.spawn_local(
-                    &profile,
+                    None,
+                    &kind,
+                    &label,
                     default_shell.as_deref(),
                     &font_family,
                     store,
+                    live_cwd,
                     window,
                     cx,
                 ) {
@@ -424,8 +471,8 @@ impl TabManager {
                         cx.notify();
                     }
                     Err(err) => {
+                        // Do not mark the source pane Failed — only report on status.
                         if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
-                            pane.state = ConnectionState::Failed;
                             pane.status_message = format!("split failed: {err:#}");
                         }
                         cx.notify();
@@ -433,12 +480,19 @@ impl TabManager {
                 }
             }
             ProfileKind::Ssh { host, port, user, .. } => {
-                match resolve_ssh_auth(&profile, None) {
+                let pseudo = Profile {
+                    id: auth_profile_id.unwrap_or_else(Uuid::nil),
+                    name: label.clone(),
+                    kind: kind.clone(),
+                };
+                match resolve_ssh_auth(&pseudo, None) {
                     Ok(Some(auth)) => {
                         let new_id = Uuid::new_v4();
                         let pane = PaneSession {
                             id: new_id,
-                            profile_id: profile.id,
+                            profile_id: None,
+                            kind: kind.clone(),
+                            label: label.clone(),
                             state: ConnectionState::Connecting,
                             status_message: format!("connecting to {user}@{host}:{port}…"),
                             terminal: None,
@@ -454,7 +508,14 @@ impl TabManager {
                             tab.focused = new_id;
                         }
                         cx.notify();
-                        self.spawn_ssh_connect(tab_id, new_id, &profile, auth, &font_family, cx);
+                        self.spawn_ssh_connect_kind(
+                            tab_id,
+                            new_id,
+                            &kind,
+                            auth,
+                            &font_family,
+                            cx,
+                        );
                     }
                     Ok(None) => {
                         if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
@@ -548,37 +609,39 @@ impl TabManager {
             return;
         };
         let focused = self.tabs[idx].focused;
-        let Some(profile_id) = self.tabs[idx]
-            .panes
-            .get(&focused)
-            .map(|p| p.profile_id)
-        else {
+        let Some((profile_id, kind, label)) = self.tabs[idx].panes.get(&focused).map(|p| {
+            (p.profile_id, p.kind.clone(), p.label.clone())
+        }) else {
             return;
         };
 
-        let (profile, default_shell, font_family) = {
+        let (default_shell, font_family) = {
             let s = store.read(cx);
-            (
-                s.workspace.find_profile(profile_id).cloned(),
-                s.settings.default_shell.clone(),
-                s.settings.font_family.clone(),
-            )
+            (s.settings.default_shell.clone(), s.settings.font_family.clone())
         };
-        let Some(profile) = profile else {
-            if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                pane.state = ConnectionState::Failed;
-                pane.status_message = "profile missing".into();
-            }
-            cx.notify();
-            return;
-        };
+
+        // Prefer live Profile fields when Bound; otherwise use pane snapshot.
+        let kind = profile_id
+            .and_then(|pid| store.read(cx).workspace.find_profile(pid).map(|p| p.kind.clone()))
+            .unwrap_or(kind);
+        let label = profile_id
+            .and_then(|pid| {
+                store
+                    .read(cx)
+                    .workspace
+                    .find_profile(pid)
+                    .map(|p| p.name.clone())
+            })
+            .unwrap_or(label);
 
         if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
             teardown_pane_io(pane);
             drop(pane.terminal.take());
+            pane.kind = kind.clone();
+            pane.label = label.clone();
         }
 
-        match &profile.kind {
+        match &kind {
             ProfileKind::Local { .. } => {
                 let Some(window) = window else {
                     if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
@@ -593,10 +656,13 @@ impl TabManager {
                     pane.status_message = "reconnecting…".into();
                 }
                 match self.spawn_local(
-                    &profile,
+                    profile_id,
+                    &kind,
+                    &label,
                     default_shell.as_deref(),
                     &font_family,
                     store,
+                    None,
                     window,
                     cx,
                 ) {
@@ -614,16 +680,28 @@ impl TabManager {
                 cx.notify();
             }
             ProfileKind::Ssh { host, port, user, .. } => {
-                match resolve_ssh_auth(&profile, password) {
+                let pseudo = Profile {
+                    id: profile_id.unwrap_or_else(Uuid::nil),
+                    name: label.clone(),
+                    kind: kind.clone(),
+                };
+                match resolve_ssh_auth(&pseudo, password) {
                     Ok(Some(auth)) => {
                         if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                            pane.profile_id = profile.id;
+                            pane.profile_id = profile_id;
                             pane.state = ConnectionState::Connecting;
                             pane.status_message =
                                 format!("connecting to {user}@{host}:{port}…");
                         }
                         cx.notify();
-                        self.spawn_ssh_connect(tab_id, focused, &profile, auth, &font_family, cx);
+                        self.spawn_ssh_connect_kind(
+                            tab_id,
+                            focused,
+                            &kind,
+                            auth,
+                            &font_family,
+                            cx,
+                        );
                     }
                     Ok(None) => {
                         if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
@@ -880,12 +958,12 @@ impl TabManager {
         cx.notify();
     }
 
-    /// Profile id for the focused pane of a tab (fallback: any pane).
+    /// Profile id for the focused pane of a tab (fallback: any pane). `None` if ephemeral.
     pub fn profile_id_for_tab(&self, tab_id: Uuid) -> Option<Uuid> {
         let tab = self.tabs.iter().find(|t| t.id == tab_id)?;
         tab.focused_pane()
-            .map(|p| p.profile_id)
-            .or_else(|| tab.panes.values().next().map(|p| p.profile_id))
+            .and_then(|p| p.profile_id)
+            .or_else(|| tab.panes.values().find_map(|p| p.profile_id))
     }
 
     /// Prefer `base`, then `base (2)`, `base (3)`, … so duplicate tabs stay distinguishable.
@@ -950,30 +1028,7 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab) = self.active_tab() else {
-            return;
-        };
-        let Some(profile_id) = tab.focused_pane().map(|p| p.profile_id) else {
-            return;
-        };
-        let profile = store.read(cx).workspace.find_profile(profile_id).cloned();
-        let (default_shell, font_family) = {
-            let s = store.read(cx);
-            (
-                s.settings.default_shell.clone(),
-                s.settings.font_family.clone(),
-            )
-        };
-        if let Some(profile) = profile {
-            self.open_profile(
-                &profile,
-                default_shell.as_deref(),
-                &font_family,
-                store,
-                window,
-                cx,
-            );
-        }
+        self.duplicate_active_ephemeral(store, window, cx);
     }
 
     pub fn begin_rename_active(&mut self, _cx: &mut Context<Self>) -> Option<String> {
@@ -1027,18 +1082,187 @@ impl TabManager {
     }
 
     pub fn snapshot_for_persist(&self) -> (Vec<(Uuid, Option<String>)>, usize) {
-        let tabs = self
+        // Only Bound tabs — ephemeral sessions are not restored.
+        let tabs: Vec<(Uuid, Option<String>)> = self
             .tabs
             .iter()
-            .map(|t| {
-                let profile_id = t
-                    .focused_pane()
-                    .map(|p| p.profile_id)
-                    .unwrap_or_else(Uuid::nil);
-                (profile_id, Some(t.title.clone()))
+            .filter_map(|t| {
+                let pid = t.focused_pane().and_then(|p| p.profile_id)?;
+                Some((pid, Some(t.title.clone())))
             })
             .collect();
-        (tabs, self.active_index())
+        let active = self
+            .active
+            .and_then(|id| {
+                self.tabs
+                    .iter()
+                    .filter(|t| t.focused_pane().and_then(|p| p.profile_id).is_some())
+                    .position(|t| t.id == id)
+            })
+            .unwrap_or(0);
+        (tabs, active)
+    }
+
+    /// Ctrl+T / +: ephemeral Local session (not in sidebar).
+    pub fn open_ephemeral_local(
+        &mut self,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (default_shell, font_family) = {
+            let s = store.read(cx);
+            (s.settings.default_shell.clone(), s.settings.font_family.clone())
+        };
+        let kind = ProfileKind::Local {
+            shell: default_shell.clone(),
+            cwd: None,
+            env: Vec::new(),
+        };
+        let label = "Shell";
+        match self.spawn_local(
+            None,
+            &kind,
+            label,
+            default_shell.as_deref(),
+            &font_family,
+            store,
+            None,
+            window,
+            cx,
+        ) {
+            Ok(pane) => {
+                let title = self.unique_tab_title(label);
+                let tab = wrap_pane_as_tab(title, pane);
+                let id = tab.id;
+                self.tabs.push(tab);
+                self.active = Some(id);
+                cx.notify();
+            }
+            Err(err) => {
+                eprintln!("loom: ephemeral local failed: {err:#}");
+            }
+        }
+    }
+
+    /// Duplicate focused session as a new ephemeral tab.
+    pub fn duplicate_active_ephemeral(
+        &mut self,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let Some(source) = tab.focused_pane() else {
+            return;
+        };
+        let kind = source.kind.clone();
+        let label = source.label.clone();
+        let auth_pid = source.profile_id;
+        let live_cwd = source
+            .terminal
+            .as_ref()
+            .and_then(|t| t.read(cx).working_directory());
+
+        let (default_shell, font_family) = {
+            let s = store.read(cx);
+            (s.settings.default_shell.clone(), s.settings.font_family.clone())
+        };
+
+        match &kind {
+            ProfileKind::Local { .. } => {
+                match self.spawn_local(
+                    None,
+                    &kind,
+                    &label,
+                    default_shell.as_deref(),
+                    &font_family,
+                    store,
+                    live_cwd,
+                    window,
+                    cx,
+                ) {
+                    Ok(pane) => {
+                        let title = self.unique_tab_title(&label);
+                        let tab = wrap_pane_as_tab(title, pane);
+                        let id = tab.id;
+                        self.tabs.push(tab);
+                        self.active = Some(id);
+                        cx.notify();
+                    }
+                    Err(err) => eprintln!("loom: duplicate local failed: {err:#}"),
+                }
+            }
+            ProfileKind::Ssh { host, port, user, .. } => {
+                let pseudo = Profile {
+                    id: auth_pid.unwrap_or_else(Uuid::nil),
+                    name: label.clone(),
+                    kind: kind.clone(),
+                };
+                match resolve_ssh_auth(&pseudo, None) {
+                    Ok(Some(auth)) => {
+                        let pane_id = Uuid::new_v4();
+                        let pane = PaneSession {
+                            id: pane_id,
+                            profile_id: None,
+                            kind: kind.clone(),
+                            label: label.clone(),
+                            state: ConnectionState::Connecting,
+                            status_message: format!("connecting to {user}@{host}:{port}…"),
+                            terminal: None,
+                            pty_master: None,
+                            pty_killer: None,
+                            ssh_shutdown: None,
+                            ssh_sftp: None,
+                            _term_subscriptions: Vec::new(),
+                        };
+                        let title = self.unique_tab_title(&label);
+                        let tab = wrap_pane_as_tab(title, pane);
+                        let tab_id = tab.id;
+                        self.tabs.push(tab);
+                        self.active = Some(tab_id);
+                        cx.notify();
+                        self.spawn_ssh_connect_kind(
+                            tab_id,
+                            pane_id,
+                            &kind,
+                            auth,
+                            &font_family,
+                            cx,
+                        );
+                    }
+                    Ok(None) => {
+                        // Fall back to opening Bound profile so password prompt can run.
+                        if let Some(pid) = auth_pid {
+                            let _ = pid;
+                        }
+                        eprintln!("loom: duplicate SSH needs password — open from sidebar or save first");
+                    }
+                    Err(err) => eprintln!("loom: duplicate SSH failed: {err:#}"),
+                }
+            }
+        }
+    }
+
+    /// Bind an ephemeral pane to a newly saved profile id.
+    pub fn bind_focused_to_profile(
+        &mut self,
+        tab_id: Uuid,
+        profile_id: Uuid,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        if let Some(pane) = tab.panes.get_mut(&tab.focused) {
+            pane.profile_id = Some(profile_id);
+            pane.label = label.clone();
+        }
+        tab.title = label;
+        cx.notify();
     }
 }
 

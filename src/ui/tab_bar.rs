@@ -204,10 +204,10 @@ impl TabBar {
             .store
             .read(cx)
             .workspace
-            .groups
-            .iter()
-            .filter(|g| Some(g.id) != current_group)
-            .map(|g| (g.id, g.name.clone()))
+            .walk_groups()
+            .into_iter()
+            .filter(|(id, _, _, _)| Some(*id) != current_group)
+            .map(|(id, name, _, _)| (id, name))
             .collect();
 
         let mut menu = self
@@ -262,21 +262,67 @@ impl TabBar {
             .child(self.menu_divider())
             .child(self.menu_item(
                 "tab-ctx-dup",
-                "Duplicate Tab",
-                profile_id.is_some(),
+                "Duplicate",
+                true,
                 cx,
-                move |this, _, cx| {
-                    if let Some(pid) = profile_id {
-                        cx.emit(TabBarEvent::DuplicateProfile(pid));
-                    } else {
-                        let _ = this;
-                    }
+                move |_, _, cx| {
+                    cx.emit(TabBarEvent::DuplicateProfile(Uuid::nil()));
                 },
             ));
 
+        if profile_id.is_none() {
+            menu = menu.child(self.menu_divider()).child(self.menu_item(
+                "tab-ctx-save-root",
+                "Save to / (root)",
+                true,
+                cx,
+                move |_, _, cx| {
+                    cx.emit(TabBarEvent::SaveTab {
+                        tab_id,
+                        group_id: None,
+                    });
+                },
+            ));
+            for (gid, name, depth, _) in self.store.read(cx).workspace.walk_groups_all() {
+                let indent = "  ".repeat(depth as usize);
+                let label: SharedString = format!("{indent}Save to {name}").into();
+                menu = menu.child(
+                    div()
+                        .id(SharedString::from(format!("tab-ctx-save-{gid}")))
+                        .w_full()
+                        .px(px(theme::SPACE_2))
+                        .py(px(theme::SPACE_1))
+                        .rounded(px(theme::RADIUS_SM))
+                        .text_color(theme::TEXT)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::HOVER))
+                        .child(label)
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(TabBarEvent::SaveTab {
+                                tab_id,
+                                group_id: Some(gid),
+                            });
+                            cx.stop_propagation();
+                        })),
+                );
+            }
+        }
+
         if let Some(pid) = profile_id {
+            menu = menu.child(self.menu_divider()).child(self.menu_item(
+                "tab-ctx-save-root-move",
+                "Move Profile → / (root)",
+                current_group.is_some(),
+                cx,
+                move |this, _, cx| {
+                    this.store.update(cx, |s, cx| {
+                        s.move_profile_to_root(pid, cx);
+                    });
+                    this.context_menu = None;
+                    cx.notify();
+                },
+            ));
             if !other_groups.is_empty() {
-                menu = menu.child(self.menu_divider());
                 for (gid, name) in other_groups {
                     let label: SharedString = format!("Move Profile → {name}").into();
                     menu = menu.child(
@@ -578,8 +624,13 @@ pub enum TabBarEvent {
     NewTab,
     Changed,
     Split(SplitDirection),
-    /// Open another session for this profile (same sidebar group).
+    /// Duplicate focused tab as ephemeral session (id unused).
     DuplicateProfile(Uuid),
+    /// Save ephemeral tab to workspace root (`group_id: None`) or a group.
+    SaveTab {
+        tab_id: Uuid,
+        group_id: Option<Uuid>,
+    },
 }
 
 impl EventEmitter<TabBarEvent> for TabBar {}

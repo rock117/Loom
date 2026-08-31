@@ -151,12 +151,17 @@ impl Render for StatusBar {
             let state = pane
                 .map(|p| p.state)
                 .unwrap_or(ConnectionState::Idle);
-            let profile_id = pane.map(|p| p.profile_id);
+            let profile_id = pane.and_then(|p| p.profile_id);
             let profile = profile_id.and_then(|pid| {
                 self.store.read(cx).workspace.find_profile(pid).cloned()
             });
+            let kind_fallback = pane.map(|p| p.kind.clone());
 
-            let (kind_icon, kind_color, target, is_ssh) = match profile.as_ref().map(|p| &p.kind) {
+            let (kind_icon, kind_color, target, is_ssh) = match profile
+                .as_ref()
+                .map(|p| &p.kind)
+                .or(kind_fallback.as_ref())
+            {
                 Some(ProfileKind::Ssh {
                     host, port, user, ..
                 }) => (

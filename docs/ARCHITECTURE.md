@@ -15,6 +15,7 @@ For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草
 For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
 For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
+For **Session / Profile / Group IA（根级 Profile、嵌套 Group、临时 Tab）**, see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md).  
 For **Local shell 选型 / pwsh 慢 / cmd 快 / 启动性能**, see [LOCAL_SHELL.md](./LOCAL_SHELL.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
@@ -201,4 +202,5 @@ Started on the GPUI tree (post Slint rollback):
 - [x] Context panel (right column): SFTP Files browser + Info — see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md)
 - [x] SSH/PTY disconnect → Failed + status-bar Reconnect (manual) — see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md)
 - [x] Local shell proxy (Off/Auto/Manual env inject) — see [LOCAL_PROXY.md](./LOCAL_PROXY.md)
+- [x] Session/Profile/Group IA (root profiles, nested groups, ephemeral tabs) — see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md)
 - [ ] macOS / Linux runtime validation

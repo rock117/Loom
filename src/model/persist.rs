@@ -89,8 +89,8 @@ pub fn import_workspace_from(path: &PathBuf) -> Result<WorkspaceFile> {
         .with_context(|| format!("failed to read {}", path.display()))?;
     let ws: WorkspaceFile = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    if ws.groups.is_empty() {
-        anyhow::bail!("imported workspace has no groups");
+    if ws.groups.is_empty() && ws.profiles.is_empty() {
+        anyhow::bail!("imported workspace is empty");
     }
     Ok(ws)
 }

@@ -218,8 +218,7 @@ impl ContextPanel {
         if let Some(sftp) = pane.ssh_sftp.clone() {
             return Some((id, FilesKind::Sftp, Some(sftp)));
         }
-        let profile = self.store.read(cx).workspace.find_profile(pane.profile_id)?;
-        if matches!(profile.kind, ProfileKind::Local { .. }) {
+        if pane.kind.is_local() {
             return Some((id, FilesKind::Local, None));
         }
         None
@@ -2250,12 +2249,14 @@ impl ContextPanel {
                 return;
             }
             // Local without going through focused_files? use profile kind.
-            let is_local = self
-                .store
-                .read(cx)
-                .workspace
-                .find_profile(pane.profile_id)
-                .is_some_and(|p| matches!(p.kind, ProfileKind::Local { .. }));
+            let is_local = pane.kind.is_local()
+                || pane.profile_id.is_some_and(|pid| {
+                    self.store
+                        .read(cx)
+                        .workspace
+                        .find_profile(pid)
+                        .is_some_and(|p| p.kind.is_local())
+                });
             if is_local {
                 self.start_local_host_probe(pane.id, cx);
             } else {
