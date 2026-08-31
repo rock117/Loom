@@ -170,8 +170,17 @@ impl RenameEdit {
         self.text.chars().skip(lo).take(hi - lo).collect()
     }
 
-    /// Render label with selection highlight and blinking caret.
+    /// Render label with selection highlight and blinking caret (bordered chrome).
     pub fn into_element(&self) -> AnyElement {
+        self.render_editor(true)
+    }
+
+    /// Same editor content without its own border/background (parent provides chrome).
+    pub fn into_element_bare(&self) -> AnyElement {
+        self.render_editor(false)
+    }
+
+    fn render_editor(&self, chrome: bool) -> AnyElement {
         let (lo, hi) = self.sel_range();
         let cursor = self.cursor.min(self.char_len());
         let before_sel: String = self.text.chars().take(lo).collect();
@@ -204,13 +213,16 @@ impl RenameEdit {
             .min_w_0()
             .overflow_hidden()
             .h(px(ROW_RENAME))
-            .px(px(theme::SPACE_1))
-            .rounded(px(theme::RADIUS_SM))
-            .bg(theme::ELEVATED)
-            .border_1()
-            .border_color(theme::ACCENT)
             .text_xs()
             .text_color(theme::TEXT);
+        if chrome {
+            row = row
+                .px(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SM))
+                .bg(theme::ELEVATED)
+                .border_1()
+                .border_color(theme::ACCENT);
+        }
 
         // Compose: text + caret at `cursor`.
         if lo == hi {

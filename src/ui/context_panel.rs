@@ -1792,7 +1792,7 @@ impl ContextPanel {
             self.path_edit.text.clone()
         };
         let path_el = if self.editing_path {
-            Some(self.path_edit.into_element())
+            Some(self.path_edit.into_element_bare())
         } else {
             None
         };
