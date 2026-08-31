@@ -51,6 +51,32 @@ pub fn parent_path(path: &str) -> Option<String> {
     Some(parent.to_string_lossy().into_owned())
 }
 
+/// Validate a typed/pasted path for the Files browser: must exist and be a directory.
+/// Strips whitespace and surrounding quotes (Explorer-style paste).
+pub fn resolve_existing_dir(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return Err("Path is empty".into());
+    }
+    let p = PathBuf::from(trimmed);
+    match std::fs::metadata(&p) {
+        Ok(meta) if meta.is_dir() => {
+            let display = match p.canonicalize() {
+                Ok(c) => {
+                    let s = c.to_string_lossy().into_owned();
+                    s.strip_prefix(r"\\?\")
+                        .unwrap_or(&s)
+                        .to_string()
+                }
+                Err(_) => trimmed.to_string(),
+            };
+            Ok(display)
+        }
+        Ok(_) => Err("Path is a file, not a directory".into()),
+        Err(_) => Err("Path does not exist".into()),
+    }
+}
+
 pub fn create_dir(path: &Path) -> Result<()> {
     std::fs::create_dir(path).with_context(|| format!("mkdir {}", path.display()))
 }

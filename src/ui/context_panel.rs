@@ -130,6 +130,9 @@ pub struct ContextPanel {
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
     prompt: Option<FilesPrompt>,
+    /// Address-bar editor for the Files cwd (copy / paste / Enter to navigate).
+    path_edit: RenameEdit,
+    editing_path: bool,
     /// Host metrics for the Info tab (manual refresh).
     host_info: Option<HostSnapshot>,
     host_info_pane: Option<Uuid>,
@@ -186,6 +189,8 @@ impl ContextPanel {
             transfer_menu: None,
             entry_menu: None,
             prompt: None,
+            path_edit: RenameEdit::new(""),
+            editing_path: false,
             host_info: None,
             host_info_pane: None,
             host_info_loading: false,
@@ -235,6 +240,8 @@ impl ContextPanel {
         self.transfer_menu = None;
         self.entry_menu = None;
         self.prompt = None;
+        self.path_edit = RenameEdit::new("");
+        self.editing_path = false;
         self._prompt_caret_blink = None;
         self.host_info = None;
         self.host_info_pane = None;
@@ -433,13 +440,18 @@ impl ContextPanel {
                 this.listing = false;
                 match result {
                     Ok(Ok(entries)) => {
-                        this.cwd = Some(path);
+                        this.cwd = Some(path.clone());
+                        this.path_edit = RenameEdit::new(path);
+                        this.editing_path = false;
                         this.entries = entries;
                         this.selected = None;
                         this.error = None;
                     }
                     Ok(Err(err)) => {
-                        this.error = Some(format!("{err:#}"));
+                        this.error = Some(format!(
+                            "{err:#} (path missing or not a directory)"
+                        ));
+                        this.editing_path = true;
                     }
                     Err(_) => {
                         this.error = Some("List cancelled".into());
@@ -470,13 +482,16 @@ impl ContextPanel {
                 this.listing = false;
                 match result {
                     Ok(entries) => {
-                        this.cwd = Some(path);
+                        this.cwd = Some(path.clone());
+                        this.path_edit = RenameEdit::new(path);
+                        this.editing_path = false;
                         this.entries = entries;
                         this.selected = None;
                         this.error = None;
                     }
                     Err(err) => {
                         this.error = Some(format!("{err:#}"));
+                        this.editing_path = true;
                     }
                 }
                 cx.notify();
@@ -1014,6 +1029,10 @@ impl ContextPanel {
                             edit.caret_visible = !edit.caret_visible;
                             cx.notify();
                             true
+                        } else if this.editing_path {
+                            this.path_edit.caret_visible = !this.path_edit.caret_visible;
+                            cx.notify();
+                            true
                         } else {
                             false
                         }
@@ -1024,6 +1043,176 @@ impl ContextPanel {
                 }
             }
         }));
+    }
+
+    fn begin_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cwd.is_none() && self.path_edit.text.is_empty() {
+            return;
+        }
+        self.editing_path = true;
+        self.entry_menu = None;
+        self.transfer_menu = None;
+        if self.path_edit.text.is_empty() {
+            if let Some(cwd) = self.cwd.clone() {
+                self.path_edit = RenameEdit::new(cwd);
+            }
+        }
+        self.path_edit.select_all();
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn cancel_path_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(cwd) = self.cwd.clone() {
+            self.path_edit = RenameEdit::new(cwd);
+        }
+        self.editing_path = false;
+        if self.prompt.is_none() {
+            self._prompt_caret_blink = None;
+        }
+        cx.notify();
+    }
+
+    fn submit_path_edit(&mut self, cx: &mut Context<Self>) {
+        let raw = self.path_edit.text.clone();
+        match self.files_kind {
+            Some(FilesKind::Local) => match local_fs::resolve_existing_dir(&raw) {
+                Ok(dir) => {
+                    self.editing_path = false;
+                    self.error = None;
+                    self.load_dir(dir, cx);
+                }
+                Err(msg) => {
+                    self.error = Some(msg);
+                    self.editing_path = true;
+                    cx.notify();
+                }
+            },
+            Some(FilesKind::Sftp) => {
+                let trimmed = raw.trim().trim_matches('"').trim().to_string();
+                if trimmed.is_empty() {
+                    self.error = Some("Path is empty".into());
+                    cx.notify();
+                    return;
+                }
+                self.editing_path = false;
+                // List fails for missing paths and non-directories; cwd stays put on error.
+                self.load_dir(trimmed, cx);
+            }
+            None => {
+                self.error = Some("No session open".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_path_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if !self.editing_path || self.prompt.is_some() {
+            return false;
+        }
+
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let chord = mods.control || mods.platform;
+
+        if key == "enter" {
+            self.submit_path_edit(cx);
+            return true;
+        }
+        if key == "escape" {
+            self.cancel_path_edit(cx);
+            return true;
+        }
+
+        let edit = &mut self.path_edit;
+
+        if chord && key.eq_ignore_ascii_case("a") {
+            edit.select_all();
+            cx.notify();
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("c") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("x") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            if edit.has_selection() {
+                edit.delete_selection();
+            } else {
+                edit.text.clear();
+                edit.cursor = 0;
+                edit.anchor = 0;
+            }
+            cx.notify();
+            return true;
+        }
+        if (chord && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                let cleaned = text.replace('\r', "").replace('\n', "");
+                if !cleaned.is_empty() {
+                    edit.insert(&cleaned);
+                    cx.notify();
+                }
+            }
+            return true;
+        }
+        if key == "backspace" {
+            edit.backspace();
+            cx.notify();
+            return true;
+        }
+        if key == "delete" {
+            edit.delete_forward();
+            cx.notify();
+            return true;
+        }
+        if key == "left" {
+            edit.move_left(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "right" {
+            edit.move_right(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "home" {
+            edit.move_home(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "end" {
+            edit.move_end(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if let Some(typed) = event.keystroke.key_char.as_deref() {
+            let cleaned = typed.replace('\r', "").replace('\n', "");
+            if !cleaned.is_empty() && !chord {
+                edit.insert(&cleaned);
+                cx.notify();
+                return true;
+            }
+        }
+        false
     }
 
     fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
@@ -1588,7 +1777,6 @@ impl ContextPanel {
         }
 
         let is_sftp = self.files_kind == Some(FilesKind::Sftp);
-        let cwd = self.cwd.clone().unwrap_or_else(|| "…".into());
         let can_up = self.cwd.as_ref().is_some_and(|p| match self.files_kind {
             Some(FilesKind::Local) => local_fs::parent_path(p).is_some(),
             _ => parent_remote(p).is_some(),
@@ -1598,6 +1786,17 @@ impl ContextPanel {
         let entries = self.entries.clone();
         let selected = self.selected.clone();
         let has_sel = selected.is_some();
+        let path_display = if self.path_edit.text.is_empty() {
+            self.cwd.clone().unwrap_or_else(|| "…".into())
+        } else {
+            self.path_edit.text.clone()
+        };
+        let path_el = if self.editing_path {
+            Some(self.path_edit.into_element())
+        } else {
+            None
+        };
+        let editing_path = self.editing_path;
 
         div()
             .flex()
@@ -1659,16 +1858,32 @@ impl ContextPanel {
             )
             .child(
                 div()
-                    .px(px(theme::SPACE_2))
-                    .py(px(theme::SPACE_1))
+                    .id("ctx-path-bar")
+                    .px(px(theme::SPACE_1))
+                    .py(px(2.0))
                     .rounded(px(theme::RADIUS_SM))
                     .bg(theme::BG)
                     .border_1()
-                    .border_color(theme::BORDER_SUBTLE)
-                    .text_xs()
-                    .text_color(theme::TEXT_MUTED)
+                    .border_color(if editing_path {
+                        theme::ACCENT
+                    } else {
+                        theme::BORDER_SUBTLE
+                    })
+                    .cursor_text()
                     .overflow_hidden()
-                    .child(cwd),
+                    .when_some(path_el, |d, el| d.child(el))
+                    .when(!editing_path, |d| {
+                        d.text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .child(path_display)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.begin_path_edit(window, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
             )
             .when_some(self.render_prompt_bar(cx), |d, bar| d.child(bar))
             .when_some(error, |d, err| {
@@ -2119,6 +2334,8 @@ impl ContextPanel {
     fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.entry_menu.as_ref()?;
         let path = menu.path.clone();
+        let path_for_copy = path.clone();
+        let path_for_reveal = path.clone();
         let position = menu.position;
         let entry = self.entries.iter().find(|e| e.path == path)?;
         let is_dir = entry.is_dir;
@@ -2146,6 +2363,18 @@ impl ContextPanel {
                             .shadow_md()
                             .occlude()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "file-ctx-copy-path",
+                                "Copy path",
+                                true,
+                                cx,
+                                move |this, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        path_for_copy.clone(),
+                                    ));
+                                    this.entry_menu = None;
+                                },
+                            ))
                             .child(self.transfer_menu_item(
                                 "file-ctx-new",
                                 "New folder…",
@@ -2181,7 +2410,9 @@ impl ContextPanel {
                                     true,
                                     cx,
                                     move |this, _, _cx| {
-                                        let _ = platform::reveal_in_file_manager(Path::new(&path));
+                                        let _ = platform::reveal_in_file_manager(Path::new(
+                                            &path_for_reveal,
+                                        ));
                                         this.entry_menu = None;
                                     },
                                 ))
@@ -2968,6 +3199,10 @@ impl Render for ContextPanel {
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                 if this.handle_prompt_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.handle_path_key(event, cx) {
                     cx.stop_propagation();
                     return;
                 }
