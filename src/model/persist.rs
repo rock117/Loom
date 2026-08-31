@@ -30,7 +30,7 @@ fn write_json<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<()> {
 pub fn load_workspace() -> WorkspaceFile {
     let path = paths::workspace_path();
     match read_json::<WorkspaceFile>(&path) {
-        Ok(Some(ws)) if !ws.groups.is_empty() => ws,
+        Ok(Some(ws)) if !ws.groups.is_empty() || !ws.profiles.is_empty() => ws,
         Ok(Some(_)) | Ok(None) => WorkspaceFile::default_workspace(),
         Err(err) => {
             eprintln!("loom: workspace load failed ({err}); using defaults");

@@ -38,8 +38,9 @@ pub fn run() {
             KeyBinding::new("ctrl-k ctrl-down", ActivatePaneDown, Some("Loom")),
         ]);
 
-        cx.on_action(|_: &QuitApp, cx| {
-            cx.quit();
+        cx.on_action(|_: &QuitApp, _cx| {
+            // WorkspaceView handles QuitApp (persist then quit). Keep this no-op
+            // so the keybinding still resolves if focus is outside the view.
         });
 
         // When the last window closes, exit the process (GPUI does not auto-quit).
@@ -64,7 +65,15 @@ pub fn run() {
                     }),
                     ..Default::default()
                 },
-                |_window, cx| cx.new(|cx| WorkspaceView::new(_window, cx)),
+                |_window, cx| {
+                    let view = cx.new(|cx| WorkspaceView::new(_window, cx));
+                    // Closing the window (title-bar X) releases the view — flush cwd/tabs first.
+                    cx.observe_release(&view, |this, cx| {
+                        this.flush_persist(cx);
+                    })
+                    .detach();
+                    view
+                },
             )?;
             Ok::<_, anyhow::Error>(())
         })

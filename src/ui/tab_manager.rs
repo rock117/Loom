@@ -67,15 +67,21 @@ pub struct TabManager {
     pub active: Option<Uuid>,
     pub font_size: f32,
     pub show_line_numbers: bool,
+    store: Entity<WorkspaceStore>,
 }
 
 impl TabManager {
-    pub fn new(font_size: f32, show_line_numbers: bool) -> Self {
+    pub fn new(
+        font_size: f32,
+        show_line_numbers: bool,
+        store: Entity<WorkspaceStore>,
+    ) -> Self {
         Self {
             tabs: Vec::new(),
             active: None,
             font_size,
             show_line_numbers,
+            store,
         }
     }
 
@@ -1081,6 +1087,32 @@ impl TabManager {
         cx.notify();
     }
 
+    /// Bound Local panes → (profile_id, live cwd) for persistence.
+    pub fn bound_local_cwds(&self, cx: &mut Context<Self>) -> Vec<(Uuid, std::path::PathBuf)> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            for pane in tab.panes.values() {
+                let Some(pid) = pane.profile_id else {
+                    continue;
+                };
+                if !pane.kind.is_local() {
+                    continue;
+                }
+                let Some(term) = pane.terminal.as_ref() else {
+                    continue;
+                };
+                let Some(cwd) = term.update(cx, |view, _| {
+                    view.refresh_working_directory();
+                    view.working_directory()
+                }) else {
+                    continue;
+                };
+                out.push((pid, cwd));
+            }
+        }
+        out
+    }
+
     pub fn snapshot_for_persist(&self) -> (Vec<(Uuid, Option<String>)>, usize) {
         // Only Bound tabs — ephemeral sessions are not restored.
         let tabs: Vec<(Uuid, Option<String>)> = self
@@ -1293,6 +1325,29 @@ fn wire_terminal_session(
             }
             TerminalViewEvent::SessionEnded => {
                 this.on_pane_session_ended(pane_id, cx);
+            }
+            TerminalViewEvent::WorkingDirectoryChanged(path) => {
+                let Some(pane) = this
+                    .tabs
+                    .iter_mut()
+                    .find_map(|t| t.panes.get_mut(&pane_id))
+                else {
+                    return;
+                };
+                let Some(pid) = pane.profile_id else {
+                    return;
+                };
+                if !pane.kind.is_local() {
+                    return;
+                }
+                if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
+                    *cwd = Some(path.clone());
+                }
+                let store = this.store.clone();
+                store.update(cx, |s, cx| {
+                    s.update_local_profile_cwd(pid, path.clone(), cx);
+                    s.persist_now();
+                });
             }
         }
     });

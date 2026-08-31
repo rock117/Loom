@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::model::{export_workspace_to, import_workspace_from};
+use crate::model::{ProfileKind, export_workspace_to, import_workspace_from};
 use crate::shared::actions::*;
 use crate::shared::theme;
 use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
@@ -65,7 +65,7 @@ impl WorkspaceView {
             .collect();
 
         let show_line_numbers = store.read(cx).settings.show_line_numbers;
-        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers));
+        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers, store.clone()));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), store.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
@@ -440,13 +440,17 @@ impl WorkspaceView {
         use crate::model::Profile;
         use crate::ui::workspace_store::InsertTarget;
 
-        let Some((kind, label)) = self.tabs.read(cx).tabs.iter().find(|t| t.id == tab_id).and_then(
-            |t| {
+        let Some((mut kind, label, live_cwd)) =
+            self.tabs.read(cx).tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
                 t.panes.get(&t.focused).map(|p| {
-                    (p.kind.clone(), p.label.clone())
+                    let cwd = p
+                        .terminal
+                        .as_ref()
+                        .and_then(|term| term.read(cx).working_directory());
+                    (p.kind.clone(), p.label.clone(), cwd)
                 })
-            },
-        ) else {
+            })
+        else {
             return;
         };
         // Already bound — nothing to save.
@@ -461,6 +465,10 @@ impl WorkspaceView {
             .is_some()
         {
             return;
+        }
+
+        if let (ProfileKind::Local { cwd: c, .. }, Some(path)) = (&mut kind, live_cwd) {
+            *c = Some(path);
         }
 
         let names = self.store.read(cx).workspace.all_profile_names();
@@ -495,17 +503,21 @@ impl WorkspaceView {
         self.persist_tabs(cx);
     }
 
-    fn persist_tabs(&mut self, cx: &mut Context<Self>) {
+    /// Flush open tabs + Bound Local cwds to disk (also used on window release).
+    pub fn flush_persist(&mut self, cx: &mut App) {
         let sidebar_width = self.sidebar_width;
         let sidebar_visible = self.sidebar_visible;
         let context_panel_width = self.context_panel_width;
         let context_panel_visible = self.context_panel_visible;
-        let (tabs, active, font_size) = {
-            let manager = self.tabs.read(cx);
-            let (tabs, active) = manager.snapshot_for_persist();
-            (tabs, active, manager.font_size)
-        };
-        self.store.update(cx, |s, _cx| {
+        let (tabs, active, font_size, local_cwds) = self.tabs.update(cx, |m, cx| {
+            let cwds = m.bound_local_cwds(cx);
+            let (tabs, active) = m.snapshot_for_persist();
+            (tabs, active, m.font_size, cwds)
+        });
+        self.store.update(cx, |s, cx| {
+            for (pid, cwd) in local_cwds {
+                s.update_local_profile_cwd(pid, cwd, cx);
+            }
             s.ui_state.sidebar_width = sidebar_width;
             s.ui_state.sidebar_visible = sidebar_visible;
             s.ui_state.context_panel_width = context_panel_width;
@@ -515,6 +527,10 @@ impl WorkspaceView {
             s.sync_open_tabs(&tabs, active);
             s.persist_now();
         });
+    }
+
+    fn persist_tabs(&mut self, cx: &mut Context<Self>) {
+        self.flush_persist(cx);
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -771,7 +787,8 @@ impl Render for WorkspaceView {
             .on_action(cx.listener(|this, _: &ImportWorkspace, _, cx| {
                 this.import_workspace(cx);
             }))
-            .on_action(cx.listener(|_this, _: &QuitApp, _, cx| {
+            .on_action(cx.listener(|this, _: &QuitApp, _, cx| {
+                this.persist_tabs(cx);
                 cx.quit();
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {

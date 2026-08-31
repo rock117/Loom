@@ -45,7 +45,8 @@ Group {
 5. **工作区再开为临时**：Ctrl+T、Tab Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。
 6. **点侧栏 Profile → Bound Session**（可持久恢复）。
 7. **Tab 右键「Save to…」** → 可选根或某 Group；升级为 Profile 并 Bound。
-8. **重启不恢复临时 tab**；`open_tabs` 只写 Bound。
+8. **重启不恢复临时 tab**；`open_tabs` 只写 Bound。  
+9. **Bound Local**：关闭/持久化时把当前 shell cwd 写回 Profile，再次打开从该目录启动。
 
 ## Session 来源
 

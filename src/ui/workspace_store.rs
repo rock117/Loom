@@ -462,6 +462,27 @@ impl WorkspaceStore {
         self.mark_dirty();
     }
 
+    /// Remember last Local shell cwd on a Bound profile (reopen / reconnect).
+    pub fn update_local_profile_cwd(
+        &mut self,
+        profile_id: Uuid,
+        cwd: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = self.workspace.find_profile_mut(profile_id) else {
+            return;
+        };
+        let ProfileKind::Local { cwd: stored, .. } = &mut profile.kind else {
+            return;
+        };
+        if stored.as_ref() == Some(&cwd) {
+            return;
+        }
+        *stored = Some(cwd);
+        self.mark_dirty();
+        cx.notify();
+    }
+
     pub fn default_local_profile_id(&self) -> Option<Uuid> {
         self.workspace.first_local_profile_id()
     }

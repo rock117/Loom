@@ -18,6 +18,8 @@ pub enum TerminalViewEvent {
     CloseRequested,
     /// PTY / SSH channel ended — host should mark the pane failed and offer reconnect.
     SessionEnded,
+    /// Shell reported a new working directory (OSC / hooks).
+    WorkingDirectoryChanged(PathBuf),
 }
 
 impl EventEmitter<TerminalViewEvent> for TerminalView {}
@@ -33,7 +35,7 @@ impl TerminalView {
     }
 
     /// Prefer live process cwd (local), else keep OSC / spawn cwd.
-    pub(super) fn refresh_working_directory(&mut self) {
+    pub fn refresh_working_directory(&mut self) {
         if let Some(pid) = self.shell_pid {
             if let Some(cwd) = platform::process_cwd(pid) {
                 self.working_directory = Some(cwd);

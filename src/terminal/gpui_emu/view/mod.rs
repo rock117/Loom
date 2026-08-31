@@ -577,7 +577,8 @@ impl TerminalView {
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
                             if let Some(cwd) = view.state.take_cwd_update() {
-                                view.working_directory = Some(cwd);
+                                view.working_directory = Some(cwd.clone());
+                                cx.emit(TerminalViewEvent::WorkingDirectoryChanged(cwd));
                             }
                             view.dispatch_pending_events(None, cx);
                             cx.notify();
