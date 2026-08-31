@@ -4,8 +4,10 @@ use gpui::*;
 use crate::model::{ProfileKind, export_workspace_to, import_workspace_from};
 use crate::shared::actions::*;
 use crate::shared::theme;
+use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
 use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
+use crate::ui::persistence::Persistence;
 use crate::ui::settings::{SettingsEvent, SettingsPanel};
 use crate::ui::sidebar::{Sidebar, SidebarEvent};
 use crate::ui::ssh_form::{SshForm, SshFormEvent};
@@ -23,6 +25,8 @@ struct ContextResizeDrag {
 pub struct WorkspaceView {
     focus_handle: FocusHandle,
     store: Entity<WorkspaceStore>,
+    app_bus: Entity<AppBus>,
+    persistence: Entity<Persistence>,
     tabs: Entity<TabManager>,
     sidebar: Entity<Sidebar>,
     tab_bar: Entity<TabBar>,
@@ -65,7 +69,8 @@ impl WorkspaceView {
             .collect();
 
         let show_line_numbers = store.read(cx).settings.show_line_numbers;
-        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers, store.clone()));
+        let app_bus = cx.new(|_| AppBus);
+        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers, app_bus.clone()));
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), store.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
@@ -73,10 +78,27 @@ impl WorkspaceView {
         let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
+        let workspace_weak = cx.weak_entity();
+        let persistence = cx.new(|cx| {
+            Persistence::new(app_bus.clone(), store.clone(), workspace_weak, cx)
+        });
+
+        // Scheme B: block close until Persistence flushes via WillQuit, then quit.
+        let bus_for_close = app_bus.clone();
+        let persistence_for_close = persistence.clone();
+        window.on_window_should_close(cx, move |_window, cx| {
+            if persistence_for_close.read(cx).allow_window_close() {
+                return true;
+            }
+            AppBus::emit(&bus_for_close, AppBusEvent::WillQuit, cx);
+            false
+        });
 
         let mut view = Self {
             focus_handle: cx.focus_handle(),
             store: store.clone(),
+            app_bus: app_bus.clone(),
+            persistence: persistence.clone(),
             tabs: tabs.clone(),
             sidebar: sidebar.clone(),
             tab_bar: tab_bar.clone(),
@@ -530,7 +552,11 @@ impl WorkspaceView {
     }
 
     fn persist_tabs(&mut self, cx: &mut Context<Self>) {
-        self.flush_persist(cx);
+        AppBus::emit(&self.app_bus, AppBusEvent::PersistRequested, cx);
+    }
+
+    fn request_quit(&mut self, cx: &mut Context<Self>) {
+        AppBus::emit(&self.app_bus, AppBusEvent::WillQuit, cx);
     }
 
     fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -538,9 +564,10 @@ impl WorkspaceView {
         let visible = self.sidebar_visible;
         self.store.update(cx, |s, cx| {
             s.ui_state.sidebar_visible = visible;
-            s.persist_now();
+            s.mark_dirty();
             cx.notify();
         });
+        self.persist_tabs(cx);
         if visible {
             self.sidebar.read(cx).focus_handle(cx).focus(window);
         } else if let Some(term) = self
@@ -560,9 +587,10 @@ impl WorkspaceView {
         let visible = self.context_panel_visible;
         self.store.update(cx, |s, cx| {
             s.ui_state.context_panel_visible = visible;
-            s.persist_now();
+            s.mark_dirty();
             cx.notify();
         });
+        self.persist_tabs(cx);
         cx.notify();
     }
 
@@ -767,8 +795,7 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &SaveWorkspace, _, cx| {
-                this.persist_tabs(cx);
-                this.store.update(cx, |s, _| s.persist_now());
+                this.persistence.update(cx, |p, cx| p.flush_now(cx));
                 this.set_toast("Workspace saved", cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
@@ -788,8 +815,7 @@ impl Render for WorkspaceView {
                 this.import_workspace(cx);
             }))
             .on_action(cx.listener(|this, _: &QuitApp, _, cx| {
-                this.persist_tabs(cx);
-                cx.quit();
+                this.request_quit(cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| {
                 let size = this.tabs.read(cx).font_size + 1.0;

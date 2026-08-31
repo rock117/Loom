@@ -14,6 +14,7 @@ use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
 use crate::terminal::{ColorPalette, TerminalConfig, TerminalView, TerminalViewEvent};
+use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::pane_layout::{PaneLayout, RemoveResult, SplitDirection};
 use crate::ui::workspace_store::WorkspaceStore;
 
@@ -67,21 +68,21 @@ pub struct TabManager {
     pub active: Option<Uuid>,
     pub font_size: f32,
     pub show_line_numbers: bool,
-    store: Entity<WorkspaceStore>,
+    app_bus: Entity<AppBus>,
 }
 
 impl TabManager {
     pub fn new(
         font_size: f32,
         show_line_numbers: bool,
-        store: Entity<WorkspaceStore>,
+        app_bus: Entity<AppBus>,
     ) -> Self {
         Self {
             tabs: Vec::new(),
             active: None,
             font_size,
             show_line_numbers,
-            store,
+            app_bus,
         }
     }
 
@@ -1343,11 +1344,14 @@ fn wire_terminal_session(
                 if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
                     *cwd = Some(path.clone());
                 }
-                let store = this.store.clone();
-                store.update(cx, |s, cx| {
-                    s.update_local_profile_cwd(pid, path.clone(), cx);
-                    s.persist_now();
-                });
+                AppBus::emit(
+                    &this.app_bus,
+                    AppBusEvent::BoundLocalCwdChanged {
+                        profile_id: pid,
+                        path: path.clone(),
+                    },
+                    cx,
+                );
             }
         }
     });

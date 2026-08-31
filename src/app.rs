@@ -39,8 +39,7 @@ pub fn run() {
         ]);
 
         cx.on_action(|_: &QuitApp, _cx| {
-            // WorkspaceView handles QuitApp (persist then quit). Keep this no-op
-            // so the keybinding still resolves if focus is outside the view.
+            // WorkspaceView emits WillQuit on AppBus; Persistence flushes then quits.
         });
 
         // When the last window closes, exit the process (GPUI does not auto-quit).
@@ -66,13 +65,7 @@ pub fn run() {
                     ..Default::default()
                 },
                 |_window, cx| {
-                    let view = cx.new(|cx| WorkspaceView::new(_window, cx));
-                    // Closing the window (title-bar X) releases the view — flush cwd/tabs first.
-                    cx.observe_release(&view, |this, cx| {
-                        this.flush_persist(cx);
-                    })
-                    .detach();
-                    view
+                    cx.new(|cx| WorkspaceView::new(_window, cx))
                 },
             )?;
             Ok::<_, anyhow::Error>(())
