@@ -92,6 +92,7 @@ GPUI code follows the skills under `~/.agents/skills` (entities observe, Statefu
 Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.  
 Design trade-offs and accepted decisions: **[docs/DECISIONS.md](docs/DECISIONS.md)**.  
 Hard GPUI/platform pitfalls + UI freeze checklist: **[docs/HARD_PROBLEMS.md](docs/HARD_PROBLEMS.md)**.  
+Local shell (pwsh vs cmd, startup slowness): **[docs/LOCAL_SHELL.md](docs/LOCAL_SHELL.md)**.  
 Three-column context panel (snippets / files / info): **[docs/CONTEXT_PANEL.md](docs/CONTEXT_PANEL.md)**.  
 Low-priority icebox features (explicit order only): **[docs/BACKLOG.md](docs/BACKLOG.md)**.  
 Agent / contributor principles: **[AGENTS.md](AGENTS.md)**.

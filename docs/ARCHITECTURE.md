@@ -15,6 +15,7 @@ For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草
 For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
 For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
+For **Local shell 选型 / pwsh 慢 / cmd 快 / 启动性能**, see [LOCAL_SHELL.md](./LOCAL_SHELL.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
 ## Goals
