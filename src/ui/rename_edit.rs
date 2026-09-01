@@ -165,9 +165,31 @@ impl RenameEdit {
         self.caret_visible = true;
     }
 
+    /// Place caret at Unicode scalar index; keep anchor when `extend` (Shift / drag).
+    pub fn set_caret(&mut self, index: usize, extend: bool) {
+        let i = index.min(self.char_len());
+        self.cursor = i;
+        if !extend {
+            self.anchor = i;
+        }
+        self.caret_visible = true;
+    }
+
     pub fn selected_text(&self) -> String {
         let (lo, hi) = self.sel_range();
         self.text.chars().skip(lo).take(hi - lo).collect()
+    }
+
+    /// Same as [`into_element_bare`] but every character is shown as `•` (passwords).
+    pub fn into_element_bare_masked(&self) -> AnyElement {
+        let masked: String = "•".repeat(self.char_len());
+        Self {
+            text: masked,
+            cursor: self.cursor.min(self.char_len()),
+            anchor: self.anchor.min(self.char_len()),
+            caret_visible: self.caret_visible,
+        }
+        .into_element_bare()
     }
 
     /// Render label with selection highlight and blinking caret (bordered chrome).

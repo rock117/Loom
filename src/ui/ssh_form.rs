@@ -9,6 +9,7 @@ use uuid::Uuid;
 use crate::model::{Profile, ProfileKind, SshAuth};
 use crate::session::credentials;
 use crate::shared::theme;
+use crate::ui::rename_edit::RenameEdit;
 use crate::ui::workspace_store::WorkspaceStore;
 
 #[derive(Clone, Debug)]
@@ -27,18 +28,22 @@ pub struct SshForm {
     focus_handle: FocusHandle,
     /// `None` = create new; `Some(id)` = edit existing SSH profile.
     editing: Option<Uuid>,
-    name: String,
-    host: String,
-    port: String,
-    user: String,
-    password: String,
-    key_path: String,
+    name: RenameEdit,
+    host: RenameEdit,
+    port: RenameEdit,
+    user: RenameEdit,
+    password: RenameEdit,
+    key_path: RenameEdit,
     use_private_key: bool,
     /// Keyring already has a password for this profile (edit mode).
     has_stored_password: bool,
     remember: bool,
     error: Option<String>,
     field: Field,
+    /// Mouse-drag text selection in the active field.
+    selecting: bool,
+    field_bounds: [Option<Bounds<Pixels>>; 6],
+    _caret_blink: Option<Task<()>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,37 +58,45 @@ enum Field {
 
 impl SshForm {
     pub fn new(store: Entity<WorkspaceStore>, cx: &mut Context<Self>) -> Self {
-        Self {
+        let mut form = Self {
             store,
             focus_handle: cx.focus_handle(),
             editing: None,
-            name: String::new(),
-            host: String::new(),
-            port: "22".into(),
-            user: whoami_user(),
-            password: String::new(),
-            key_path: String::new(),
+            name: field_edit(""),
+            host: field_edit(""),
+            port: field_edit("22"),
+            user: field_edit(whoami_user()),
+            password: field_edit(""),
+            key_path: field_edit(""),
             use_private_key: false,
             has_stored_password: false,
             remember: true,
             error: None,
             field: Field::Host,
-        }
+            selecting: false,
+            field_bounds: [None; 6],
+            _caret_blink: None,
+        };
+        form.field = Field::Host;
+        form.start_caret_blink(cx);
+        form
     }
 
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.editing = None;
-        self.name.clear();
-        self.host.clear();
-        self.port = "22".into();
-        self.user = whoami_user();
-        self.password.clear();
-        self.key_path.clear();
+        self.name = field_edit("");
+        self.host = field_edit("");
+        self.port = field_edit("22");
+        self.user = field_edit(whoami_user());
+        self.password = field_edit("");
+        self.key_path = field_edit("");
         self.use_private_key = false;
         self.has_stored_password = false;
         self.remember = true;
         self.error = None;
         self.field = Field::Host;
+        self.selecting = false;
+        self.start_caret_blink(cx);
         cx.notify();
     }
 
@@ -112,19 +125,17 @@ impl SshForm {
         };
 
         self.editing = Some(profile_id);
-        self.name = profile.name;
-        self.host = host;
-        self.port = port.to_string();
-        self.user = user;
-        self.password.clear();
+        self.name = field_edit(profile.name);
+        self.host = field_edit(host);
+        self.port = field_edit(port.to_string());
+        self.user = field_edit(user);
+        self.password = field_edit("");
         self.error = None;
-        self.field = Field::Host;
-
         match auth {
             SshAuth::Password { remember } => {
                 self.use_private_key = false;
                 self.remember = remember;
-                self.key_path.clear();
+                self.key_path = field_edit("");
                 self.has_stored_password = credentials::get_password(profile_id)
                     .ok()
                     .flatten()
@@ -133,10 +144,13 @@ impl SshForm {
             SshAuth::PrivateKey { path } => {
                 self.use_private_key = true;
                 self.remember = false;
-                self.key_path = path.display().to_string();
+                self.key_path = field_edit(path.display().to_string());
                 self.has_stored_password = false;
             }
         }
+        self.field = Field::Host;
+        self.selecting = false;
+        self.start_caret_blink(cx);
         cx.notify();
     }
 
@@ -144,28 +158,102 @@ impl SshForm {
         self.focus_handle.focus(window);
     }
 
-    fn append_char(&mut self, event: &KeyDownEvent) -> bool {
-        if event.keystroke.modifiers.control
-            || event.keystroke.modifiers.alt
-            || event.keystroke.modifiers.platform
-        {
-            return false;
-        }
-        let Some(typed) = event.keystroke.key_char.as_deref() else {
-            return false;
-        };
-        let target = self.active_field_mut();
-        let mut any = false;
-        for ch in typed.chars() {
-            if !ch.is_control() {
-                target.push(ch);
-                any = true;
+    fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self._caret_blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        let edit = this.active_edit_mut();
+                        edit.caret_visible = !edit.caret_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
             }
-        }
-        any
+        }));
     }
 
-    fn active_field_mut(&mut self) -> &mut String {
+    fn focus_field(&mut self, field: Field, window: &mut Window, cx: &mut Context<Self>) {
+        if self.field != field {
+            self.field = field;
+            // Caret at end; do not select — user selects explicitly.
+            self.active_edit_mut().move_end(false);
+        } else {
+            self.active_edit_mut().caret_visible = true;
+        }
+        self.selecting = false;
+        self.start_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn begin_mouse_select(
+        &mut self,
+        field: Field,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.field = field;
+        self.focus_handle.focus(window);
+        let extend = event.modifiers.shift;
+        if event.click_count >= 2 {
+            self.active_edit_mut().select_all();
+            self.selecting = false;
+        } else {
+            let idx = self.index_at_pointer(field, event.position);
+            self.active_edit_mut().set_caret(idx, extend);
+            self.selecting = true;
+        }
+        self.start_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn update_mouse_select(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        let field = self.field;
+        let idx = self.index_at_pointer(field, position);
+        self.active_edit_mut().set_caret(idx, true);
+        self.active_edit_mut().caret_visible = true;
+        cx.notify();
+    }
+
+    fn end_mouse_select(&mut self, cx: &mut Context<Self>) {
+        if self.selecting {
+            self.selecting = false;
+            cx.notify();
+        }
+    }
+
+    fn index_at_pointer(&self, field: Field, position: Point<Pixels>) -> usize {
+        let Some(bounds) = self.field_bounds[field_idx(field)] else {
+            return self.edit_for(field).char_len();
+        };
+        let pad: f32 = theme::SPACE_2;
+        let local_x: f32 = (position.x - bounds.origin.x).into();
+        char_index_at_x(self.edit_for(field), local_x - pad)
+    }
+
+    fn edit_for(&self, field: Field) -> &RenameEdit {
+        match field {
+            Field::Name => &self.name,
+            Field::Host => &self.host,
+            Field::Port => &self.port,
+            Field::User => &self.user,
+            Field::Password => &self.password,
+            Field::KeyPath => &self.key_path,
+        }
+    }
+
+    fn active_edit_mut(&mut self) -> &mut RenameEdit {
         match self.field {
             Field::Name => &mut self.name,
             Field::Host => &mut self.host,
@@ -176,7 +264,7 @@ impl SshForm {
         }
     }
 
-    fn active_field(&self) -> &str {
+    fn active_edit(&self) -> &RenameEdit {
         match self.field {
             Field::Name => &self.name,
             Field::Host => &self.host,
@@ -187,53 +275,94 @@ impl SshForm {
         }
     }
 
-    fn paste_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-            return false;
-        };
-        let cleaned = text.replace('\r', "").replace('\n', "");
-        if cleaned.is_empty() {
-            return false;
-        }
-        self.active_field_mut().push_str(&cleaned);
-        true
-    }
-
-    fn copy_field(&self, cx: &mut Context<Self>) -> bool {
-        let text = self.active_field();
-        if text.is_empty() {
-            return false;
-        }
-        cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-        true
-    }
-
-    fn cut_field(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.copy_field(cx) {
-            return false;
-        }
-        self.active_field_mut().clear();
-        true
-    }
-
-    fn handle_clipboard_keys(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+    fn handle_edit_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         let chord = mods.control || mods.platform;
-        if !chord {
-            if mods.shift && key.eq_ignore_ascii_case("insert") {
-                return self.paste_clipboard(cx);
+        let shift = mods.shift;
+
+        if chord && key.eq_ignore_ascii_case("a") {
+            self.active_edit_mut().select_all();
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("c") {
+            let edit = self.active_edit();
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
             }
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("x") {
+            let text = {
+                let edit = self.active_edit();
+                if edit.has_selection() {
+                    edit.selected_text()
+                } else {
+                    edit.text.clone()
+                }
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            let edit = self.active_edit_mut();
+            if edit.has_selection() {
+                edit.delete_selection();
+            } else {
+                edit.text.clear();
+                edit.cursor = 0;
+                edit.anchor = 0;
+            }
+            return true;
+        }
+        if (chord && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                let cleaned = text.replace('\r', "").replace('\n', "");
+                if !cleaned.is_empty() {
+                    self.active_edit_mut().insert(&cleaned);
+                }
+            }
+            return true;
+        }
+        if key == "backspace" {
+            self.active_edit_mut().backspace();
+            return true;
+        }
+        if key == "delete" {
+            self.active_edit_mut().delete_forward();
+            return true;
+        }
+        if key == "left" {
+            self.active_edit_mut().move_left(shift);
+            return true;
+        }
+        if key == "right" {
+            self.active_edit_mut().move_right(shift);
+            return true;
+        }
+        if key == "home" {
+            self.active_edit_mut().move_home(shift);
+            return true;
+        }
+        if key == "end" {
+            self.active_edit_mut().move_end(shift);
+            return true;
+        }
+        if chord {
             return false;
         }
-        if key.eq_ignore_ascii_case("v") {
-            return self.paste_clipboard(cx);
-        }
-        if key.eq_ignore_ascii_case("c") {
-            return self.copy_field(cx);
-        }
-        if key.eq_ignore_ascii_case("x") {
-            return self.cut_field(cx);
+        if let Some(typed) = event.keystroke.key_char.as_deref() {
+            let cleaned = typed.replace('\r', "").replace('\n', "");
+            if !cleaned.is_empty() {
+                self.active_edit_mut().insert(&cleaned);
+                return true;
+            }
         }
         false
     }
@@ -256,23 +385,24 @@ impl SshForm {
                 Field::Password | Field::KeyPath => Field::Name,
             }
         };
+        self.active_edit_mut().move_end(false);
     }
 
     fn submit(&mut self, connect: bool, cx: &mut Context<Self>) {
         self.error = None;
-        let host = self.host.trim().to_string();
+        let host = self.host.text.trim().to_string();
         if host.is_empty() {
             self.error = Some("Host is required".into());
             cx.notify();
             return;
         }
-        let user = self.user.trim().to_string();
+        let user = self.user.text.trim().to_string();
         if user.is_empty() {
             self.error = Some("User is required".into());
             cx.notify();
             return;
         }
-        let port: u16 = match self.port.trim().parse() {
+        let port: u16 = match self.port.text.trim().parse() {
             Ok(0) | Err(_) => {
                 self.error = Some("Port must be 1–65535".into());
                 cx.notify();
@@ -281,7 +411,7 @@ impl SshForm {
             Ok(p) => p,
         };
         let name = {
-            let n = self.name.trim();
+            let n = self.name.text.trim();
             if n.is_empty() {
                 format!("{user}@{host}")
             } else {
@@ -289,11 +419,11 @@ impl SshForm {
             }
         };
 
-        let id = self.editing.unwrap_or_else(Uuid::new_v4);
         let creating = self.editing.is_none();
+        let id = self.editing.unwrap_or_else(Uuid::new_v4);
 
         let (auth, oneshot) = if self.use_private_key {
-            let path = self.key_path.trim().to_string();
+            let path = self.key_path.text.trim().to_string();
             if path.is_empty() {
                 self.error = Some("Private key path is required".into());
                 cx.notify();
@@ -307,7 +437,7 @@ impl SshForm {
                 None,
             )
         } else {
-            if self.password.is_empty() {
+            if self.password.text.is_empty() {
                 if creating || !self.has_stored_password {
                     self.error = Some(
                         "Password is required (saved to OS keyring if Remember is on)".into(),
@@ -317,9 +447,9 @@ impl SshForm {
                 }
             }
 
-            if !self.password.is_empty() {
+            if !self.password.text.is_empty() {
                 if self.remember {
-                    if let Err(err) = credentials::set_password(id, &self.password) {
+                    if let Err(err) = credentials::set_password(id, &self.password.text) {
                         self.error = Some(format!("Could not store password: {err:#}"));
                         cx.notify();
                         return;
@@ -331,8 +461,8 @@ impl SshForm {
                 let _ = credentials::delete_password(id);
             }
 
-            let oneshot = if !self.password.is_empty() && !self.remember {
-                Some(self.password.clone())
+            let oneshot = if !self.password.text.is_empty() && !self.remember {
+                Some(self.password.text.clone())
             } else {
                 None
             };
@@ -388,20 +518,16 @@ impl SshForm {
         &self,
         id: &'static str,
         label: &'static str,
-        value: &str,
+        field: Field,
+        edit: &RenameEdit,
         active: bool,
         secret: bool,
         empty_hint: &str,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let display = if secret && !value.is_empty() {
-            "•".repeat(value.chars().count().min(24))
-        } else if value.is_empty() {
-            String::new()
-        } else {
-            value.to_string()
-        };
-        let caret = if active { "|" } else { "" };
-        let show_hint = display.is_empty() && !active;
+        let show_hint = edit.text.is_empty() && !active;
+        let view = cx.entity();
+        let fi = field_idx(field);
         div()
             .id(id)
             .flex()
@@ -415,6 +541,8 @@ impl SshForm {
             )
             .child(
                 div()
+                    .id(SharedString::from(format!("{id}-input")))
+                    .relative()
                     .w_full()
                     .px(px(theme::SPACE_2))
                     .py(px(theme::SPACE_1))
@@ -427,16 +555,44 @@ impl SshForm {
                         theme::BORDER
                     })
                     .text_sm()
-                    .text_color(if show_hint {
-                        theme::TEXT_DISABLED
-                    } else {
-                        theme::TEXT
+                    .overflow_hidden()
+                    .cursor_text()
+                    .child(
+                        canvas(
+                            move |bounds, _, cx| {
+                                view.update(cx, |this, _| {
+                                    this.field_bounds[fi] = Some(bounds);
+                                });
+                                bounds
+                            },
+                            |_bounds, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .when(active && !secret, |d| d.child(edit.into_element_bare()))
+                    .when(active && secret, |d| d.child(edit.into_element_bare_masked()))
+                    .when(!active, |d| {
+                        d.text_color(if show_hint {
+                            theme::TEXT_DISABLED
+                        } else {
+                            theme::TEXT
+                        })
+                        .child(if show_hint {
+                            empty_hint.to_string()
+                        } else if secret {
+                            "•".repeat(edit.char_len().min(24))
+                        } else {
+                            edit.text.clone()
+                        })
                     })
-                    .child(if show_hint {
-                        SharedString::from(empty_hint.to_string())
-                    } else {
-                        SharedString::from(format!("{display}{caret}"))
-                    }),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.begin_mouse_select(field, event, window, cx);
+                            cx.stop_propagation();
+                        }),
+                    ),
             )
     }
 }
@@ -445,6 +601,34 @@ fn whoami_user() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "root".into())
+}
+
+/// Caret at end, no selection (unlike [`RenameEdit::new`] which selects all).
+fn field_edit(text: impl Into<String>) -> RenameEdit {
+    let mut edit = RenameEdit::new(text);
+    edit.move_end(false);
+    edit
+}
+
+fn field_idx(field: Field) -> usize {
+    match field {
+        Field::Name => 0,
+        Field::Host => 1,
+        Field::Port => 2,
+        Field::User => 3,
+        Field::Password => 4,
+        Field::KeyPath => 5,
+    }
+}
+
+/// Approximate hit-test for proportional UI text (good enough for form fields).
+fn char_index_at_x(edit: &RenameEdit, local_x: f32) -> usize {
+    const AVG_CHAR_W: f32 = 7.4;
+    if local_x <= 0.0 {
+        return 0;
+    }
+    let idx = (local_x / AVG_CHAR_W).round() as usize;
+    idx.min(edit.char_len())
 }
 
 impl Focusable for SshForm {
@@ -485,6 +669,15 @@ impl Render for SshForm {
                 MouseButton::Left,
                 cx.listener(|_, _, _, cx| cx.emit(SshFormEvent::Close)),
             )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.update_mouse_select(event.position, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_mouse_select(cx);
+                }),
+            )
             .child(
                 div()
                     .id("ssh-form-card")
@@ -509,21 +702,29 @@ impl Render for SshForm {
                         MouseButton::Right,
                         cx.listener(|this, _, window, cx| {
                             this.focus_handle.focus(window);
-                            if this.paste_clipboard(cx) {
-                                cx.notify();
+                            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                                let cleaned = text.replace('\r', "").replace('\n', "");
+                                if !cleaned.is_empty() {
+                                    this.active_edit_mut().insert(&cleaned);
+                                    cx.notify();
+                                }
                             }
                             cx.stop_propagation();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        this.update_mouse_select(event.position, cx);
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.end_mouse_select(cx);
                         }),
                     )
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
                         let key = &event.keystroke.key;
                         if key == "escape" {
                             cx.emit(SshFormEvent::Close);
-                            cx.stop_propagation();
-                            return;
-                        }
-                        if this.handle_clipboard_keys(event, cx) {
-                            cx.notify();
                             cx.stop_propagation();
                             return;
                         }
@@ -534,15 +735,13 @@ impl Render for SshForm {
                         }
                         if key == "tab" {
                             this.cycle_field();
+                            this.start_caret_blink(cx);
                             cx.notify();
                             cx.stop_propagation();
                             return;
                         }
-                        if key == "backspace" {
-                            this.active_field_mut().pop();
-                            cx.notify();
-                            cx.stop_propagation();
-                        } else if this.append_char(event) {
+                        if this.handle_edit_key(event, cx) {
+                            this.active_edit_mut().caret_visible = true;
                             cx.notify();
                             cx.stop_propagation();
                         }
@@ -558,44 +757,28 @@ impl Render for SshForm {
                         div()
                             .text_xs()
                             .text_color(theme::TEXT_MUTED)
-                            .child("Tab · Ctrl+C/V · Enter connects · Esc"),
+                            .child("Tab · Ctrl+A/C/V/X · arrows · Enter connects · Esc"),
                     )
-                    .child(
-                        div()
-                            .id("f-name")
-                            .cursor_pointer()
-                            .child(self.field_row(
-                                "ssh-name",
-                                "Name (optional)",
-                                &self.name,
-                                self.field == Field::Name,
-                                false,
-                                "…",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.field = Field::Name;
-                                this.focus_handle.focus(window);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("f-host")
-                            .cursor_pointer()
-                            .child(self.field_row(
-                                "ssh-host",
-                                "Host",
-                                &self.host,
-                                self.field == Field::Host,
-                                false,
-                                "…",
-                            ))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.field = Field::Host;
-                                this.focus_handle.focus(window);
-                                cx.notify();
-                            })),
-                    )
+                    .child(self.field_row(
+                        "ssh-name",
+                        "Name (optional)",
+                        Field::Name,
+                        &self.name,
+                        self.field == Field::Name,
+                        false,
+                        "…",
+                        cx,
+                    ))
+                    .child(self.field_row(
+                        "ssh-host",
+                        "Host",
+                        Field::Host,
+                        &self.host,
+                        self.field == Field::Host,
+                        false,
+                        "…",
+                        cx,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -604,39 +787,31 @@ impl Render for SshForm {
                                 div()
                                     .id("f-port")
                                     .flex_1()
-                                    .cursor_pointer()
                                     .child(self.field_row(
                                         "ssh-port",
                                         "Port",
+                                        Field::Port,
                                         &self.port,
                                         self.field == Field::Port,
                                         false,
                                         "…",
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.field = Field::Port;
-                                        this.focus_handle.focus(window);
-                                        cx.notify();
-                                    })),
+                                        cx,
+                                    )),
                             )
                             .child(
                                 div()
                                     .id("f-user")
                                     .flex_1()
-                                    .cursor_pointer()
                                     .child(self.field_row(
                                         "ssh-user",
                                         "User",
+                                        Field::User,
                                         &self.user,
                                         self.field == Field::User,
                                         false,
                                         "…",
-                                    ))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.field = Field::User;
-                                        this.focus_handle.focus(window);
-                                        cx.notify();
-                                    })),
+                                        cx,
+                                    )),
                             ),
                     )
                     .child(
@@ -656,35 +831,27 @@ impl Render for SshForm {
                                         "Auth: password  (click to use private key)"
                                     }),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 this.use_private_key = !this.use_private_key;
-                                this.field = if this.use_private_key {
+                                let field = if this.use_private_key {
                                     Field::KeyPath
                                 } else {
                                     Field::Password
                                 };
-                                cx.notify();
+                                this.focus_field(field, window, cx);
                             })),
                     )
                     .when(!self.use_private_key, |d| {
-                        d.child(
-                            div()
-                                .id("f-pass")
-                                .cursor_pointer()
-                                .child(self.field_row(
-                                    "ssh-pass",
-                                    pass_label,
-                                    &self.password,
-                                    self.field == Field::Password,
-                                    true,
-                                    pass_hint,
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.field = Field::Password;
-                                    this.focus_handle.focus(window);
-                                    cx.notify();
-                                })),
-                        )
+                        d.child(self.field_row(
+                            "ssh-pass",
+                            pass_label,
+                            Field::Password,
+                            &self.password,
+                            self.field == Field::Password,
+                            true,
+                            pass_hint,
+                            cx,
+                        ))
                         .child(
                             div()
                                 .id("ssh-remember")
@@ -709,24 +876,16 @@ impl Render for SshForm {
                         )
                     })
                     .when(self.use_private_key, |d| {
-                        d.child(
-                            div()
-                                .id("f-key")
-                                .cursor_pointer()
-                                .child(self.field_row(
-                                    "ssh-key",
-                                    "Private key path",
-                                    &self.key_path,
-                                    self.field == Field::KeyPath,
-                                    false,
-                                    "C:\\Users\\…\\.ssh\\id_ed25519",
-                                ))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.field = Field::KeyPath;
-                                    this.focus_handle.focus(window);
-                                    cx.notify();
-                                })),
-                        )
+                        d.child(self.field_row(
+                            "ssh-key",
+                            "Private key path",
+                            Field::KeyPath,
+                            &self.key_path,
+                            self.field == Field::KeyPath,
+                            false,
+                            "C:\\Users\\…\\.ssh\\id_ed25519",
+                            cx,
+                        ))
                     })
                     .when_some(err, |d, msg| {
                         d.child(
