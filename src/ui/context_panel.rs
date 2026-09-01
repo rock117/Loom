@@ -41,6 +41,28 @@ enum FilesKind {
     Local,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SortField {
+    Name,
+    /// Folder vs file.
+    Kind,
+    Size,
+    Mtime,
+    Ext,
+}
+
+impl SortField {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Kind => "Type",
+            Self::Size => "Size",
+            Self::Mtime => "Modified",
+            Self::Ext => "Ext",
+        }
+    }
+}
+
 #[derive(Clone)]
 enum TransferStatus {
     /// Request is on the transfer lane but the worker has not started it yet.
@@ -138,6 +160,9 @@ pub struct ContextPanel {
     editing_search: bool,
     /// Whether the filter input row is visible (opened via toolbar search).
     search_open: bool,
+    /// Details-list sort (click column headers).
+    sort_field: SortField,
+    sort_asc: bool,
     /// Host metrics for the Info tab (manual refresh).
     host_info: Option<HostSnapshot>,
     host_info_pane: Option<Uuid>,
@@ -199,6 +224,8 @@ impl ContextPanel {
             search_edit: RenameEdit::new(""),
             editing_search: false,
             search_open: false,
+            sort_field: SortField::Name,
+            sort_asc: true,
             host_info: None,
             host_info_pane: None,
             host_info_loading: false,
@@ -1422,14 +1449,29 @@ impl ContextPanel {
 
     fn filtered_entries(&self) -> Vec<RemoteEntry> {
         let q = self.search_edit.text.trim();
-        if q.is_empty() {
-            return self.entries.clone();
+        let mut entries: Vec<RemoteEntry> = if q.is_empty() {
+            self.entries.clone()
+        } else {
+            self.entries
+                .iter()
+                .filter(|e| name_matches(&e.name, q))
+                .cloned()
+                .collect()
+        };
+        let field = self.sort_field;
+        let asc = self.sort_asc;
+        entries.sort_by(|a, b| cmp_entries(a, b, field, asc));
+        entries
+    }
+
+    fn toggle_sort(&mut self, field: SortField, cx: &mut Context<Self>) {
+        if self.sort_field == field {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_field = field;
+            self.sort_asc = true;
         }
-        self.entries
-            .iter()
-            .filter(|e| name_matches(&e.name, q))
-            .cloned()
-            .collect()
+        cx.notify();
     }
 
     fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
@@ -2336,6 +2378,14 @@ impl ContextPanel {
         let view = cx.entity();
         let query = search_query.trim().to_string();
         let no_matches = entries.is_empty() && !query.is_empty();
+        let panel_w = self
+            .files_body_bounds
+            .map(|b| f32::from(b.size.width))
+            .filter(|w| *w > 1.0)
+            .unwrap_or_else(|| self.store.read(cx).ui_state.context_panel_width);
+        let cols = details_columns(panel_w);
+        let sort_field = self.sort_field;
+        let sort_asc = self.sort_asc;
 
         div()
             .id("ctx-files-body")
@@ -2347,8 +2397,20 @@ impl ContextPanel {
             .child(
                 canvas(
                     move |bounds, _, cx| {
-                        view.update(cx, |this, _| {
+                        view.update(cx, |this, cx| {
+                            let prev = this
+                                .files_body_bounds
+                                .map(|b| f32::from(b.size.width));
                             this.files_body_bounds = Some(bounds);
+                            let w = f32::from(bounds.size.width);
+                            let crossed = prev.is_none_or(|p| {
+                                details_columns(p).mtime != details_columns(w).mtime
+                                    || details_columns(p).kind != details_columns(w).kind
+                                    || details_columns(p).ext != details_columns(w).ext
+                            });
+                            if crossed {
+                                cx.notify();
+                            }
                         });
                         bounds
                     },
@@ -2363,7 +2425,8 @@ impl ContextPanel {
                     .h(relative(list_ratio))
                     .w_full()
                     .min_h_0()
-                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
                     .border_1()
                     .border_color(theme::BORDER_SUBTLE)
                     .rounded(px(theme::RADIUS_SM))
@@ -2395,67 +2458,121 @@ impl ContextPanel {
                             },
                         ))
                     })
-                    .when(no_matches, |d| {
-                        d.child(
-                            div()
-                                .px(px(theme::SPACE_2))
-                                .py(px(theme::SPACE_2))
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .child("No matches"),
-                        )
-                    })
-                    .children(entries.into_iter().map(|entry| {
-                        let path = entry.path.clone();
-                        let is_sel = selected.as_deref() == Some(path.as_str());
-                        let icon = if entry.is_dir { "📁" } else { "📄" };
-                        let size = if entry.is_dir {
-                            String::new()
-                        } else {
-                            format_size(entry.size)
-                        };
-                        let entry_click = entry.clone();
-                        let name_el = highlighted_entry_name(&entry.name, &query);
+                    .child(self.render_details_header(cols, sort_field, sort_asc, cx))
+                    .child(
                         div()
-                            .id(SharedString::from(format!("file-{path}")))
-                            .flex()
-                            .items_center()
-                            .gap(px(theme::SPACE_1))
-                            .px(px(theme::SPACE_2))
-                            .py(px(theme::SPACE_1))
-                            .cursor_pointer()
-                            .when(is_sel, |d| d.bg(theme::HOVER))
-                            .hover(|s| s.bg(theme::HOVER))
-                            .child(div().text_xs().child(icon))
-                            .child(name_el)
-                            .child(
+                            .id("ctx-file-list-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .overflow_y_scroll()
+                            .when(no_matches, |d| {
+                                d.child(
+                                    div()
+                                        .px(px(theme::SPACE_2))
+                                        .py(px(theme::SPACE_2))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child("No matches"),
+                                )
+                            })
+                            .children(entries.into_iter().map(|entry| {
+                                let path = entry.path.clone();
+                                let is_sel = selected.as_deref() == Some(path.as_str());
+                                let icon = if entry.is_dir { "📁" } else { "📄" };
+                                let size = if entry.is_dir {
+                                    String::new()
+                                } else {
+                                    format_size(entry.size)
+                                };
+                                let mtime = format_mtime(entry.mtime);
+                                let kind = entry_kind_label(&entry);
+                                let ext = if entry.is_dir {
+                                    String::new()
+                                } else {
+                                    entry_extension(&entry.name)
+                                };
+                                let entry_click = entry.clone();
+                                let name_el = highlighted_entry_name(&entry.name, &query);
                                 div()
-                                    .text_xs()
-                                    .text_color(theme::TEXT_MUTED)
-                                    .child(size),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.selected = Some(path.clone());
-                                    this.transfer_menu = None;
-                                    this.entry_menu = Some(EntryMenu {
-                                        path: path.clone(),
-                                        position: event.position,
-                                    });
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.entry_menu = None;
-                                this.selected = Some(entry_click.path.clone());
-                                if event.click_count() >= 2 {
-                                    this.enter_or_download(entry_click.clone(), cx);
-                                }
-                                cx.notify();
-                            }))
-                    })),
+                                    .id(SharedString::from(format!("file-{path}")))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .cursor_pointer()
+                                    .when(is_sel, |d| d.bg(theme::HOVER))
+                                    .hover(|s| s.bg(theme::HOVER))
+                                    .child(div().text_xs().flex_shrink_0().child(icon))
+                                    .child(name_el)
+                                    .when(cols.mtime, |d| {
+                                        d.child(
+                                            div()
+                                                .w(px(column_width(SortField::Mtime)))
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(mtime),
+                                        )
+                                    })
+                                    .when(cols.kind, |d| {
+                                        d.child(
+                                            div()
+                                                .w(px(column_width(SortField::Kind)))
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(kind),
+                                        )
+                                    })
+                                    .when(cols.ext, |d| {
+                                        d.child(
+                                            div()
+                                                .w(px(column_width(SortField::Ext)))
+                                                .flex_shrink_0()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .child(ext),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(column_width(SortField::Size)))
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .child(size),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                            this.selected = Some(path.clone());
+                                            this.transfer_menu = None;
+                                            this.entry_menu = Some(EntryMenu {
+                                                path: path.clone(),
+                                                position: event.position,
+                                            });
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                        }),
+                                    )
+                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                        this.entry_menu = None;
+                                        this.selected = Some(entry_click.path.clone());
+                                        if event.click_count() >= 2 {
+                                            this.enter_or_download(entry_click.clone(), cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -2475,6 +2592,108 @@ impl ContextPanel {
                     ),
             )
             .child(self.render_transfers(1.0 - list_ratio, cx))
+    }
+
+    fn render_details_header(
+        &self,
+        cols: DetailsColumns,
+        sort_field: SortField,
+        sort_asc: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .px(px(theme::SPACE_2))
+            .py(px(2.0))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::BORDER_SUBTLE)
+            .child(div().w(px(16.0)).flex_shrink_0())
+            .child(self.sort_header_btn(
+                "ctx-sort-name",
+                SortField::Name,
+                sort_field,
+                sort_asc,
+                true,
+                cx,
+            ))
+            .when(cols.mtime, |d| {
+                d.child(self.sort_header_btn(
+                    "ctx-sort-mtime",
+                    SortField::Mtime,
+                    sort_field,
+                    sort_asc,
+                    false,
+                    cx,
+                ))
+            })
+            .when(cols.kind, |d| {
+                d.child(self.sort_header_btn(
+                    "ctx-sort-kind",
+                    SortField::Kind,
+                    sort_field,
+                    sort_asc,
+                    false,
+                    cx,
+                ))
+            })
+            .when(cols.ext, |d| {
+                d.child(self.sort_header_btn(
+                    "ctx-sort-ext",
+                    SortField::Ext,
+                    sort_field,
+                    sort_asc,
+                    false,
+                    cx,
+                ))
+            })
+            .child(self.sort_header_btn(
+                "ctx-sort-size",
+                SortField::Size,
+                sort_field,
+                sort_asc,
+                false,
+                cx,
+            ))
+    }
+
+    fn sort_header_btn(
+        &self,
+        id: &'static str,
+        field: SortField,
+        active: SortField,
+        asc: bool,
+        flex_name: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_active = active == field;
+        let arrow = if is_active {
+            if asc { " ↑" } else { " ↓" }
+        } else {
+            ""
+        };
+        let label = format!("{}{arrow}", field.label());
+        let width = column_width(field);
+        div()
+            .id(id)
+            .when(flex_name, |d| d.flex_1().min_w_0())
+            .when(!flex_name, |d| d.w(px(width)).flex_shrink_0())
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if is_active {
+                theme::TEXT
+            } else {
+                theme::TEXT_MUTED
+            })
+            .cursor_pointer()
+            .hover(|s| s.text_color(theme::TEXT))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_sort(field, cx);
+                cx.stop_propagation();
+            }))
     }
 
     fn render_transfers(&self, height_ratio: f32, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3303,6 +3522,98 @@ fn default_local_home() -> String {
                 "/".into()
             }
         })
+}
+
+#[derive(Clone, Copy)]
+struct DetailsColumns {
+    mtime: bool,
+    kind: bool,
+    ext: bool,
+}
+
+fn details_columns(panel_width: f32) -> DetailsColumns {
+    // Context panel width: name+size always; then mtime; then type; then ext.
+    DetailsColumns {
+        mtime: panel_width >= 300.0,
+        kind: panel_width >= 400.0,
+        ext: panel_width >= 520.0,
+    }
+}
+
+fn column_width(field: SortField) -> f32 {
+    match field {
+        SortField::Name => 0.0,
+        SortField::Mtime => 118.0,
+        SortField::Kind => 56.0,
+        SortField::Ext => 44.0,
+        SortField::Size => 56.0,
+    }
+}
+
+fn entry_extension(name: &str) -> String {
+    Path::new(name)
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_ascii_lowercase()))
+        .unwrap_or_default()
+}
+
+fn entry_kind_label(entry: &RemoteEntry) -> &'static str {
+    if entry.is_dir { "Folder" } else { "File" }
+}
+
+fn cmp_entries(a: &RemoteEntry, b: &RemoteEntry, field: SortField, asc: bool) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+    let dirs_first = || match (a.is_dir, b.is_dir) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => Ordering::Equal,
+    };
+    match field {
+        SortField::Name => {
+            let name_ord = if asc {
+                by_name()
+            } else {
+                by_name().reverse()
+            };
+            dirs_first().then(name_ord)
+        }
+        SortField::Kind => {
+            let kind_ord = a.is_dir.cmp(&b.is_dir).reverse();
+            let kind_ord = if asc { kind_ord } else { kind_ord.reverse() };
+            kind_ord.then_with(by_name)
+        }
+        SortField::Size => {
+            let size_ord = if asc {
+                a.size.cmp(&b.size)
+            } else {
+                a.size.cmp(&b.size).reverse()
+            };
+            size_ord.then_with(by_name)
+        }
+        SortField::Mtime => {
+            let ta = a.mtime.unwrap_or(0);
+            let tb = b.mtime.unwrap_or(0);
+            let time_ord = if asc { ta.cmp(&tb) } else { ta.cmp(&tb).reverse() };
+            time_ord.then_with(by_name)
+        }
+        SortField::Ext => {
+            let ext_ord = entry_extension(&a.name).cmp(&entry_extension(&b.name));
+            let ext_ord = if asc { ext_ord } else { ext_ord.reverse() };
+            dirs_first().then(ext_ord).then_with(by_name)
+        }
+    }
+}
+
+fn format_mtime(secs: Option<u64>) -> String {
+    let Some(secs) = secs else {
+        return String::new();
+    };
+    use chrono::{DateTime, Local};
+    let Some(dt) = DateTime::from_timestamp(secs as i64, 0) else {
+        return String::new();
+    };
+    dt.with_timezone(&Local).format("%Y/%m/%d %H:%M").to_string()
 }
 
 fn chars_eq_ci(a: char, b: char) -> bool {

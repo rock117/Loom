@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use super::sftp::RemoteEntry;
 
-/// List a local directory as [`RemoteEntry`] rows (sorted dirs-first, then name).
+/// List a local directory as [`RemoteEntry`] rows (unsorted; UI applies sort).
 pub fn list_dir(path: &Path) -> Result<Vec<RemoteEntry>> {
     let mut out = Vec::new();
     let rd = std::fs::read_dir(path).with_context(|| format!("read_dir {}", path.display()))?;
@@ -24,18 +24,19 @@ pub fn list_dir(path: &Path) -> Result<Vec<RemoteEntry>> {
             Ok(m) => m,
             Err(_) => continue,
         };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
         out.push(RemoteEntry {
             name,
             path: full.to_string_lossy().into_owned(),
             is_dir: meta.is_dir(),
             size: if meta.is_file() { meta.len() } else { 0 },
+            mtime,
         });
     }
-    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
     Ok(out)
 }
 

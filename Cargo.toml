@@ -9,6 +9,7 @@ authors = ["Loom"]
 [dependencies]
 alacritty_terminal = "0.25.1"
 anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 flume = "0.12"
 gpui = "0.2.2"

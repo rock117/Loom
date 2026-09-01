@@ -3487,6 +3487,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
  "embed-resource",
  "flume 0.12.0",

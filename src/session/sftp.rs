@@ -33,6 +33,8 @@ pub struct RemoteEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
+    /// Last modified time as Unix seconds, when the backend provides it.
+    pub mtime: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -475,19 +477,17 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {
     {
         let name = entry.file_name();
         let is_dir = entry.file_type().is_dir();
-        let size = entry.metadata().size.unwrap_or(0);
+        let meta = entry.metadata();
+        let size = meta.size.unwrap_or(0);
+        let mtime = meta.mtime.map(|t| t as u64);
         out.push(RemoteEntry {
             name,
             path: entry.path(),
             is_dir,
             size,
+            mtime,
         });
     }
-    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-        (true, false) => std::cmp::Ordering::Less,
-        (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-    });
     Ok(out)
 }
 
