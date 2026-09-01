@@ -133,6 +133,11 @@ pub struct ContextPanel {
     /// Address-bar editor for the Files cwd (copy / paste / Enter to navigate).
     path_edit: RenameEdit,
     editing_path: bool,
+    /// Current-directory name filter (files + folders; non-recursive).
+    search_edit: RenameEdit,
+    editing_search: bool,
+    /// Whether the filter input row is visible (opened via toolbar search).
+    search_open: bool,
     /// Host metrics for the Info tab (manual refresh).
     host_info: Option<HostSnapshot>,
     host_info_pane: Option<Uuid>,
@@ -191,6 +196,9 @@ impl ContextPanel {
             prompt: None,
             path_edit: RenameEdit::new(""),
             editing_path: false,
+            search_edit: RenameEdit::new(""),
+            editing_search: false,
+            search_open: false,
             host_info: None,
             host_info_pane: None,
             host_info_loading: false,
@@ -242,6 +250,9 @@ impl ContextPanel {
         self.prompt = None;
         self.path_edit = RenameEdit::new("");
         self.editing_path = false;
+        self.search_edit = RenameEdit::new("");
+        self.editing_search = false;
+        self.search_open = false;
         self._prompt_caret_blink = None;
         self.host_info = None;
         self.host_info_pane = None;
@@ -1033,6 +1044,10 @@ impl ContextPanel {
                             this.path_edit.caret_visible = !this.path_edit.caret_visible;
                             cx.notify();
                             true
+                        } else if this.editing_search {
+                            this.search_edit.caret_visible = !this.search_edit.caret_visible;
+                            cx.notify();
+                            true
                         } else {
                             false
                         }
@@ -1049,6 +1064,7 @@ impl ContextPanel {
         if self.cwd.is_none() && self.path_edit.text.is_empty() {
             return;
         }
+        self.editing_search = false;
         self.editing_path = true;
         self.entry_menu = None;
         self.transfer_menu = None;
@@ -1213,6 +1229,207 @@ impl ContextPanel {
             }
         }
         false
+    }
+
+    fn begin_search_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cwd.is_none() {
+            return;
+        }
+        if self.editing_path {
+            self.cancel_path_edit(cx);
+        }
+        self.search_open = true;
+        self.editing_search = true;
+        self.entry_menu = None;
+        self.transfer_menu = None;
+        self.search_edit.caret_visible = true;
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cwd.is_none() {
+            return;
+        }
+        if self.search_open {
+            self.close_search(cx);
+        } else {
+            self.begin_search_edit(window, cx);
+        }
+    }
+
+    fn close_search(&mut self, cx: &mut Context<Self>) {
+        self.search_edit = RenameEdit::new("");
+        self.editing_search = false;
+        self.search_open = false;
+        if self.prompt.is_none() && !self.editing_path {
+            self._prompt_caret_blink = None;
+        }
+        cx.notify();
+    }
+
+    fn clear_search_text(&mut self, cx: &mut Context<Self>) {
+        self.search_edit = RenameEdit::new("");
+        self.editing_search = true;
+        self.search_edit.caret_visible = true;
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn handle_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let chord = mods.control || mods.platform;
+
+        // Ctrl/Cmd+F opens / focuses the filter.
+        if chord && key.eq_ignore_ascii_case("f") {
+            if self.prompt.is_some() || self.cwd.is_none() {
+                return false;
+            }
+            if self.editing_path {
+                if let Some(cwd) = self.cwd.clone() {
+                    self.path_edit = RenameEdit::new(cwd);
+                }
+                self.editing_path = false;
+            }
+            self.search_open = true;
+            self.editing_search = true;
+            self.search_edit.select_all();
+            self.start_prompt_caret_blink(cx);
+            cx.notify();
+            return true;
+        }
+
+        if !self.search_open || self.prompt.is_some() || self.editing_path {
+            return false;
+        }
+        if !self.editing_search {
+            // Bar visible but not focused: Esc closes it.
+            if key == "escape" {
+                self.close_search(cx);
+                return true;
+            }
+            return false;
+        }
+
+        if key == "escape" {
+            if !self.search_edit.text.is_empty() {
+                self.clear_search_text(cx);
+            } else {
+                self.close_search(cx);
+            }
+            return true;
+        }
+        if key == "enter" {
+            self.editing_search = false;
+            if self.prompt.is_none() {
+                self._prompt_caret_blink = None;
+            }
+            cx.notify();
+            return true;
+        }
+
+        let edit = &mut self.search_edit;
+
+        if chord && key.eq_ignore_ascii_case("a") {
+            edit.select_all();
+            cx.notify();
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("c") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return true;
+        }
+        if chord && key.eq_ignore_ascii_case("x") {
+            let text = if edit.has_selection() {
+                edit.selected_text()
+            } else {
+                edit.text.clone()
+            };
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            if edit.has_selection() {
+                edit.delete_selection();
+            } else {
+                edit.text.clear();
+                edit.cursor = 0;
+                edit.anchor = 0;
+            }
+            cx.notify();
+            return true;
+        }
+        if (chord && key.eq_ignore_ascii_case("v"))
+            || (mods.shift && key.eq_ignore_ascii_case("insert"))
+        {
+            if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                let cleaned = text.replace('\r', "").replace('\n', "");
+                if !cleaned.is_empty() {
+                    edit.insert(&cleaned);
+                    cx.notify();
+                }
+            }
+            return true;
+        }
+        if key == "backspace" {
+            edit.backspace();
+            cx.notify();
+            return true;
+        }
+        if key == "delete" {
+            edit.delete_forward();
+            cx.notify();
+            return true;
+        }
+        if key == "left" {
+            edit.move_left(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "right" {
+            edit.move_right(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "home" {
+            edit.move_home(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if key == "end" {
+            edit.move_end(mods.shift);
+            cx.notify();
+            return true;
+        }
+        if let Some(typed) = event.keystroke.key_char.as_deref() {
+            let cleaned = typed.replace('\r', "").replace('\n', "");
+            if !cleaned.is_empty() && !chord {
+                edit.insert(&cleaned);
+                cx.notify();
+                return true;
+            }
+        }
+        false
+    }
+
+    fn filtered_entries(&self) -> Vec<RemoteEntry> {
+        let q = self.search_edit.text.trim();
+        if q.is_empty() {
+            return self.entries.clone();
+        }
+        self.entries
+            .iter()
+            .filter(|e| name_matches(&e.name, q))
+            .cloned()
+            .collect()
     }
 
     fn cancel_prompt(&mut self, cx: &mut Context<Self>) {
@@ -1783,7 +2000,8 @@ impl ContextPanel {
         });
         let listing = self.listing;
         let error = self.error.clone();
-        let entries = self.entries.clone();
+        let search_query = self.search_edit.text.clone();
+        let entries = self.filtered_entries();
         let selected = self.selected.clone();
         let has_sel = selected.is_some();
         let path_display = if self.path_edit.text.is_empty() {
@@ -1797,6 +2015,17 @@ impl ContextPanel {
             None
         };
         let editing_path = self.editing_path;
+        let search_open = self.search_open;
+        let editing_search = self.editing_search;
+        let search_empty = self.search_edit.text.is_empty();
+        let search_el = if editing_search {
+            Some(self.search_edit.into_element_bare())
+        } else {
+            None
+        };
+        let filter_active = search_open && !search_query.trim().is_empty();
+        let shown = entries.len();
+        let total = self.entries.len();
 
         div()
             .flex()
@@ -1828,7 +2057,96 @@ impl ContextPanel {
                         cx,
                         |this, window, cx| this.begin_new_folder(window, cx),
                     ))
-                    .child(div().flex_1())
+                    .child(self.nav_btn(
+                        "ctx-search",
+                        "⌕",
+                        if search_open {
+                            "Close filter"
+                        } else {
+                            "Filter in folder"
+                        },
+                        self.cwd.is_some(),
+                        cx,
+                        |this, window, cx| this.toggle_search(window, cx),
+                    ))
+                    .when(search_open, |d| {
+                        d.child(
+                            div()
+                                .id("ctx-search-bar")
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap(px(theme::SPACE_1))
+                                .px(px(theme::SPACE_1))
+                                .py(px(1.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .bg(theme::BG)
+                                .border_1()
+                                .border_color(if editing_search {
+                                    theme::ACCENT
+                                } else {
+                                    theme::BORDER_SUBTLE
+                                })
+                                .cursor_text()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .when_some(search_el, |d, el| d.child(el))
+                                        .when(!editing_search, |d| {
+                                            d.text_xs()
+                                                .text_color(if search_empty {
+                                                    theme::TEXT_DISABLED
+                                                } else {
+                                                    theme::TEXT
+                                                })
+                                                .child(if search_empty {
+                                                    "Filter…".to_string()
+                                                } else {
+                                                    search_query.clone()
+                                                })
+                                        }),
+                                )
+                                .when(filter_active && !listing, |d| {
+                                    d.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .child(format!("{shown}/{total}")),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("ctx-search-close")
+                                        .flex_shrink_0()
+                                        .px(px(4.0))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                        .child("×")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.close_search(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.begin_search_edit(window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                    })
+                    .when(!search_open, |d| d.child(div().flex_1()))
                     .when(is_sftp, |d| {
                         d.child(self.nav_btn(
                             "ctx-download",
@@ -1904,7 +2222,7 @@ impl ContextPanel {
                         .child("Loading…"),
                 )
             })
-            .child(self.render_files_split(entries, selected, is_sftp, cx))
+            .child(self.render_files_split(entries, selected, &search_query, is_sftp, cx))
             .into_any_element()
     }
 
@@ -2010,11 +2328,14 @@ impl ContextPanel {
         &self,
         entries: Vec<RemoteEntry>,
         selected: Option<String>,
+        search_query: &str,
         accept_drops: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let list_ratio = self.list_ratio.clamp(0.35, 0.9);
         let view = cx.entity();
+        let query = search_query.trim().to_string();
+        let no_matches = entries.is_empty() && !query.is_empty();
 
         div()
             .id("ctx-files-body")
@@ -2074,6 +2395,16 @@ impl ContextPanel {
                             },
                         ))
                     })
+                    .when(no_matches, |d| {
+                        d.child(
+                            div()
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_2))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .child("No matches"),
+                        )
+                    })
                     .children(entries.into_iter().map(|entry| {
                         let path = entry.path.clone();
                         let is_sel = selected.as_deref() == Some(path.as_str());
@@ -2084,6 +2415,7 @@ impl ContextPanel {
                             format_size(entry.size)
                         };
                         let entry_click = entry.clone();
+                        let name_el = highlighted_entry_name(&entry.name, &query);
                         div()
                             .id(SharedString::from(format!("file-{path}")))
                             .flex()
@@ -2095,15 +2427,7 @@ impl ContextPanel {
                             .when(is_sel, |d| d.bg(theme::HOVER))
                             .hover(|s| s.bg(theme::HOVER))
                             .child(div().text_xs().child(icon))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_xs()
-                                    .text_color(theme::TEXT)
-                                    .overflow_hidden()
-                                    .child(entry.name.clone()),
-                            )
+                            .child(name_el)
                             .child(
                                 div()
                                     .text_xs()
@@ -2981,6 +3305,99 @@ fn default_local_home() -> String {
         })
 }
 
+fn chars_eq_ci(a: char, b: char) -> bool {
+    if a.eq_ignore_ascii_case(&b) {
+        return true;
+    }
+    a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// Non-overlapping case-insensitive substring ranges as Unicode scalar indices.
+fn match_ranges(name: &str, query: &str) -> Vec<(usize, usize)> {
+    let name_chars: Vec<char> = name.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    let qlen = query_chars.len();
+    if qlen == 0 || name_chars.len() < qlen {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + qlen <= name_chars.len() {
+        let matched = name_chars[i..i + qlen]
+            .iter()
+            .zip(query_chars.iter())
+            .all(|(a, b)| chars_eq_ci(*a, *b));
+        if matched {
+            out.push((i, i + qlen));
+            i += qlen;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn name_matches(name: &str, query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() {
+        return true;
+    }
+    !match_ranges(name, q).is_empty()
+}
+
+fn highlighted_entry_name(name: &str, query: &str) -> AnyElement {
+    let q = query.trim();
+    let base = div()
+        .flex()
+        .items_center()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .text_xs()
+        .text_color(theme::TEXT);
+
+    if q.is_empty() {
+        return base.child(name.to_string()).into_any_element();
+    }
+
+    let ranges = match_ranges(name, q);
+    if ranges.is_empty() {
+        return base.child(name.to_string()).into_any_element();
+    }
+
+    let chars: Vec<char> = name.chars().collect();
+    let mut row = base;
+    let mut i = 0usize;
+    for (start, end) in ranges {
+        if i < start {
+            let plain: String = chars[i..start].iter().collect();
+            row = row.child(div().whitespace_nowrap().child(plain));
+        }
+        let hit: String = chars[start..end].iter().collect();
+        row = row.child(
+            div()
+                .whitespace_nowrap()
+                .rounded(px(2.0))
+                .bg(theme::ACCENT.opacity(0.4))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(hit),
+        );
+        i = end;
+    }
+    if i < chars.len() {
+        let rest: String = chars[i..].iter().collect();
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(rest),
+        );
+    }
+    row.into_any_element()
+}
+
 fn format_size(n: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -3203,6 +3620,10 @@ impl Render for ContextPanel {
                     return;
                 }
                 if this.handle_path_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.handle_search_key(event, cx) {
                     cx.stop_propagation();
                     return;
                 }
