@@ -2,7 +2,7 @@ use gpui::*;
 use uuid::Uuid;
 
 use crate::model::{
-    Group, OpenTabRef, Profile, ProfileKind, SettingsFile, UiStateFile, WorkspaceFile,
+    Group, OpenTabRef, OrderKey, Profile, ProfileKind, SettingsFile, UiStateFile, WorkspaceFile,
     load_settings, load_ui_state, load_workspace, save_settings, save_ui_state, save_workspace,
 };
 use crate::ui::rename_edit::RenameEdit;
@@ -129,6 +129,7 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
         self.selection = Selection::Group(id);
         self.mark_dirty();
         self.persist_now();
@@ -151,6 +152,7 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
         self.selection = Selection::Profile(id);
         self.mark_dirty();
         self.persist_now();
@@ -171,6 +173,7 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
         self.selection = Selection::Profile(id);
         self.mark_dirty();
         self.persist_now();
@@ -197,6 +200,7 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
         self.selection = Selection::Profile(id);
         self.mark_dirty();
         self.persist_now();
@@ -257,6 +261,9 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
+        self.workspace
+            .insert_order_key_after(OrderKey::Profile(new_id), OrderKey::Profile(id));
         self.selection = Selection::Profile(new_id);
         self.mark_dirty();
         self.persist_now();
@@ -269,6 +276,7 @@ impl WorkspaceStore {
             Selection::Profile(id) => {
                 let _ = crate::session::credentials::delete_password(id);
                 self.workspace.remove_profile(id);
+                self.workspace.sync_orders();
                 self.selection = Selection::None;
                 self.mark_dirty();
                 self.persist_now();
@@ -281,6 +289,8 @@ impl WorkspaceStore {
                 self.workspace.remove_group(id);
                 if self.workspace.groups.is_empty() && self.workspace.profiles.is_empty() {
                     self.workspace = WorkspaceFile::default_workspace();
+                } else {
+                    self.workspace.sync_orders();
                 }
                 self.selection = Selection::None;
                 self.mark_dirty();
@@ -364,6 +374,7 @@ impl WorkspaceStore {
         } else {
             self.workspace.profiles.push(profile);
         }
+        self.workspace.sync_orders();
         self.mark_dirty();
         self.persist_now();
         cx.notify();
@@ -374,6 +385,7 @@ impl WorkspaceStore {
             return;
         };
         self.workspace.profiles.push(profile);
+        self.workspace.sync_orders();
         self.selection = Selection::Profile(profile_id);
         self.mark_dirty();
         self.persist_now();
@@ -419,13 +431,18 @@ impl WorkspaceStore {
                 }
             }
         }
+        self.workspace.sync_orders();
+        self.workspace.insert_order_key_before(
+            OrderKey::Profile(profile_id),
+            OrderKey::Profile(before_profile),
+        );
         self.selection = Selection::Profile(profile_id);
         self.mark_dirty();
         self.persist_now();
         cx.notify();
     }
 
-    /// Reorder root-level groups only (MVP): place `dragged` immediately before `before`.
+    /// Place `dragged` group immediately before `before` in the shared sibling order.
     pub fn reorder_group_before(
         &mut self,
         dragged: Uuid,
@@ -435,19 +452,49 @@ impl WorkspaceStore {
         if dragged == before {
             return;
         }
-        let Some(from) = self.workspace.groups.iter().position(|g| g.id == dragged) else {
-            return;
-        };
-        let group = self.workspace.groups.remove(from);
-        let Some(to) = self.workspace.groups.iter().position(|g| g.id == before) else {
-            self.workspace.groups.insert(from, group);
-            return;
-        };
-        self.workspace.groups.insert(to, group);
+        self.workspace.sync_orders();
+        self.workspace
+            .insert_order_key_before(OrderKey::Group(dragged), OrderKey::Group(before));
         self.selection = Selection::Group(dragged);
         self.mark_dirty();
         self.persist_now();
         cx.notify();
+    }
+
+    pub fn move_profile_up(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.move_profile_by(id, -1) {
+            self.selection = Selection::Profile(id);
+            self.mark_dirty();
+            self.persist_now();
+            cx.notify();
+        }
+    }
+
+    pub fn move_profile_down(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.move_profile_by(id, 1) {
+            self.selection = Selection::Profile(id);
+            self.mark_dirty();
+            self.persist_now();
+            cx.notify();
+        }
+    }
+
+    pub fn move_group_up(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.move_group_by(id, -1) {
+            self.selection = Selection::Group(id);
+            self.mark_dirty();
+            self.persist_now();
+            cx.notify();
+        }
+    }
+
+    pub fn move_group_down(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.workspace.move_group_by(id, 1) {
+            self.selection = Selection::Group(id);
+            self.mark_dirty();
+            self.persist_now();
+            cx.notify();
+        }
     }
 
     pub fn sync_open_tabs(&mut self, tabs: &[(Uuid, Option<String>)], active: usize) {
@@ -493,6 +540,7 @@ impl WorkspaceStore {
 
     pub fn replace_workspace(&mut self, workspace: WorkspaceFile, cx: &mut Context<Self>) {
         self.workspace = workspace;
+        self.workspace.sync_orders();
         self.selection = Selection::None;
         self.mark_dirty();
         self.persist_now();

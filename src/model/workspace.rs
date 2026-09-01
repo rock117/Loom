@@ -4,6 +4,14 @@ use uuid::Uuid;
 use super::profile::Profile;
 use crate::session::local_proxy::LocalProxyMode;
 
+/// Sibling slot in a workspace or group folder (profile and group share one order).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "t", content = "id", rename_all = "snake_case")]
+pub enum OrderKey {
+    Profile(Uuid),
+    Group(Uuid),
+}
+
 /// Workspace root (`/`: files + directories).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceFile {
@@ -13,6 +21,9 @@ pub struct WorkspaceFile {
     pub profiles: Vec<Profile>,
     /// Root-level groups (directories under `/`).
     pub groups: Vec<Group>,
+    /// Display / move order of root profiles and groups (interleaved).
+    #[serde(default)]
+    pub order: Vec<OrderKey>,
 }
 
 impl WorkspaceFile {
@@ -22,11 +33,14 @@ impl WorkspaceFile {
         } else {
             "Shell"
         };
+        let profile = Profile::new_local(profile_name);
+        let id = profile.id;
         Self {
             version: 2,
             // Default Local shell sits at root — no forced group.
-            profiles: vec![Profile::new_local(profile_name)],
+            profiles: vec![profile],
             groups: Vec::new(),
+            order: vec![OrderKey::Profile(id)],
         }
     }
 
@@ -172,22 +186,180 @@ impl WorkspaceFile {
         }
         None
     }
-    /// Flatten for sidebar: root profiles, then groups (respecting collapsed).
+    /// Flatten for sidebar using interleaved `order` (respecting collapsed).
     pub fn sidebar_entries(&self) -> Vec<SidebarEntry> {
         let mut out = Vec::new();
-        for p in &self.profiles {
-            out.push(SidebarEntry::Profile {
-                id: p.id,
-                name: p.name.clone(),
-                depth: 0,
-                is_local: p.kind.is_local(),
-            });
-        }
-        for g in &self.groups {
-            g.append_sidebar_entries(0, &mut out);
-        }
+        self.append_ordered_entries(&self.order, &self.profiles, &self.groups, 0, &mut out);
         out
     }
+
+    fn append_ordered_entries(
+        &self,
+        order: &[OrderKey],
+        profiles: &[Profile],
+        groups: &[Group],
+        depth: u32,
+        out: &mut Vec<SidebarEntry>,
+    ) {
+        for key in order {
+            match key {
+                OrderKey::Profile(id) => {
+                    if let Some(p) = profiles.iter().find(|p| p.id == *id) {
+                        out.push(SidebarEntry::Profile {
+                            id: p.id,
+                            name: p.name.clone(),
+                            depth,
+                            is_local: p.kind.is_local(),
+                        });
+                    }
+                }
+                OrderKey::Group(id) => {
+                    if let Some(g) = groups.iter().find(|g| g.id == *id) {
+                        g.append_sidebar_entries(depth, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Repair `order` lists after load or structural edits (preserves relative order).
+    pub fn sync_orders(&mut self) {
+        sync_order_list(&mut self.order, &self.profiles, &self.groups);
+        for g in &mut self.groups {
+            g.sync_orders_recursive();
+        }
+    }
+
+    /// Whether a profile can move up / down among its ordered siblings (profiles + groups).
+    pub fn profile_can_move(&self, id: Uuid) -> (bool, bool) {
+        self.order_key_can_move(OrderKey::Profile(id))
+    }
+
+    /// Swap a profile with the previous/next sibling in the unified order.
+    pub fn move_profile_by(&mut self, id: Uuid, delta: isize) -> bool {
+        self.move_order_key(OrderKey::Profile(id), delta)
+    }
+
+    /// Whether a group can move up / down among its ordered siblings.
+    pub fn group_can_move(&self, id: Uuid) -> (bool, bool) {
+        self.order_key_can_move(OrderKey::Group(id))
+    }
+
+    /// Swap a group with the previous/next sibling in the unified order.
+    pub fn move_group_by(&mut self, id: Uuid, delta: isize) -> bool {
+        self.move_order_key(OrderKey::Group(id), delta)
+    }
+
+    fn order_key_can_move(&self, key: OrderKey) -> (bool, bool) {
+        if let Some(i) = self.order.iter().position(|k| *k == key) {
+            return (i > 0, i + 1 < self.order.len());
+        }
+        for g in &self.groups {
+            if let Some(bounds) = g.order_key_can_move(key) {
+                return bounds;
+            }
+        }
+        (false, false)
+    }
+
+    fn move_order_key(&mut self, key: OrderKey, delta: isize) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        if move_key_in_order(&mut self.order, key, delta) {
+            return true;
+        }
+        for g in &mut self.groups {
+            if g.move_order_key_recursive(key, delta) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove `key` from every order list.
+    pub fn remove_order_key(&mut self, key: OrderKey) {
+        self.order.retain(|k| *k != key);
+        for g in &mut self.groups {
+            g.remove_order_key_recursive(key);
+        }
+    }
+
+    /// Place `key` immediately before `before` in the order list that contains `before`.
+    /// If `before` is missing, appends to root order.
+    pub fn insert_order_key_before(&mut self, key: OrderKey, before: OrderKey) {
+        self.remove_order_key(key);
+        if insert_before_in_order(&mut self.order, key, before) {
+            return;
+        }
+        for g in &mut self.groups {
+            if g.insert_order_key_before_recursive(key, before) {
+                return;
+            }
+        }
+        self.order.push(key);
+    }
+
+    /// Place `key` immediately after `after` in the order list that contains `after`.
+    pub fn insert_order_key_after(&mut self, key: OrderKey, after: OrderKey) {
+        self.remove_order_key(key);
+        if insert_after_in_order(&mut self.order, key, after) {
+            return;
+        }
+        for g in &mut self.groups {
+            if g.insert_order_key_after_recursive(key, after) {
+                return;
+            }
+        }
+        self.order.push(key);
+    }
+}
+
+fn sync_order_list(order: &mut Vec<OrderKey>, profiles: &[Profile], groups: &[Group]) {
+    order.retain(|k| match k {
+        OrderKey::Profile(id) => profiles.iter().any(|p| p.id == *id),
+        OrderKey::Group(id) => groups.iter().any(|g| g.id == *id),
+    });
+    for p in profiles {
+        let key = OrderKey::Profile(p.id);
+        if !order.iter().any(|k| *k == key) {
+            order.push(key);
+        }
+    }
+    for g in groups {
+        let key = OrderKey::Group(g.id);
+        if !order.iter().any(|k| *k == key) {
+            order.push(key);
+        }
+    }
+}
+
+fn move_key_in_order(order: &mut [OrderKey], key: OrderKey, delta: isize) -> bool {
+    let Some(i) = order.iter().position(|k| *k == key) else {
+        return false;
+    };
+    let j = i as isize + delta;
+    if j < 0 || j as usize >= order.len() {
+        return false;
+    }
+    order.swap(i, j as usize);
+    true
+}
+
+fn insert_before_in_order(order: &mut Vec<OrderKey>, key: OrderKey, before: OrderKey) -> bool {
+    let Some(pos) = order.iter().position(|k| *k == before) else {
+        return false;
+    };
+    order.insert(pos, key);
+    true
+}
+
+fn insert_after_in_order(order: &mut Vec<OrderKey>, key: OrderKey, after: OrderKey) -> bool {
+    let Some(pos) = order.iter().position(|k| *k == after) else {
+        return false;
+    };
+    order.insert(pos + 1, key);
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +373,9 @@ pub struct Group {
     /// Nested groups (subdirectories).
     #[serde(default)]
     pub children: Vec<Group>,
+    /// Display / move order of this folder's profiles and child groups.
+    #[serde(default)]
+    pub order: Vec<OrderKey>,
 }
 
 /// One row in the profiles sidebar tree.
@@ -228,6 +403,7 @@ impl Group {
             collapsed: false,
             profiles: Vec::new(),
             children: Vec::new(),
+            order: Vec::new(),
         }
     }
 
@@ -241,16 +417,24 @@ impl Group {
         if self.collapsed {
             return;
         }
-        for p in &self.profiles {
-            out.push(SidebarEntry::Profile {
-                id: p.id,
-                name: p.name.clone(),
-                depth: depth + 1,
-                is_local: p.kind.is_local(),
-            });
-        }
-        for c in &self.children {
-            c.append_sidebar_entries(depth + 1, out);
+        for key in &self.order {
+            match key {
+                OrderKey::Profile(id) => {
+                    if let Some(p) = self.profiles.iter().find(|p| p.id == *id) {
+                        out.push(SidebarEntry::Profile {
+                            id: p.id,
+                            name: p.name.clone(),
+                            depth: depth + 1,
+                            is_local: p.kind.is_local(),
+                        });
+                    }
+                }
+                OrderKey::Group(id) => {
+                    if let Some(c) = self.children.iter().find(|c| c.id == *id) {
+                        c.append_sidebar_entries(depth + 1, out);
+                    }
+                }
+            }
         }
     }
 
@@ -360,6 +544,68 @@ impl Group {
                 c.walk(depth + 1, out, include_collapsed);
             }
         }
+    }
+
+    fn sync_orders_recursive(&mut self) {
+        sync_order_list(&mut self.order, &self.profiles, &self.children);
+        for c in &mut self.children {
+            c.sync_orders_recursive();
+        }
+    }
+
+    fn order_key_can_move(&self, key: OrderKey) -> Option<(bool, bool)> {
+        if let Some(i) = self.order.iter().position(|k| *k == key) {
+            return Some((i > 0, i + 1 < self.order.len()));
+        }
+        for c in &self.children {
+            if let Some(bounds) = c.order_key_can_move(key) {
+                return Some(bounds);
+            }
+        }
+        None
+    }
+
+    fn move_order_key_recursive(&mut self, key: OrderKey, delta: isize) -> bool {
+        if move_key_in_order(&mut self.order, key, delta) {
+            return true;
+        }
+        for c in &mut self.children {
+            if c.move_order_key_recursive(key, delta) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn remove_order_key_recursive(&mut self, key: OrderKey) {
+        self.order.retain(|k| *k != key);
+        for c in &mut self.children {
+            c.remove_order_key_recursive(key);
+        }
+    }
+
+    fn insert_order_key_before_recursive(&mut self, key: OrderKey, before: OrderKey) -> bool {
+        if insert_before_in_order(&mut self.order, key, before) {
+            return true;
+        }
+        for c in &mut self.children {
+            if c.insert_order_key_before_recursive(key, before) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn insert_order_key_after_recursive(&mut self, key: OrderKey, after: OrderKey) -> bool {
+        if insert_after_in_order(&mut self.order, key, after) {
+            return true;
+        }
+        for c in &mut self.children {
+            if c.insert_order_key_after_recursive(key, after) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -479,18 +725,39 @@ mod tests {
             version: 2,
             profiles: Vec::new(),
             groups: Vec::new(),
+            order: Vec::new(),
         };
         let mut child = Group::new("child");
         let p = Profile::new_local("inner");
         let pid = p.id;
         child.profiles.push(p);
+        child.order.push(OrderKey::Profile(pid));
         let mut parent = Group::new("parent");
         let child_id = child.id;
         parent.children.push(child);
+        parent.order.push(OrderKey::Group(child_id));
         ws.groups.push(parent);
+        ws.order.push(OrderKey::Group(ws.groups[0].id));
 
         assert_eq!(ws.group_id_for_profile(pid), Some(child_id));
         assert!(ws.find_profile(pid).is_some());
         assert!(ws.find_group(child_id).is_some());
+    }
+
+    #[test]
+    fn root_profile_can_move_past_group() {
+        let mut ws = WorkspaceFile::default_workspace();
+        let pid = ws.profiles[0].id;
+        let g = Group::new("G");
+        let gid = g.id;
+        ws.groups.push(g);
+        ws.sync_orders();
+        // order: profile, group
+        assert_eq!(ws.order.len(), 2);
+        assert!(ws.move_profile_by(pid, 1));
+        assert_eq!(ws.order, vec![OrderKey::Group(gid), OrderKey::Profile(pid)]);
+        let entries = ws.sidebar_entries();
+        assert!(matches!(entries[0], SidebarEntry::Group { id, .. } if id == gid));
+        assert!(matches!(entries[1], SidebarEntry::Profile { id, .. } if id == pid));
     }
 }

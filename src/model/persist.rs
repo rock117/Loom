@@ -30,7 +30,10 @@ fn write_json<T: serde::Serialize>(path: &PathBuf, value: &T) -> Result<()> {
 pub fn load_workspace() -> WorkspaceFile {
     let path = paths::workspace_path();
     match read_json::<WorkspaceFile>(&path) {
-        Ok(Some(ws)) if !ws.groups.is_empty() || !ws.profiles.is_empty() => ws,
+        Ok(Some(mut ws)) if !ws.groups.is_empty() || !ws.profiles.is_empty() => {
+            ws.sync_orders();
+            ws
+        }
         Ok(Some(_)) | Ok(None) => WorkspaceFile::default_workspace(),
         Err(err) => {
             eprintln!("loom: workspace load failed ({err}); using defaults");
@@ -87,10 +90,11 @@ pub fn export_workspace_to(path: &PathBuf, ws: &WorkspaceFile) -> Result<()> {
 pub fn import_workspace_from(path: &PathBuf) -> Result<WorkspaceFile> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    let ws: WorkspaceFile = serde_json::from_str(&raw)
+    let mut ws: WorkspaceFile = serde_json::from_str(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     if ws.groups.is_empty() && ws.profiles.is_empty() {
         anyhow::bail!("imported workspace is empty");
     }
+    ws.sync_orders();
     Ok(ws)
 }

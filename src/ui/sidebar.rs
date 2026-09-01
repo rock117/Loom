@@ -161,6 +161,74 @@ impl Sidebar {
         }
     }
 
+    /// ↑↓ shown only while the row group is hovered.
+    fn reorder_buttons(
+        &self,
+        row_group: SharedString,
+        id_prefix: String,
+        can_up: bool,
+        can_down: bool,
+        cx: &mut Context<Self>,
+        on_up: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        on_down: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let up_id = SharedString::from(format!("{id_prefix}-up"));
+        let down_id = SharedString::from(format!("{id_prefix}-down"));
+        div()
+            .flex()
+            .items_center()
+            .flex_shrink_0()
+            .gap(px(1.0))
+            .invisible()
+            .group_hover(row_group, |s| s.visible())
+            .child(
+                div()
+                    .id(up_id)
+                    .px(px(3.0))
+                    .py(px(1.0))
+                    .rounded(px(theme::RADIUS_SM))
+                    .text_xs()
+                    .when(can_up, |d| {
+                        d.text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.context_menu = None;
+                                    on_up(this, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                    })
+                    .when(!can_up, |d| d.text_color(theme::TEXT_DISABLED))
+                    .child("↑"),
+            )
+            .child(
+                div()
+                    .id(down_id)
+                    .px(px(3.0))
+                    .py(px(1.0))
+                    .rounded(px(theme::RADIUS_SM))
+                    .text_xs()
+                    .when(can_down, |d| {
+                        d.text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.context_menu = None;
+                                    on_down(this, cx);
+                                    cx.stop_propagation();
+                                }),
+                            )
+                    })
+                    .when(!can_down, |d| d.text_color(theme::TEXT_DISABLED))
+                    .child("↓"),
+            )
+    }
+
     fn menu_item(
         &self,
         id: impl Into<ElementId>,
@@ -400,16 +468,38 @@ impl Focusable for Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let store = self.store.read(cx);
-        let renaming = store.rename.clone();
-        let selection = store.selection;
-        let entries = store.workspace.sidebar_entries();
-        let other_groups: Vec<(Uuid, String)> = store
-            .workspace
-            .walk_groups_all()
-            .into_iter()
-            .map(|(id, name, _, _)| (id, name))
-            .collect();
+        let (renaming, selection, entries, other_groups, profile_can, group_can) = {
+            let store = self.store.read(cx);
+            let renaming = store.rename.clone();
+            let selection = store.selection;
+            let entries = store.workspace.sidebar_entries();
+            let other_groups: Vec<(Uuid, String)> = store
+                .workspace
+                .walk_groups_all()
+                .into_iter()
+                .map(|(id, name, _, _)| (id, name))
+                .collect();
+            let mut profile_can = std::collections::HashMap::new();
+            let mut group_can = std::collections::HashMap::new();
+            for entry in &entries {
+                match entry {
+                    crate::model::SidebarEntry::Profile { id, .. } => {
+                        profile_can.insert(*id, store.workspace.profile_can_move(*id));
+                    }
+                    crate::model::SidebarEntry::Group { id, .. } => {
+                        group_can.insert(*id, store.workspace.group_can_move(*id));
+                    }
+                }
+            }
+            (
+                renaming,
+                selection,
+                entries,
+                other_groups,
+                profile_can,
+                group_can,
+            )
+        };
         let context_menu = self
             .context_menu
             .as_ref()
@@ -519,6 +609,11 @@ impl Render for Sidebar {
                                 collapsed,
                             } => {
                                 let selected_group = selection == Selection::Group(gid);
+                                let renaming_this = renaming.is_some() && selected_group;
+                                let (can_up, can_down) =
+                                    group_can.get(&gid).copied().unwrap_or((false, false));
+                                let row_group: SharedString =
+                                    SharedString::from(format!("sb-g-{gid}"));
                                 let folder_icon = if collapsed {
                                     "icons/ui/folder.svg"
                                 } else {
@@ -532,6 +627,7 @@ impl Render for Sidebar {
                                 let indent = theme::SPACE_1 + depth as f32 * 12.0;
                                 div()
                                     .id(SharedString::from(format!("group-{gid}")))
+                                    .group(row_group.clone())
                                     .flex()
                                     .items_center()
                                     .gap(px(theme::SPACE_1))
@@ -564,6 +660,25 @@ impl Render for Sidebar {
                                                 .child(gname.clone())
                                                 .into_any_element()
                                         }
+                                    })
+                                    .when(!renaming_this, |d| {
+                                        d.child(self.reorder_buttons(
+                                            row_group,
+                                            format!("g-{gid}"),
+                                            can_up,
+                                            can_down,
+                                            cx,
+                                            move |this, cx| {
+                                                this.store.update(cx, |s, cx| {
+                                                    s.move_group_up(gid, cx);
+                                                });
+                                            },
+                                            move |this, cx| {
+                                                this.store.update(cx, |s, cx| {
+                                                    s.move_group_down(gid, cx);
+                                                });
+                                            },
+                                        ))
                                     })
                                     .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
                                         this.context_menu = None;
@@ -635,6 +750,11 @@ impl Render for Sidebar {
                                 is_local,
                             } => {
                                 let selected = selection == Selection::Profile(pid);
+                                let renaming_this = renaming.is_some() && selected;
+                                let (can_up, can_down) =
+                                    profile_can.get(&pid).copied().unwrap_or((false, false));
+                                let row_group: SharedString =
+                                    SharedString::from(format!("sb-p-{pid}"));
                                 let (icon_path, icon_color) = if is_local {
                                     ("icons/ui/terminal.svg", theme::ICON_LOCAL)
                                 } else {
@@ -658,6 +778,7 @@ impl Render for Sidebar {
                                     };
                                 div()
                                     .id(SharedString::from(format!("profile-{pid}")))
+                                    .group(row_group.clone())
                                     .flex()
                                     .items_center()
                                     .gap(px(theme::SPACE_1))
@@ -673,6 +794,25 @@ impl Render for Sidebar {
                                     .cursor_pointer()
                                     .child(Self::svg_icon(icon_path, ICON_TREE, icon_color))
                                     .child(name_el)
+                                    .when(!renaming_this, |d| {
+                                        d.child(self.reorder_buttons(
+                                            row_group,
+                                            format!("p-{pid}"),
+                                            can_up,
+                                            can_down,
+                                            cx,
+                                            move |this, cx| {
+                                                this.store.update(cx, |s, cx| {
+                                                    s.move_profile_up(pid, cx);
+                                                });
+                                            },
+                                            move |this, cx| {
+                                                this.store.update(cx, |s, cx| {
+                                                    s.move_profile_down(pid, cx);
+                                                });
+                                            },
+                                        ))
+                                    })
                                     .on_click(cx.listener(
                                         move |this, event: &ClickEvent, window, cx| {
                                             this.context_menu = None;
@@ -747,7 +887,7 @@ impl Render for Sidebar {
                     .border_color(theme::BORDER_SUBTLE)
                     .text_xs()
                     .text_color(theme::TEXT_DISABLED)
-                    .child("↵ open · drag to move · F2 · Del · right-click"),
+                    .child("↵ open · hover ↑↓ · drag · F2 · Del · right-click"),
             )
             // Context menu — anchored to right-click point (window coords)
             .when_some(context_menu, |this, (target, position)| {
