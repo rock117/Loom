@@ -237,6 +237,26 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-09-02 — PTY stdout：合并处理 + 单次 notify（不丢字节）
+
+**Status:** accepted  
+
+**Context:** 高吞吐输出时 UI 对每个 ≤4KB chunk 各 `process_bytes` + `cx.notify()` 一次，重绘跟不上，窗口假死。审查见稳定性分析；规格：[PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md)。
+
+**Options:**
+- A — 保持每 chunk 一次 notify（现状）  
+- B — drain 已到块、拼序喂入、单次 notify；通道仍 unbounded  
+- C — 有界队列 + 丢弃溢出（拒绝：花屏）  
+- D — 解析挪出 UI 线程（拒绝：事件回写顺序风险大）  
+
+**Decision:** **B**。读线程与 `unbounded` 不变；reader 任务合并已到达字节后一次解析、一次 notify。
+
+**Why:** 削减洪水下的重绘次数，且 **不丢 PTY 字节**；改动面限于 reader 循环，副作用小。
+
+**Consequences / follow-ups:** 洪水时画面可能更「跳」、单次 update 更长但总工作更少。有界背压、Find 防抖另议，不在本决策内。
+
+---
+
 ## How to use this file in review
 
 1. Before changing terminal stack, UI toolkit, or license boundary, read matching sections here.  

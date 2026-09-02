@@ -15,10 +15,12 @@
 //!
 //! 1. A background thread reads bytes from the PTY stdout in 4KB chunks
 //! 2. Bytes are sent through a [flume](https://docs.rs/flume) channel to an async task
-//! 3. The async task processes bytes through the VTE parser and calls `cx.notify()`
+//! 3. The async task drains any already-queued chunks, feeds them to the VTE parser in
+//!    order, then calls `cx.notify()` **once** (coalesce — see `docs/PTY_OUTPUT_COALESCE.md`)
 //! 4. GPUI repaints the terminal with the updated grid
 //!
 //! This approach ensures the terminal only wakes when data arrives, avoiding polling.
+//! Bytes are never dropped; only redundant repaints are coalesced under flood.
 //!
 //! # Thread Safety
 //!
@@ -575,16 +577,20 @@ impl TerminalView {
             Self::read_stdout_blocking(stdout_reader, bytes_tx);
         });
 
-        // Spawn async task that awaits on the channel and notifies the view
-        // This is push-based: the task blocks until bytes arrive, then immediately notifies
+        // Spawn async task that awaits on the channel and notifies the view.
+        // Push-based: sleep until data arrives. Under flood, drain all already-queued
+        // chunks into one buffer, process once, notify once — never drop bytes
+        // (docs/PTY_OUTPUT_COALESCE.md).
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                // Wait for bytes from the background reader (blocks until data arrives)
                 match bytes_rx.recv_async().await {
-                    Ok(bytes) => {
-                        // Process bytes and notify the view
+                    Ok(first) => {
+                        let mut batch = first;
+                        while let Ok(more) = bytes_rx.try_recv() {
+                            batch.extend_from_slice(&more);
+                        }
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                            view.state.process_bytes(&bytes);
+                            view.state.process_bytes(&batch);
                             if let Some(cwd) = view.state.take_cwd_update() {
                                 view.working_directory = Some(cwd.clone());
                                 cx.emit(TerminalViewEvent::WorkingDirectoryChanged(cwd));

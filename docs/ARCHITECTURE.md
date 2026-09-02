@@ -14,6 +14,7 @@ For **主题系统（可切换 Theme / CSD / 终端 palette）**（中文规格�
 For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草案，尚未实现）, see [LOOM_CLI.md](./LOOM_CLI.md).  
 For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
 For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
+For **PTY 高吞吐输出合并 notify**（已实现，不丢字节）, see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md).  
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
 For **Session / Profile / Group IA（根级 Profile、嵌套 Group、临时 Tab）**, see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md).  
 For **持久化事件（AppBus / Persistence / WillQuit）**, see [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md).  

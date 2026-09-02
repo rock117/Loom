@@ -46,6 +46,7 @@ GPUI runs layout → prepaint → paint and input dispatch on the **window / UI 
 | SSH `connect_blocking` (or any russh handshake) on the UI thread | Network RTT freezes UI | Keep pattern in `tab_manager`: worker thread + `flume` + `cx.spawn` await |
 | `persist_now()` / large JSON write on every keystroke on UI thread | Stutter under load | Debounce; or write on a background task (follow-up if it becomes hot) |
 | PTY spawn + waiting for first output synchronously in open handler | Shell startup blocks open | Spawn async; show tab in Connecting; attach terminal when ready |
+| Per-chunk `cx.notify()` on PTY flood (`yes` / huge `cat`) | UI drown in updates; soft freeze | Drain pending chunks, one `process_bytes` + one notify — see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md). **Never drop bytes** |
 | Lock order inversion (e.g. store lock then term lock vs reverse) | Cross-thread or same-thread deadlock | Document order: prefer **no nested locks**; if needed, fixed global order |
 
 **Loom rules of thumb:**
