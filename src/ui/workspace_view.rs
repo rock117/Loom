@@ -69,8 +69,11 @@ impl WorkspaceView {
             .collect();
 
         let show_line_numbers = store.read(cx).settings.show_line_numbers;
+        let ansi_palette = store.read(cx).settings.ansi_palette;
         let app_bus = cx.new(|_| AppBus);
-        let tabs = cx.new(|_cx| TabManager::new(font_size, show_line_numbers, app_bus.clone()));
+        let tabs = cx.new(|_cx| {
+            TabManager::new(font_size, show_line_numbers, ansi_palette, app_bus.clone())
+        });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), store.clone(), cx));
         let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
@@ -298,6 +301,10 @@ impl WorkspaceView {
                 SettingsEvent::LineNumbersChanged(enabled) => {
                     this.tabs
                         .update(cx, |m, cx| m.set_show_line_numbers(*enabled, cx));
+                }
+                SettingsEvent::AnsiPaletteChanged(palette) => {
+                    this.tabs
+                        .update(cx, |m, cx| m.set_ansi_palette(*palette, cx));
                 }
             },
         ));

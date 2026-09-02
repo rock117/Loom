@@ -3,6 +3,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::model::AnsiPalette;
 use crate::session::local_proxy::{self, LocalProxyMode};
 use crate::shared::theme;
 use crate::ui::workspace_store::WorkspaceStore;
@@ -14,6 +15,7 @@ pub enum SettingsEvent {
     Import,
     FontSizeChanged(f32),
     LineNumbersChanged(bool),
+    AnsiPaletteChanged(AnsiPalette),
 }
 
 pub struct SettingsPanel {
@@ -147,6 +149,7 @@ impl Render for SettingsPanel {
         let font_family = settings.font_family.clone();
         let font_size = settings.font_size;
         let show_line_numbers = settings.show_line_numbers;
+        let ansi_palette = settings.ansi_palette;
         let proxy_mode = settings.local_proxy_mode;
         let proxy_url = settings.local_proxy_url.clone().unwrap_or_default();
         let no_proxy = settings.local_proxy_no_proxy.clone().unwrap_or_default();
@@ -642,6 +645,80 @@ impl Render for SettingsPanel {
                                                 });
                                                 cx.emit(SettingsEvent::LineNumbersChanged(enabled));
                                                 cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(theme::TEXT)
+                                                    .child("ANSI colors"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_MUTED)
+                                                    .child(
+                                                        "How ANSI colors are drawn. Does not change the remote shell.",
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(AnsiPalette::ALL.into_iter().map(|preset| {
+                                                let selected = ansi_palette == preset;
+                                                let label = preset.as_str().to_string();
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "ansi-palette-{label}"
+                                                    )))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded(px(theme::RADIUS_SM))
+                                                    .bg(if selected {
+                                                        theme::SELECTION
+                                                    } else {
+                                                        theme::BG
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if selected {
+                                                        theme::ACCENT
+                                                    } else {
+                                                        theme::BORDER
+                                                    })
+                                                    .text_xs()
+                                                    .text_color(if selected {
+                                                        theme::TEXT
+                                                    } else {
+                                                        theme::TEXT_MUTED
+                                                    })
+                                                    .cursor_pointer()
+                                                    .child(label)
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.store.update(cx, |s, cx| {
+                                                            s.settings.ansi_palette = preset;
+                                                            s.mark_dirty();
+                                                            s.persist_now();
+                                                            cx.notify();
+                                                        });
+                                                        cx.emit(SettingsEvent::AnsiPaletteChanged(
+                                                            preset,
+                                                        ));
+                                                        cx.notify();
+                                                    }))
                                             })),
                                     ),
                             ),

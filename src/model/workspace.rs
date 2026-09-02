@@ -677,6 +677,9 @@ pub struct SettingsFile {
     /// Left gutter with absolute scrollback line numbers (1 = oldest in buffer).
     #[serde(default = "default_show_line_numbers")]
     pub show_line_numbers: bool,
+    /// Client-side ANSI 16-color preset (does not change remote shell).
+    #[serde(default)]
+    pub ansi_palette: AnsiPalette,
     /// Off / Auto (env + OS) / Manual URL — Local shells only.
     #[serde(default)]
     pub local_proxy_mode: LocalProxyMode,
@@ -692,6 +695,34 @@ fn default_show_line_numbers() -> bool {
     true
 }
 
+/// How the terminal maps ANSI color indices to screen colors.
+///
+/// See `docs/TERMINAL_ANSI_PALETTE.md`. Default matches historical Loom colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnsiPalette {
+    #[default]
+    Default,
+    Readable,
+    HighContrast,
+}
+
+impl AnsiPalette {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::Readable => "Readable",
+            Self::HighContrast => "High contrast",
+        }
+    }
+
+    pub const ALL: [AnsiPalette; 3] = [
+        AnsiPalette::Default,
+        AnsiPalette::Readable,
+        AnsiPalette::HighContrast,
+    ];
+}
+
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
@@ -700,6 +731,7 @@ impl Default for SettingsFile {
             font_family: crate::platform::monospace_font_family().into(),
             font_size: 14.0,
             show_line_numbers: true,
+            ansi_palette: AnsiPalette::Default,
             local_proxy_mode: LocalProxyMode::Off,
             local_proxy_url: None,
             local_proxy_no_proxy: None,

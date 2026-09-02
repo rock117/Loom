@@ -7,7 +7,7 @@ use gpui::*;
 use portable_pty::ChildKiller;
 use uuid::Uuid;
 
-use crate::model::{ConnectionState, Profile, ProfileKind, SshAuth};
+use crate::model::{AnsiPalette, ConnectionState, Profile, ProfileKind, SshAuth};
 use crate::platform;
 use crate::session::credentials;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
@@ -68,6 +68,7 @@ pub struct TabManager {
     pub active: Option<Uuid>,
     pub font_size: f32,
     pub show_line_numbers: bool,
+    pub ansi_palette: AnsiPalette,
     app_bus: Entity<AppBus>,
 }
 
@@ -75,6 +76,7 @@ impl TabManager {
     pub fn new(
         font_size: f32,
         show_line_numbers: bool,
+        ansi_palette: AnsiPalette,
         app_bus: Entity<AppBus>,
     ) -> Self {
         Self {
@@ -82,6 +84,7 @@ impl TabManager {
             active: None,
             font_size,
             show_line_numbers,
+            ansi_palette,
             app_bus,
         }
     }
@@ -284,6 +287,7 @@ impl TabManager {
         };
         let font_size = self.font_size;
         let show_line_numbers = self.show_line_numbers;
+        let ansi_palette = self.ansi_palette;
         let label = format!("{user}@{host}:{port}");
 
         let (tx, rx) = flume::bounded(1);
@@ -305,7 +309,7 @@ impl TabManager {
                 };
                 match result {
                     Ok(Ok(handles)) => {
-                        let config = terminal_config(font_size, &family, show_line_numbers);
+                        let config = terminal_config(font_size, &family, show_line_numbers, ansi_palette);
                         let resize = handles.resize.clone();
                         let terminal = cx.new(|cx| {
                             TerminalView::new(handles.writer, handles.reader, config, cx)
@@ -377,7 +381,12 @@ impl TabManager {
         } else {
             font_family
         };
-        let config = terminal_config(self.font_size, family, self.show_line_numbers);
+        let config = terminal_config(
+            self.font_size,
+            family,
+            self.show_line_numbers,
+            self.ansi_palette,
+        );
         let working_dir = spawn_cwd
             .map(std::path::Path::to_path_buf)
             .or_else(|| LocalPty::default_cwd());
@@ -1088,6 +1097,22 @@ impl TabManager {
         cx.notify();
     }
 
+    pub fn set_ansi_palette(&mut self, palette: AnsiPalette, cx: &mut Context<Self>) {
+        self.ansi_palette = palette;
+        for tab in &self.tabs {
+            for pane in tab.panes.values() {
+                if let Some(term) = &pane.terminal {
+                    term.update(cx, |terminal, cx| {
+                        let mut config = terminal.config().clone();
+                        config.colors = ansi_color_palette(palette);
+                        terminal.update_config(config, cx);
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Bound Local panes → (profile_id, live cwd) for persistence.
     pub fn bound_local_cwds(&self, cx: &mut Context<Self>) -> Vec<(Uuid, std::path::PathBuf)> {
         let mut out = Vec::new();
@@ -1412,29 +1437,12 @@ fn resolve_ssh_auth(
     }
 }
 
-fn terminal_config(font_size: f32, font_family: &str, show_line_numbers: bool) -> TerminalConfig {
-    let colors = ColorPalette::builder()
-        .background(0x1A, 0x1A, 0x1C)
-        .foreground(0xE8, 0xE6, 0xE3)
-        .cursor(0xE8, 0xE6, 0xE3)
-        .black(0x0C, 0x0C, 0x0C)
-        .red(0xC5, 0x0F, 0x1F)
-        .green(0x13, 0xA1, 0x0E)
-        .yellow(0xC1, 0x9C, 0x00)
-        .blue(0x00, 0x37, 0xDA)
-        .magenta(0x88, 0x17, 0x98)
-        .cyan(0x3A, 0x96, 0xDD)
-        .white(0xCC, 0xCC, 0xCC)
-        .bright_black(0x76, 0x76, 0x76)
-        .bright_red(0xE7, 0x48, 0x56)
-        .bright_green(0x16, 0xC6, 0x0C)
-        .bright_yellow(0xF9, 0xF1, 0xA5)
-        .bright_blue(0x3B, 0x78, 0xFF)
-        .bright_magenta(0xB4, 0x00, 0x9E)
-        .bright_cyan(0x61, 0xD6, 0xD6)
-        .bright_white(0xF2, 0xF2, 0xF2)
-        .build();
-
+fn terminal_config(
+    font_size: f32,
+    font_family: &str,
+    show_line_numbers: bool,
+    ansi_palette: AnsiPalette,
+) -> TerminalConfig {
     TerminalConfig {
         font_family: font_family.into(),
         font_size: px(font_size),
@@ -1444,7 +1452,77 @@ fn terminal_config(font_size: f32, font_family: &str, show_line_numbers: bool) -
         line_height_multiplier: 1.2,
         padding: Edges::all(px(theme::SPACE_2)),
         show_line_numbers,
-        colors,
+        colors: ansi_color_palette(ansi_palette),
+    }
+}
+
+/// Historical Loom / Windows Console–like 16 colors (`AnsiPalette::Default`).
+fn ansi_color_palette(palette: AnsiPalette) -> ColorPalette {
+    match palette {
+        AnsiPalette::Default => ColorPalette::builder()
+            .background(0x1A, 0x1A, 0x1C)
+            .foreground(0xE8, 0xE6, 0xE3)
+            .cursor(0xE8, 0xE6, 0xE3)
+            .black(0x0C, 0x0C, 0x0C)
+            .red(0xC5, 0x0F, 0x1F)
+            .green(0x13, 0xA1, 0x0E)
+            .yellow(0xC1, 0x9C, 0x00)
+            .blue(0x00, 0x37, 0xDA)
+            .magenta(0x88, 0x17, 0x98)
+            .cyan(0x3A, 0x96, 0xDD)
+            .white(0xCC, 0xCC, 0xCC)
+            .bright_black(0x76, 0x76, 0x76)
+            .bright_red(0xE7, 0x48, 0x56)
+            .bright_green(0x16, 0xC6, 0x0C)
+            .bright_yellow(0xF9, 0xF1, 0xA5)
+            .bright_blue(0x3B, 0x78, 0xFF)
+            .bright_magenta(0xB4, 0x00, 0x9E)
+            .bright_cyan(0x61, 0xD6, 0xD6)
+            .bright_white(0xF2, 0xF2, 0xF2)
+            .build(),
+        // Brighter blues/cyans for dark-bg `ls` directories (remote LS_COLORS).
+        AnsiPalette::Readable => ColorPalette::builder()
+            .background(0x1A, 0x1A, 0x1C)
+            .foreground(0xE8, 0xE6, 0xE3)
+            .cursor(0xE8, 0xE6, 0xE3)
+            .black(0x0C, 0x0C, 0x0C)
+            .red(0xC5, 0x0F, 0x1F)
+            .green(0x13, 0xA1, 0x0E)
+            .yellow(0xC1, 0x9C, 0x00)
+            .blue(0x5C, 0xA8, 0xFF)
+            .magenta(0x88, 0x17, 0x98)
+            .cyan(0x5E, 0xC8, 0xE8)
+            .white(0xCC, 0xCC, 0xCC)
+            .bright_black(0x76, 0x76, 0x76)
+            .bright_red(0xE7, 0x48, 0x56)
+            .bright_green(0x16, 0xC6, 0x0C)
+            .bright_yellow(0xF9, 0xF1, 0xA5)
+            .bright_blue(0x82, 0xC0, 0xFF)
+            .bright_magenta(0xB4, 0x00, 0x9E)
+            .bright_cyan(0x7E, 0xE7, 0xE7)
+            .bright_white(0xF2, 0xF2, 0xF2)
+            .build(),
+        AnsiPalette::HighContrast => ColorPalette::builder()
+            .background(0x1A, 0x1A, 0x1C)
+            .foreground(0xFF, 0xFF, 0xFF)
+            .cursor(0xFF, 0xFF, 0xFF)
+            .black(0x00, 0x00, 0x00)
+            .red(0xFF, 0x55, 0x55)
+            .green(0x55, 0xFF, 0x55)
+            .yellow(0xFF, 0xFF, 0x55)
+            .blue(0x77, 0xB4, 0xFF)
+            .magenta(0xFF, 0x55, 0xFF)
+            .cyan(0x55, 0xFF, 0xFF)
+            .white(0xEE, 0xEE, 0xEE)
+            .bright_black(0x99, 0x99, 0x99)
+            .bright_red(0xFF, 0x88, 0x88)
+            .bright_green(0x88, 0xFF, 0x88)
+            .bright_yellow(0xFF, 0xFF, 0xAA)
+            .bright_blue(0xAA, 0xD4, 0xFF)
+            .bright_magenta(0xFF, 0x88, 0xFF)
+            .bright_cyan(0x88, 0xFF, 0xFF)
+            .bright_white(0xFF, 0xFF, 0xFF)
+            .build(),
     }
 }
 

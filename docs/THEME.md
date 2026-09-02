@@ -16,7 +16,7 @@
 | `src/shared/theme.rs` 全是 `pub const` 色值 / 间距 | 无法热切换；换主题必须改代码重编译 |
 | UI 各处直接 `theme::PANEL_BG` 等 | 迁移成本在「调用点」，不在配色本身 |
 | 终端 `ColorPalette` 与 UI 主题无关 | 换 UI 主题后终端仍可能「另一套风格」 |
-| Settings 仅有 font / line numbers | 尚无 `theme` 字段 |
+| Settings 仅有 font / line numbers | 尚无 `theme` 字段；ANSI 预设见独立规格 [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md)（可先于完整 Theme 落地） |
 | 窗口 `appears_transparent: false`（原生标题栏） | 系统标题栏颜色不受应用主题控制，易与底栏/内容割裂 |
 
 业界（VS Code / Zed / Windows Terminal）普遍做法：

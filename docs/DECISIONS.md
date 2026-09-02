@@ -257,6 +257,25 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-09-03 — 终端 ANSI 配色：Settings 预设（客户端，默认不变）
+
+**Status:** accepted（已实现）  
+
+**Context:** SSH/Linux 上 `ls` 等 ANSI 蓝在黑底难读；用户无权限或不便改远端 `LS_COLORS`。完整 Theme（A1）尚未落地。
+
+**Options:**
+- A — 改服务器 / 注入 startup（拒绝：要碰远端或未有 Profile env）  
+- B — Settings 全局 ANSI 预设（Default / Readable / …），默认 Default = 现状  
+- C — 等完整 Theme 再做（可等，但对比度问题可先用小开关）  
+
+**Decision:** **B**。默认 **`default`（不做任何设置则零观感变化）**；Readable 调亮蓝；High contrast 整体抬对比。不写远端。详见 [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md)。Backlog **A3**。
+
+**Why:** 客户端映射即可；与 Local/SSH 共用 palette 一致；不阻塞也不取代 A1。
+
+**Consequences / follow-ups:** Theme 落地后可将预设迁入 terminal 包。
+
+---
+
 ## How to use this file in review
 
 1. Before changing terminal stack, UI toolkit, or license boundary, read matching sections here.  
