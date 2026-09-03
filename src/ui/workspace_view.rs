@@ -125,6 +125,22 @@ impl WorkspaceView {
         };
 
         view._subscriptions.push(cx.subscribe_in(
+            &app_bus,
+            window,
+            |this, _, event, window, cx| match event {
+                AppBusEvent::SplitPane { pane_id, direction } => {
+                    let pane_id = *pane_id;
+                    let direction = *direction;
+                    let store = this.store.clone();
+                    this.tabs.update(cx, |m, cx| {
+                        m.split_pane(pane_id, direction, &store, window, cx);
+                    });
+                }
+                _ => {}
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
             &sidebar,
             window,
             |this, _, event, window, cx| match event {

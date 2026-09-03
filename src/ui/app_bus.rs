@@ -3,6 +3,8 @@
 use gpui::*;
 use uuid::Uuid;
 
+use crate::ui::pane_layout::SplitDirection;
+
 /// Lifecycle / persistence facts emitted by [`AppBus`].
 #[derive(Clone, Debug)]
 pub enum AppBusEvent {
@@ -14,6 +16,11 @@ pub enum AppBusEvent {
     BoundLocalCwdChanged {
         profile_id: Uuid,
         path: std::path::PathBuf,
+    },
+    /// Split a terminal pane (from terminal context menu).
+    SplitPane {
+        pane_id: Uuid,
+        direction: SplitDirection,
     },
 }
 

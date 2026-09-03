@@ -13,7 +13,7 @@ use crate::session::credentials;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
-use crate::terminal::{ColorPalette, TerminalConfig, TerminalView, TerminalViewEvent};
+use crate::terminal::{ColorPalette, TerminalConfig, TerminalSplitDirection, TerminalView, TerminalViewEvent};
 use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::pane_layout::{PaneLayout, RemoveResult, SplitDirection};
 use crate::ui::workspace_store::WorkspaceStore;
@@ -438,14 +438,31 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(tab_id) = self.active else {
+        let Some(focused) = self.active_tab().map(|t| t.focused) else {
             return;
         };
-        let Some(tab_idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+        self.split_pane(focused, direction, store, window, cx);
+    }
+
+    pub fn split_pane(
+        &mut self,
+        pane_id: Uuid,
+        direction: SplitDirection,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_idx) = self
+            .tabs
+            .iter()
+            .position(|t| t.panes.contains_key(&pane_id))
+        else {
             return;
         };
-        let focused = self.tabs[tab_idx].focused;
-        let Some(source) = self.tabs[tab_idx].panes.get(&focused).map(|p| {
+        let tab_id = self.tabs[tab_idx].id;
+        self.active = Some(tab_id);
+        self.tabs[tab_idx].focused = pane_id;
+        let Some(source) = self.tabs[tab_idx].panes.get(&pane_id).map(|p| {
             (
                 p.kind.clone(),
                 p.label.clone(),
@@ -481,14 +498,14 @@ impl TabManager {
                         let new_id = pane.id;
                         let tab = &mut self.tabs[tab_idx];
                         tab.panes.insert(new_id, pane);
-                        if tab.layout.split(focused, direction, new_id) {
+                        if tab.layout.split(pane_id, direction, new_id) {
                             tab.focused = new_id;
                         }
                         cx.notify();
                     }
                     Err(err) => {
                         // Do not mark the source pane Failed — only report on status.
-                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                        if let Some(pane) = self.tabs[tab_idx].panes.get_mut(&pane_id) {
                             pane.status_message = format!("split failed: {err:#}");
                         }
                         cx.notify();
@@ -520,7 +537,7 @@ impl TabManager {
                         };
                         let tab = &mut self.tabs[tab_idx];
                         tab.panes.insert(new_id, pane);
-                        if tab.layout.split(focused, direction, new_id) {
+                        if tab.layout.split(pane_id, direction, new_id) {
                             tab.focused = new_id;
                         }
                         cx.notify();
@@ -534,13 +551,13 @@ impl TabManager {
                         );
                     }
                     Ok(None) => {
-                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                        if let Some(pane) = self.tabs[tab_idx].panes.get_mut(&pane_id) {
                             pane.status_message = "password required for split".into();
                         }
                         cx.notify();
                     }
                     Err(err) => {
-                        if let Some(pane) = self.tabs[tab_idx].focused_pane_mut() {
+                        if let Some(pane) = self.tabs[tab_idx].panes.get_mut(&pane_id) {
                             pane.status_message = format!("split failed: {err:#}");
                         }
                         cx.notify();
@@ -1349,6 +1366,17 @@ fn wire_terminal_session(
             TerminalViewEvent::CloseRequested => {
                 this.close_pane(pane_id, None, cx);
             }
+            TerminalViewEvent::SplitRequested(direction) => {
+                this.focus_pane_id(pane_id, cx);
+                AppBus::emit(
+                    &this.app_bus,
+                    AppBusEvent::SplitPane {
+                        pane_id,
+                        direction: split_direction_from_terminal(*direction),
+                    },
+                    cx,
+                );
+            }
             TerminalViewEvent::SessionEnded => {
                 this.on_pane_session_ended(pane_id, cx);
             }
@@ -1381,6 +1409,15 @@ fn wire_terminal_session(
         }
     });
     vec![sub]
+}
+
+fn split_direction_from_terminal(direction: TerminalSplitDirection) -> SplitDirection {
+    match direction {
+        TerminalSplitDirection::Left => SplitDirection::Left,
+        TerminalSplitDirection::Right => SplitDirection::Right,
+        TerminalSplitDirection::Up => SplitDirection::Up,
+        TerminalSplitDirection::Down => SplitDirection::Down,
+    }
 }
 
 fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {

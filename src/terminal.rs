@@ -6,4 +6,4 @@
 pub mod gpui_emu;
 pub mod session;
 
-pub use gpui_emu::{ColorPalette, TerminalConfig, TerminalView, TerminalViewEvent};
+pub use gpui_emu::{ColorPalette, TerminalConfig, TerminalSplitDirection, TerminalView, TerminalViewEvent};

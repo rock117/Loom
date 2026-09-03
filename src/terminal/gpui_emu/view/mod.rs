@@ -52,7 +52,7 @@
 mod context_menu;
 mod find;
 
-pub use context_menu::TerminalViewEvent;
+pub use context_menu::{TerminalSplitDirection, TerminalViewEvent};
 
 use super::colors::ColorPalette;
 use super::event::{GpuiEventProxy, TerminalEvent};

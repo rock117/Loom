@@ -10,12 +10,22 @@ use crate::shared::theme;
 
 use super::TerminalView;
 
+#[derive(Clone, Copy, Debug)]
+pub enum TerminalSplitDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Clone, Debug)]
 pub enum TerminalViewEvent {
     /// Focus the pane that owns this terminal (e.g. before a context action).
     FocusRequested,
     /// Close the pane that owns this terminal (or its tab when it is the last pane).
     CloseRequested,
+    /// Split this pane in the given direction (same session as source).
+    SplitRequested(TerminalSplitDirection),
     /// PTY / SSH channel ended — host should mark the pane failed and offer reconnect.
     SessionEnded,
     /// Shell reported a new working directory (OSC / hooks).
@@ -151,6 +161,31 @@ impl TerminalView {
             }))
     }
 
+    fn split_menu_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        direction: TerminalSplitDirection,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w_full()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
+            .text_sm()
+            .text_color(theme::TEXT)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::HOVER))
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.emit(TerminalViewEvent::SplitRequested(direction));
+                this.context_menu = None;
+                cx.notify();
+            }))
+    }
+
     pub(super) fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let position = self.context_menu?;
         let has_sel = self.has_selection();
@@ -223,6 +258,31 @@ impl TerminalView {
                                 |this, _, cx| {
                                     this.select_all(cx);
                                 },
+                            ))
+                            .child(self.menu_divider())
+                            .child(self.split_menu_item(
+                                "term-ctx-split-left",
+                                "Split Left",
+                                TerminalSplitDirection::Left,
+                                cx,
+                            ))
+                            .child(self.split_menu_item(
+                                "term-ctx-split-right",
+                                "Split Right",
+                                TerminalSplitDirection::Right,
+                                cx,
+                            ))
+                            .child(self.split_menu_item(
+                                "term-ctx-split-up",
+                                "Split Up",
+                                TerminalSplitDirection::Up,
+                                cx,
+                            ))
+                            .child(self.split_menu_item(
+                                "term-ctx-split-down",
+                                "Split Down",
+                                TerminalSplitDirection::Down,
+                                cx,
                             ))
                             .child(self.menu_divider())
                             .child(self.menu_item(

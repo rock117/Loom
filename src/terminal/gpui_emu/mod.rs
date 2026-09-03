@@ -11,4 +11,4 @@ mod terminal;
 mod view;
 
 pub use colors::ColorPalette;
-pub use view::{TerminalConfig, TerminalView, TerminalViewEvent};
+pub use view::{TerminalConfig, TerminalSplitDirection, TerminalView, TerminalViewEvent};
