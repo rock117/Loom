@@ -1,6 +1,6 @@
 # 主题系统（Theme）实现方案
 
-相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[BACKLOG.md](./BACKLOG.md)（A1 / A2）。
+相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[BACKLOG.md](./BACKLOG.md)（A1 / A2）、[ZED_THEME.md](./ZED_THEME.md)（Zed 机制对照，GPL 源码勿拷贝）。
 
 > **状态**：规格已定，**尚未实现**。实现须由用户明确点名后开始（与 backlog 纪律一致）。  
 > **文档约定**：新增规格默认中文。
@@ -24,6 +24,8 @@
 - **Client-Side Decorations**：自绘标题栏，与 StatusBar 同色阶  
 - **Token 契约**：surfaces / text / accent，而不是散落魔法色  
 - **UI 主题与终端 palette 分两层**，可「跟随」或「独立选择」
+
+Zed 具体怎么加载 JSON、Global、缺省 merge、热刷新，见 [ZED_THEME.md](./ZED_THEME.md)。Loom **不复制** Zed 上百个 editor/syntax token；只采用同一套运行时机制。
 
 ## 非目标（本规格不覆盖）
 
@@ -61,8 +63,123 @@ Settings.theme_id  ──►  ActiveTheme（Global / Entity）
 ### 用户主题（第二期）
 
 - 路径示例：`~/.loom/themes/*.json`（或与现有 config 目录一致）  
-- 只覆盖 **已知 token 键**；缺字段回落到所选内置基座  
+- 只覆盖 **已知 token 键**（见下节）；缺字段回落到所选内置基座  
 - 非法 JSON / 非法色值：Settings 提示，不崩溃，保持上一有效主题
+
+---
+
+## Loom 可修改的主题设置
+
+对照 [ZED_THEME.md](./ZED_THEME.md)：Zed 有上百个 editor/syntax/vim token。Loom 只开放 **终端客户端壳 UI + 终端 palette** 所需的一小截。下列为契约；实现时 Settings / JSON 不得擅自增加未列键（可后续修订本文再扩）。
+
+### A. Settings 里选什么（产品开关）
+
+| 设置键 | 类型 | 默认 | 说明 |
+|--------|------|------|------|
+| `theme` | string | `"loom-dark"` | 当前 UI 主题 id（内置或用户文件 stem） |
+| `appearance` | `"manual"` \| `"system"` | `"manual"` | `system` 时在 `loom-dark` / `loom-light`（或 HC）间跟随 OS；`manual` 只用 `theme` |
+| `terminal_theme` | `null` \| string | `null` | `null` = 终端默认 fg/bg（及可选整盘 ANSI）**跟随** UI 主题；非空 = 独立主题 id / 文件 |
+| `ansi_palette` | 已有枚举 | `"default"` | 见 [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md)。与 Theme **并存**：指定时覆盖主题里的 16 ANSI；未指定时可用主题自带 ANSI 或内置推导 |
+
+字号 / 行号等仍走现有 Settings，**不属于主题包**。
+
+### B. UI 色 token（主题包 / 用户 JSON 可改）
+
+对应今天 `src/shared/theme.rs` 的色常量；JSON 键用 **snake_case**（与运行时字段一致）。
+
+| JSON / 字段 | 现状常量 | 用在哪 |
+|-------------|----------|--------|
+| `bg` | `BG` | 主内容区底（终端所在列） |
+| `sidebar_bg` | `SIDEBAR_BG` | 左侧 Profiles |
+| `panel_bg` | `PANEL_BG` | Tab 栏、右栏、状态栏等面板面 |
+| `elevated` | `ELEVATED` | 菜单、弹层、浮层 |
+| `border` | `BORDER` | 主分割线 / 描边 |
+| `border_subtle` | `BORDER_SUBTLE` | 弱分割线 |
+| `text` | `TEXT` | 默认正文 |
+| `text_muted` | `TEXT_MUTED` | 次要说明 |
+| `text_disabled` | `TEXT_DISABLED` | 禁用态 |
+| `accent` | `ACCENT` | 焦点环、主强调、链接感 |
+| `accent_soft` | `ACCENT_SOFT` | 弱强调底 |
+| `danger` | `DANGER` | 错误 / 危险操作 |
+| `success` | `SUCCESS` | 成功 / 已连接等 |
+| `tab_active` | `TAB_ACTIVE` | 活动 Tab 底 |
+| `hover` | `HOVER` | 行/按钮悬停 |
+| `selection` | `SELECTION` | 列表 / 文本选中底 |
+| `icon_local` | `ICON_LOCAL` | 侧栏 Local 图标 |
+| `icon_remote` | `ICON_REMOTE` | 侧栏 SSH 图标 |
+| `icon_group` | `ICON_GROUP` | 侧栏 Group 图标 |
+
+**可选第二期再加**（今日无常量硬推、不进第一版 JSON）：
+
+| 键 | 说明 |
+|----|------|
+| `title_bar_bg` | CSD 标题栏底（默认同 `panel_bg`） |
+| `status_bar_bg` | 状态栏底（默认同 `panel_bg`） |
+| `warning` | 警告态（Info 面板等；没有则用 `accent` / 独立常量） |
+
+### C. 终端 palette（主题包可选段）
+
+| JSON / 字段 | 说明 |
+|-------------|------|
+| `terminal.background` | 终端默认背景（常跟 `bg`） |
+| `terminal.foreground` | 默认前景（常跟 `text`） |
+| `terminal.cursor` | 光标色（可缺省 = `accent`） |
+| `terminal.ansi.black` … `white` | 标准 8 色 |
+| `terminal.ansi.bright_black` … `bright_white` | 亮色 8 色 |
+
+缺整段 `terminal`：从 UI token 推导 bg/fg，ANSI 用内置 Default 或当前 `ansi_palette` 预设。
+
+不做（相对 Zed）：dim 档、256 色表、syntax highlight。
+
+### D. 明确不可改（第一期 / 主题 JSON）
+
+| 项 | 原因 |
+|----|------|
+| `SPACE_*` / `RADIUS_*` / `TAB_BAR_HEIGHT` / `STATUS_BAR_*` | 几何 metrics，保持编译期常量 |
+| `FONT_UI*` / 终端字号 | 已有 Settings；不进主题色包 |
+| Editor gutter / vim / syntax / players / icon theme | IDE 面，Loom 无 |
+| 任意未列自定义键 | 忽略或校验失败提示，不进运行时 |
+
+### E. 用户主题 JSON 示例
+
+```json
+{
+  "id": "my-slate",
+  "name": "My Slate",
+  "appearance": "dark",
+  "ui": {
+    "bg": "#1a1c20ff",
+    "sidebar_bg": "#14161aff",
+    "panel_bg": "#1e2128ff",
+    "elevated": "#262a32ff",
+    "border": "#333842ff",
+    "border_subtle": "#2a2e36ff",
+    "text": "#e6e8ecff",
+    "text_muted": "#8b909aff",
+    "text_disabled": "#5c616aff",
+    "accent": "#6b9bd1ff",
+    "accent_soft": "#2a3a4fff",
+    "danger": "#d16b6bff",
+    "success": "#6bc48aff",
+    "tab_active": "#2a2e36ff",
+    "hover": "#2e333cff",
+    "selection": "#3a4555ff",
+    "icon_local": "#6bc4a0ff",
+    "icon_remote": "#7a9fd4ff",
+    "icon_group": "#d4a06bff"
+  },
+  "terminal": {
+    "background": "#1a1c20ff",
+    "foreground": "#e6e8ecff",
+    "ansi": {
+      "blue": "#74ade8ff",
+      "bright_blue": "#8fbef0ff"
+    }
+  }
+}
+```
+
+色值：`#RRGGBB` 或 `#RRGGBBAA`。未写的 `ui` / `ansi` 键回落基座（`appearance` 选 dark→`loom-dark`，light→`loom-light`）。
 
 ## 数据形状（建议）
 
@@ -84,8 +201,9 @@ ThemeTokens {
 Theme {
   id: SharedString,          // "loom-dark"
   name: SharedString,        // 显示名
+  appearance: Dark | Light,
   ui: ThemeTokens,
-  terminal: TerminalPalette, // 或 Option：None = 从 ui 推导默认 bg/fg
+  terminal: Option<TerminalPalette>, // None = 从 ui + ansi_palette 推导
 }
 ```
 
@@ -99,6 +217,7 @@ Theme {
 theme: "loom-dark"                 // 必选，默认 loom-dark
 terminal_theme: null | "…"         // null = 跟随 UI；否则独立 id / 文件名
 appearance: "manual" | "system"    // 可选；system 时在 dark/light 内置包间跟随 OS
+// ansi_palette: 已存在，见 TERMINAL_ANSI_PALETTE.md
 ```
 
 ## 实现阶段与难度

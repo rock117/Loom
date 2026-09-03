@@ -39,7 +39,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| A1 | **Theme system** | Spec — [THEME.md](./THEME.md). Built-in packs + user JSON; UI + terminal palette; CSD title bar. **Do not implement** until explicitly ordered. |
+| A1 | **Theme system** | Spec — [THEME.md](./THEME.md); Zed mechanism notes — [ZED_THEME.md](./ZED_THEME.md). Built-in packs + user JSON; UI + terminal palette; CSD title bar. **Do not implement** until explicitly ordered. |
 | A2 | **Accessibility themes** | High-contrast / larger UI variants (can ship with A1; see THEME.md). |
 | A3 | **Terminal ANSI palette presets** | Spec + shipped — [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md). Settings: Default / Readable / High contrast; **default = Default (no change)**. Client-only. |
 
