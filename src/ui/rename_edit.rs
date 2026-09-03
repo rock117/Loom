@@ -175,6 +175,15 @@ impl RenameEdit {
         self.caret_visible = true;
     }
 
+    /// Approximate x hit-test for single-line proportional text (form fields, filters).
+    pub fn char_index_at_x(&self, local_x: f32, avg_char_w: f32) -> usize {
+        if local_x <= 0.0 {
+            return 0;
+        }
+        let idx = (local_x / avg_char_w).round() as usize;
+        idx.min(self.char_len())
+    }
+
     pub fn selected_text(&self) -> String {
         let (lo, hi) = self.sel_range();
         self.text.chars().skip(lo).take(hi - lo).collect()
@@ -312,3 +321,17 @@ impl RenameEdit {
 }
 
 const ROW_RENAME: f32 = 18.0;
+
+/// Printable text from a keystroke, if any.
+///
+/// GPUI reports Space as `key == "space"` without populating `key_char`.
+pub fn typed_text_from_keystroke(keystroke: &Keystroke) -> Option<String> {
+    if keystroke.key.as_str() == "space" {
+        return Some(" ".to_string());
+    }
+    keystroke
+        .key_char
+        .as_ref()
+        .map(|s| s.replace('\r', "").replace('\n', ""))
+        .filter(|s| !s.is_empty())
+}

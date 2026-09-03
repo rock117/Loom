@@ -177,6 +177,33 @@ impl TabBar {
             }))
     }
 
+    fn tab_split_menu_item(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        tab_id: Uuid,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w_full()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .rounded(px(theme::RADIUS_SM))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::HOVER))
+            .child(label)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.context_menu = None;
+                this.close_split_menu(cx);
+                this.tabs.update(cx, |m, cx| m.select_tab(tab_id, window, cx));
+                cx.emit(TabBarEvent::Split(direction));
+                cx.stop_propagation();
+                cx.notify();
+            }))
+    }
+
     fn split_popover(&self, cx: &mut Context<Self>) -> impl IntoElement {
         self.menu_shell()
             .child(self.split_menu_item("split-right", "Split Right", SplitDirection::Right, cx))
@@ -258,6 +285,35 @@ impl TabBar {
                     this.tabs.update(cx, |m, cx| m.close_all_tabs(cx));
                     cx.emit(TabBarEvent::Changed);
                 },
+            ))
+            .child(self.menu_divider())
+            .child(self.tab_split_menu_item(
+                "tab-ctx-split-left",
+                "Split Left",
+                tab_id,
+                SplitDirection::Left,
+                cx,
+            ))
+            .child(self.tab_split_menu_item(
+                "tab-ctx-split-right",
+                "Split Right",
+                tab_id,
+                SplitDirection::Right,
+                cx,
+            ))
+            .child(self.tab_split_menu_item(
+                "tab-ctx-split-up",
+                "Split Up",
+                tab_id,
+                SplitDirection::Up,
+                cx,
+            ))
+            .child(self.tab_split_menu_item(
+                "tab-ctx-split-down",
+                "Split Down",
+                tab_id,
+                SplitDirection::Down,
+                cx,
             ))
             .child(self.menu_divider())
             .child(self.menu_item(

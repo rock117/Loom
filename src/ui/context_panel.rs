@@ -16,7 +16,7 @@ use crate::session::sftp::{
     parent_remote, transfer_cancel_flag,
 };
 use crate::shared::theme;
-use crate::ui::rename_edit::RenameEdit;
+use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::tab_manager::TabManager;
 use crate::ui::tooltip::Tooltip;
 use crate::ui::workspace_store::WorkspaceStore;
@@ -160,6 +160,9 @@ pub struct ContextPanel {
     editing_search: bool,
     /// Whether the filter input row is visible (opened via toolbar search).
     search_open: bool,
+    /// Mouse-drag selection in the filter field.
+    search_selecting: bool,
+    search_edit_bounds: Option<Bounds<Pixels>>,
     /// Details-list sort (click column headers).
     sort_field: SortField,
     sort_asc: bool,
@@ -224,6 +227,8 @@ impl ContextPanel {
             search_edit: RenameEdit::new(""),
             editing_search: false,
             search_open: false,
+            search_selecting: false,
+            search_edit_bounds: None,
             sort_field: SortField::Name,
             sort_asc: true,
             host_info: None,
@@ -280,6 +285,8 @@ impl ContextPanel {
         self.search_edit = RenameEdit::new("");
         self.editing_search = false;
         self.search_open = false;
+        self.search_selecting = false;
+        self.search_edit_bounds = None;
         self._prompt_caret_blink = None;
         self.host_info = None;
         self.host_info_pane = None;
@@ -1247,9 +1254,8 @@ impl ContextPanel {
             cx.notify();
             return true;
         }
-        if let Some(typed) = event.keystroke.key_char.as_deref() {
-            let cleaned = typed.replace('\r', "").replace('\n', "");
-            if !cleaned.is_empty() && !chord {
+        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+            if !chord {
                 edit.insert(&cleaned);
                 cx.notify();
                 return true;
@@ -1267,12 +1273,70 @@ impl ContextPanel {
         }
         self.search_open = true;
         self.editing_search = true;
+        self.search_selecting = false;
         self.entry_menu = None;
         self.transfer_menu = None;
+        self.search_edit.move_end(false);
         self.search_edit.caret_visible = true;
         self.start_prompt_caret_blink(cx);
         self.focus_handle.focus(window);
         cx.notify();
+    }
+
+    fn begin_search_mouse_select(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cwd.is_none() {
+            return;
+        }
+        if self.editing_path {
+            self.cancel_path_edit(cx);
+        }
+        self.search_open = true;
+        self.editing_search = true;
+        self.entry_menu = None;
+        self.transfer_menu = None;
+        self.focus_handle.focus(window);
+        let extend = event.modifiers.shift;
+        if event.click_count >= 2 {
+            self.search_edit.select_all();
+            self.search_selecting = false;
+        } else {
+            let idx = self.search_index_at_pointer(event.position);
+            self.search_edit.set_caret(idx, extend);
+            self.search_selecting = true;
+        }
+        self.search_edit.caret_visible = true;
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn update_search_mouse_select(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.search_selecting || !self.editing_search {
+            return;
+        }
+        let idx = self.search_index_at_pointer(position);
+        self.search_edit.set_caret(idx, true);
+        self.search_edit.caret_visible = true;
+        cx.notify();
+    }
+
+    fn end_search_mouse_select(&mut self, cx: &mut Context<Self>) {
+        if self.search_selecting {
+            self.search_selecting = false;
+            cx.notify();
+        }
+    }
+
+    fn search_index_at_pointer(&self, position: Point<Pixels>) -> usize {
+        let Some(bounds) = self.search_edit_bounds else {
+            return self.search_edit.char_len();
+        };
+        let local_x: f32 = (position.x - bounds.origin.x).into();
+        self.search_edit.char_index_at_x(local_x, FILTER_CHAR_W)
     }
 
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1287,9 +1351,10 @@ impl ContextPanel {
     }
 
     fn close_search(&mut self, cx: &mut Context<Self>) {
-        self.search_edit = RenameEdit::new("");
+        self.search_edit = filter_edit("");
         self.editing_search = false;
         self.search_open = false;
+        self.search_selecting = false;
         if self.prompt.is_none() && !self.editing_path {
             self._prompt_caret_blink = None;
         }
@@ -1297,8 +1362,9 @@ impl ContextPanel {
     }
 
     fn clear_search_text(&mut self, cx: &mut Context<Self>) {
-        self.search_edit = RenameEdit::new("");
+        self.search_edit = filter_edit("");
         self.editing_search = true;
+        self.search_selecting = false;
         self.search_edit.caret_visible = true;
         self.start_prompt_caret_blink(cx);
         cx.notify();
@@ -1436,9 +1502,8 @@ impl ContextPanel {
             cx.notify();
             return true;
         }
-        if let Some(typed) = event.keystroke.key_char.as_deref() {
-            let cleaned = typed.replace('\r', "").replace('\n', "");
-            if !cleaned.is_empty() && !chord {
+        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+            if !chord {
                 edit.insert(&cleaned);
                 cx.notify();
                 return true;
@@ -1933,9 +1998,8 @@ impl ContextPanel {
             cx.notify();
             return true;
         }
-        if let Some(typed) = event.keystroke.key_char.as_deref() {
-            let cleaned = typed.replace('\r', "").replace('\n', "");
-            if !cleaned.is_empty() && !chord {
+        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+            if !chord {
                 edit.insert(&cleaned);
                 cx.notify();
                 return true;
@@ -2068,6 +2132,7 @@ impl ContextPanel {
         let filter_active = search_open && !search_query.trim().is_empty();
         let shown = entries.len();
         let total = self.entries.len();
+        let view = cx.entity();
 
         div()
             .flex()
@@ -2133,9 +2198,24 @@ impl ContextPanel {
                                 .cursor_text()
                                 .child(
                                     div()
+                                        .id("ctx-search-input")
+                                        .relative()
                                         .flex_1()
                                         .min_w_0()
                                         .overflow_hidden()
+                                        .child(
+                                            canvas(
+                                                move |bounds, _, cx| {
+                                                    view.update(cx, |this, _| {
+                                                        this.search_edit_bounds = Some(bounds);
+                                                    });
+                                                    bounds
+                                                },
+                                                |_bounds, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .size_full(),
+                                        )
                                         .when_some(search_el, |d, el| d.child(el))
                                         .when(!editing_search, |d| {
                                             d.text_xs()
@@ -2181,8 +2261,8 @@ impl ContextPanel {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.begin_search_edit(window, cx);
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        this.begin_search_mouse_select(event, window, cx);
                                         cx.stop_propagation();
                                     }),
                                 ),
@@ -3893,6 +3973,15 @@ impl Focusable for ContextPanel {
     }
 }
 
+/// Filter field uses `text_xs`; approximate glyph width for mouse hit-test.
+const FILTER_CHAR_W: f32 = 6.5;
+
+fn filter_edit(text: impl Into<String>) -> RenameEdit {
+    let mut edit = RenameEdit::new(text);
+    edit.move_end(false);
+    edit
+}
+
 impl Render for ContextPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep Files browser in sync when the focused pane changes.
@@ -3951,20 +4040,25 @@ impl Render for ContextPanel {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    if !this.files_sash_drag {
+                    if this.files_sash_drag {
+                        this.files_sash_drag = false;
+                        let ratio = this.list_ratio.clamp(0.35, 0.9);
+                        this.list_ratio = ratio;
+                        this.store.update(cx, |s, _| {
+                            s.ui_state.context_files_list_ratio = ratio;
+                            s.persist_now();
+                        });
+                        cx.notify();
                         return;
                     }
-                    this.files_sash_drag = false;
-                    let ratio = this.list_ratio.clamp(0.35, 0.9);
-                    this.list_ratio = ratio;
-                    this.store.update(cx, |s, _| {
-                        s.ui_state.context_files_list_ratio = ratio;
-                        s.persist_now();
-                    });
-                    cx.notify();
+                    this.end_search_mouse_select(cx);
                 }),
             )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.search_selecting {
+                    this.update_search_mouse_select(event.position, cx);
+                    return;
+                }
                 if !this.files_sash_drag {
                     return;
                 }

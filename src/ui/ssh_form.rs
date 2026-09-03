@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::model::{Profile, ProfileKind, SshAuth};
 use crate::session::credentials;
 use crate::shared::theme;
-use crate::ui::rename_edit::RenameEdit;
+use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::workspace_store::WorkspaceStore;
 
 #[derive(Clone, Debug)]
@@ -357,12 +357,9 @@ impl SshForm {
         if chord {
             return false;
         }
-        if let Some(typed) = event.keystroke.key_char.as_deref() {
-            let cleaned = typed.replace('\r', "").replace('\n', "");
-            if !cleaned.is_empty() {
-                self.active_edit_mut().insert(&cleaned);
-                return true;
-            }
+        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+            self.active_edit_mut().insert(&cleaned);
+            return true;
         }
         false
     }

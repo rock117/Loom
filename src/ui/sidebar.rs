@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::model::ProfileKind;
 use crate::shared::theme;
+use crate::ui::rename_edit::typed_text_from_keystroke;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
 const ICON_TREE: f32 = 14.0;
@@ -1057,7 +1058,7 @@ impl Render for Sidebar {
                     }
                     if !chord
                         && !mods.alt
-                        && let Some(typed) = event.keystroke.key_char.as_deref()
+                        && let Some(typed) = typed_text_from_keystroke(&event.keystroke)
                     {
                         let mut cleaned = String::new();
                         for ch in typed.chars() {

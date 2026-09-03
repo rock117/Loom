@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::session::credentials;
 use crate::shared::theme;
+use crate::ui::rename_edit::typed_text_from_keystroke;
 
 #[derive(Clone, Debug)]
 pub enum PasswordPromptEvent {
@@ -180,7 +181,7 @@ impl Render for PasswordPrompt {
                             && !event.keystroke.modifiers.alt
                             && !event.keystroke.modifiers.platform
                         {
-                            if let Some(typed) = event.keystroke.key_char.as_deref() {
+                            if let Some(typed) = typed_text_from_keystroke(&event.keystroke) {
                                 let mut any = false;
                                 for ch in typed.chars() {
                                     if !ch.is_control() {
