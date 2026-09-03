@@ -94,7 +94,7 @@ Implement fully on Windows; other OSes compile with stubs or minimal defaults.
 | API | Windows | Later |
 |-----|---------|--------|
 | `config_dir()` | `%APPDATA%/Loom` | `~/Library/Application Support/Loom`, `~/.config/loom` |
-| `default_shell()` | pwsh → powershell → cmd | `$SHELL`, `/bin/zsh`, etc. |
+| `default_shell()` | Zed 式路径扫描 + 缓存（见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)） | `$SHELL` → `/bin/zsh` / `/bin/bash` |
 | `monospace_font_family()` | Cascadia Mono / Consolas | Menlo / DejaVu Sans Mono |
 | PTY | `portable-pty` (already cross-platform) | same crate |
 

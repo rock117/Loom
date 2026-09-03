@@ -4,6 +4,8 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+mod command;
+
 #[cfg(windows)]
 mod windows;
 
@@ -13,6 +15,8 @@ pub use linux::*;
 pub use macos::*;
 #[cfg(windows)]
 pub use windows::*;
+
+pub use command::new_command;
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 compile_error!("Loom currently supports Windows, macOS, and Linux only");

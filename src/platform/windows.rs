@@ -1,4 +1,8 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
+
+/// Cached default shell (Zed-style path scan; no `where.exe` subprocess).
+static DEFAULT_SHELL: LazyLock<String> = LazyLock::new(detect_default_shell);
 
 pub fn native_config_dir() -> PathBuf {
     dirs::config_dir()
@@ -7,12 +11,7 @@ pub fn native_config_dir() -> PathBuf {
 }
 
 pub fn native_default_shell() -> String {
-    for name in ["pwsh", "powershell", "cmd"] {
-        if let Some(path) = resolve_executable(name) {
-            return path;
-        }
-    }
-    r"C:\Windows\System32\cmd.exe".to_string()
+    DEFAULT_SHELL.clone()
 }
 
 pub fn native_monospace_font_family() -> &'static str {
@@ -28,7 +27,7 @@ pub fn native_monospace_font_family() -> &'static str {
 pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if path.is_file() {
-        // Single argument form: /select,C:\full\path
+        // Explorer is GUI — do not use CREATE_NO_WINDOW.
         std::process::Command::new("explorer")
             .arg(format!("/select,{}", path.display()))
             .spawn()?;
@@ -61,9 +60,6 @@ pub fn native_open_url(url: &str) -> std::io::Result<()> {
         ) -> isize;
     }
 
-    // ASFW_ANY (-1): let the browser take focus after a user Ctrl+click.
-    // Without this (or if open runs on a background thread), Windows often only
-    // flashes the taskbar and keeps Loom in front — unlike Zed's sync open.
     const ASFW_ANY: u32 = u32::MAX;
     const SW_SHOWNORMAL: i32 = 1;
 
@@ -90,7 +86,6 @@ pub fn native_open_url(url: &str) -> std::io::Result<()> {
             SW_SHOWNORMAL,
         )
     };
-    // Per MSDN, values ≤ 32 indicate failure.
     if ret <= 32 {
         Err(std::io::Error::last_os_error())
     } else {
@@ -102,17 +97,101 @@ fn font_file_exists(path: &str) -> bool {
     std::path::Path::new(path).is_file()
 }
 
-fn resolve_executable(name: &str) -> Option<String> {
-    let output = std::process::Command::new("where")
-        .arg(name)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Zed `gpui_util::get_powershell` — scan common install locations, then PATH.
+fn detect_default_shell() -> String {
+    let probes: [fn() -> Option<PathBuf>; 11] = [
+        || find_pwsh_in_programfiles(false, false),
+        || find_pwsh_in_programfiles(true, false),
+        || find_pwsh_in_msix(false),
+        || find_pwsh_in_programfiles(false, true),
+        || find_pwsh_in_msix(true),
+        || find_pwsh_in_programfiles(true, true),
+        || find_pwsh_in_scoop(),
+        || find_pwsh_in_dotnet_tools(),
+        || which_global("pwsh.exe"),
+        || which_global("powershell.exe"),
+        || find_windows_powershell(),
+    ];
+
+    if let Some(path) = probes.into_iter().find_map(|f| f()) {
+        return path.to_string_lossy().trim().to_owned();
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines()
-        .next()
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+
+    let system_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+    PathBuf::from(system_root)
+        .join("System32\\cmd.exe")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn find_pwsh_in_programfiles(find_alternate: bool, find_preview: bool) -> Option<PathBuf> {
+    #[cfg(target_pointer_width = "64")]
+    let env_var = if find_alternate {
+        "ProgramFiles(x86)"
+    } else {
+        "ProgramFiles"
+    };
+    #[cfg(target_pointer_width = "32")]
+    let env_var = if find_alternate {
+        "ProgramW6432"
+    } else {
+        "ProgramFiles"
+    };
+
+    let install_base_dir = PathBuf::from(std::env::var_os(env_var)?).join("PowerShell");
+    install_base_dir
+        .read_dir()
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| matches!(entry.file_type(), Ok(ft) if ft.is_dir()))
+        .filter_map(|entry| {
+            let dir_name = entry.file_name();
+            let dir_name = dir_name.to_string_lossy();
+            let version = if find_preview {
+                let dash_index = dir_name.find('-')?;
+                if &dir_name[dash_index + 1..] != "preview" {
+                    return None;
+                }
+                dir_name[..dash_index].parse::<u32>().ok()?
+            } else {
+                dir_name.parse::<u32>().ok()?
+            };
+            let exe_path = entry.path().join("pwsh.exe");
+            exe_path.is_file().then_some((version, exe_path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+fn find_pwsh_in_msix(find_preview: bool) -> Option<PathBuf> {
+    let msix_app_dir =
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("Microsoft\\WindowsApps");
+    let package_family_name = if find_preview {
+        "Microsoft.PowerShellPreview_8wekyb3d8bbwe"
+    } else {
+        "Microsoft.PowerShell_8wekyb3d8bbwe"
+    };
+    let pwsh_exe = msix_app_dir.join(package_family_name).join("pwsh.exe");
+    pwsh_exe.is_file().then_some(pwsh_exe)
+}
+
+fn find_pwsh_in_scoop() -> Option<PathBuf> {
+    let pwsh_exe = PathBuf::from(std::env::var_os("USERPROFILE")?).join("scoop\\shims\\pwsh.exe");
+    pwsh_exe.is_file().then_some(pwsh_exe)
+}
+
+fn find_pwsh_in_dotnet_tools() -> Option<PathBuf> {
+    let pwsh_exe =
+        PathBuf::from(std::env::var_os("USERPROFILE")?).join(".dotnet\\tools\\pwsh.exe");
+    pwsh_exe.is_file().then_some(pwsh_exe)
+}
+
+fn find_windows_powershell() -> Option<PathBuf> {
+    let system_root = PathBuf::from(std::env::var_os("SystemRoot")?);
+    let powershell = system_root.join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    powershell.is_file().then_some(powershell)
+}
+
+fn which_global(name: &str) -> Option<PathBuf> {
+    which::which_global(name).ok()
 }

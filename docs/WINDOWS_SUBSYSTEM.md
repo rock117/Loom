@@ -1,6 +1,6 @@
 # Windows 子系统与纯 GUI 启动
 
-知识笔记：说明 `#![windows_subsystem = "windows"]` 与 Loom 在 Windows 上不弹 CMD 的原因。不属于架构规格；需要时也可对照 [HARD_PROBLEMS.md](./HARD_PROBLEMS.md) 中的平台坑。
+相关文档：[LOCAL_SHELL.md](./LOCAL_SHELL.md)、[PLATFORM_SHELL.md](./PLATFORM_SHELL.md)。
 
 ## 结论（Loom 现状）
 
@@ -77,7 +77,9 @@ Loom 当前采用 **无条件** `"windows"`：Debug / Release 启动都不弹 CM
 | 机制 | 管谁 | Loom 里的例子 |
 |------|------|----------------|
 | `windows_subsystem` | **本进程** `loom.exe` 启动时要不要控制台 | `src/main.rs` |
-| `CREATE_NO_WINDOW`（`Command` creation flags） | **子进程** 会不会闪黑窗 | 如 Info 面板采 GPU 时跑 `nvidia-smi` / PowerShell |
+| `CREATE_NO_WINDOW`（`Command` creation flags） | **子进程** 会不会闪黑窗 | `platform::new_command`；Info 面板 `nvidia-smi` / PowerShell 等 |
+
+Shell 探测与子进程规范见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)（Windows 已不用 `where.exe`）。
 
 两者独立。父进程已是 GUI，子进程若以默认 console 方式 `Command::new` 启动，仍可能短暂弹出控制台；需要时再对子进程设 `CREATE_NO_WINDOW`（或等效重定向）。
 
@@ -102,4 +104,5 @@ Loom 当前采用 **无条件** `"windows"`：Debug / Release 启动都不弹 CM
 |----|------|
 | 子系统属性 | `src/main.rs` |
 | Windows 图标资源 | `build.rs`、`resources/windows/loom.rc`、`assets/icons/loom.ico` |
-| 平台封装 | `src/platform/`（与子系统无关，但同属 Windows 打包面） |
+| 平台封装 | `src/platform/`（shell 探测、`new_command`） |
+| Shell / 子进程文档 | [PLATFORM_SHELL.md](./PLATFORM_SHELL.md) |

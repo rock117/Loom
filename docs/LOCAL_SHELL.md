@@ -76,7 +76,9 @@ Local spawn 时（`src/session/local.rs`）会：
 
 ### 4. 默认 shell 探测（未配置时）
 
-`platform::resolve_shell` 若 Settings / Profile 未写死路径，Windows 会对 `pwsh`、`powershell`、`cmd` 各跑一次 **`where`**（子进程）。建议 **在 Settings 里写绝对路径**，避免每次新建 Tab 都探测。
+Windows 使用 **Zed 式路径扫描 + `LazyLock` 缓存**（不 spawn `where.exe`），详见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)。  
+macOS / Linux 读 **`$SHELL`** 环境变量。  
+仍建议在 Settings 里写 **绝对路径**，避免依赖自动探测与 PATH 差异。
 
 ---
 
@@ -93,7 +95,7 @@ Local spawn 时（`src/session/local.rs`）会：
 ### B. 不增加额外开销（实现层）
 
 - 少注入启动脚本，或做成可选（shell integration）
-- 缓存默认 shell 路径，避免每次 `where`
+- 默认 shell 路径在 Windows 上进程内只探测一次（`LazyLock`）；见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)
 - 提供 Profile 启动参数字段（如 `-NoLogo`、`-NoProfile`）
 
 Loom 当前：**SSH 已走 A**；**Local 仍以同步 spawn 为主**；**pwsh 会额外带 EncodedCommand cwd hook**。
@@ -115,7 +117,7 @@ C:\Windows\System32\cmd.exe
 
 ### 2. 固定路径，关闭 Auto 探测
 
-- Default shell 不要用空值依赖 `pwsh → powershell → cmd` 链式 `where`
+- Default shell 不要用空值依赖自动探测链；可写绝对路径（见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)）
 - Local Proxy 若不需要：**Off**（见 [LOCAL_PROXY.md](./LOCAL_PROXY.md)）
 
 ### 3. 必须用 pwsh 时
@@ -136,7 +138,9 @@ C:\Windows\System32\cmd.exe
 
 | 模块 | 职责 |
 |------|------|
-| `src/platform/windows.rs` | 默认 shell 探测顺序、`where` |
+| `src/platform/windows.rs` | Windows 默认 shell（Zed 式路径扫描 + 缓存） |
+| `src/platform/command.rs` | 后台 `Command`（Windows `CREATE_NO_WINDOW`） |
+| `src/platform/macos.rs` / `linux.rs` | Unix `$SHELL` 默认 shell |
 | `src/platform.rs` | `resolve_shell` |
 | `src/session/local.rs` | `LocalPty::spawn`、`configure_cwd_reporting`、teardown |
 | `src/ui/tab_manager.rs` | `spawn_local`（同步）vs `begin_ssh` / `spawn_ssh_connect`（异步） |
@@ -148,7 +152,7 @@ C:\Windows\System32\cmd.exe
 
 - Local 与 SSH 对齐：**先 Tab + Connecting，后台 spawn PTY**（GPUI async / `background_spawn` 模式）
 - Settings：**可选 `-NoProfile`**、可选关闭 cwd OSC hook
-- 缓存 `resolve_shell` 结果，避免重复 `where`
+- 缓存与文档见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)（Windows 已实现 `LazyLock`）
 
 若采纳架构变更，应在 [DECISIONS.md](./DECISIONS.md) 新增条目。
 

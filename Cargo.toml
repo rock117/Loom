@@ -27,6 +27,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [target.'cfg(windows)'.dependencies]
+which = "7.0"
 winreg = "0.52"
 
 [target.'cfg(windows)'.build-dependencies]

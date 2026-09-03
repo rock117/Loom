@@ -403,15 +403,8 @@ fn is_dummy_gpu_name(name: &str) -> bool {
 }
 
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    use std::process::Command;
-    let mut cmd = Command::new(program);
+    let mut cmd = crate::platform::new_command(program);
     cmd.args(args);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
     let output = cmd.output().ok()?;
     if !output.status.success() && output.stdout.is_empty() {
         return None;
