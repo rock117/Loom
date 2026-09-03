@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=resources/windows/loom.rc");
     println!("cargo:rerun-if-changed=assets/icons/loom.ico");
+    println!("cargo:rerun-if-changed=assets/icons/loom.svg");
 
     #[cfg(target_os = "windows")]
     {
