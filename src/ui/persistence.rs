@@ -40,6 +40,7 @@ impl Persistence {
                     this.schedule_debounce(cx);
                 }
                 AppBusEvent::SplitPane { .. } => {}
+                AppBusEvent::DuplicateActiveTab => {}
             }
         });
 

@@ -232,12 +232,11 @@ impl Render for StatusBar {
 
             let fwd_snap = pane.and_then(|p| p.ssh_forwards.as_ref().map(|h| h.snapshot()));
             let fwd_listening = fwd_snap.as_ref().map(|s| s.listening_count()).unwrap_or(0);
-            let fwd_errors = fwd_snap.as_ref().map(|s| s.error_count()).unwrap_or(0);
-            let fwd_denied = fwd_snap
+            let fwd_error_label = fwd_snap
                 .as_ref()
-                .is_some_and(|s| s.forwarding_denied);
+                .and_then(|s| s.status_bar_error_label());
             let fwd_label = match fwd_snap.as_ref() {
-                Some(snap) if fwd_listening == 1 => snap
+                Some(snap) if fwd_listening == 1 && fwd_error_label.is_none() => snap
                     .rows
                     .iter()
                     .find(|r| r.status.is_listening())
@@ -254,10 +253,12 @@ impl Render for StatusBar {
                         }
                     })
                     .unwrap_or_else(|| format!("⇄ {fwd_listening}")),
-                _ if fwd_listening > 0 => format!("⇄ {fwd_listening}"),
+                _ if fwd_listening > 0 && fwd_error_label.is_none() => {
+                    format!("⇄ {fwd_listening}")
+                }
                 _ => String::new(),
             };
-            let fwd_tooltip = if fwd_listening == 1 {
+            let fwd_ok_tooltip = if fwd_listening == 1 {
                 "Port forward — open Info"
             } else {
                 "Port forwards — open Info"
@@ -310,7 +311,7 @@ impl Render for StatusBar {
                                 .child(format!("·  {profile_name}")),
                         ),
                 ))
-                .when(fwd_errors > 0 || fwd_denied, |d| {
+                .when_some(fwd_error_label.clone(), |d, err_label| {
                     d.child(Self::segment(
                         "sb-fwd-err",
                         cx,
@@ -327,15 +328,16 @@ impl Render for StatusBar {
                                 div()
                                     .text_xs()
                                     .text_color(theme::DANGER)
-                                    .child("Forward error"),
+                                    .whitespace_nowrap()
+                                    .child(err_label),
                             ),
                     ))
                 })
-                .when(fwd_errors == 0 && !fwd_denied && fwd_listening > 0, |d| {
+                .when(fwd_error_label.is_none() && fwd_listening > 0, |d| {
                     d.child(Self::segment(
                         "sb-fwd",
                         cx,
-                        fwd_tooltip,
+                        fwd_ok_tooltip,
                         None,
                         |_, _, cx| {
                             cx.emit(StatusBarEvent::FocusPortForwards);

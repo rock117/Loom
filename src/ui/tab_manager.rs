@@ -7,9 +7,10 @@ use gpui::*;
 use portable_pty::ChildKiller;
 use uuid::Uuid;
 
-use crate::model::{AnsiPalette, ConnectionState, Profile, ProfileKind, SshAuth};
+use crate::model::{AnsiPalette, ConnectionState, PortForwardRule, Profile, ProfileKind, SshAuth};
 use crate::platform;
 use crate::session::credentials;
+use crate::session::forward::ForwardHandle;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
 use crate::shared::theme;
@@ -507,6 +508,7 @@ impl TabManager {
                 p.kind.clone(),
                 p.label.clone(),
                 p.profile_id,
+                p.ssh_forwards.clone(),
                 p.terminal
                     .as_ref()
                     .and_then(|t| t.read(cx).working_directory()),
@@ -514,7 +516,7 @@ impl TabManager {
         }) else {
             return;
         };
-        let (kind, label, auth_profile_id, live_cwd) = source;
+        let (kind, label, auth_profile_id, source_forwards, live_cwd) = source;
 
         let (default_shell, font_family) = {
             let s = store.read(cx);
@@ -553,6 +555,8 @@ impl TabManager {
                 }
             }
             ProfileKind::Ssh { host, port, user, .. } => {
+                let auto_forwards =
+                    collect_auto_forwards(store, auth_profile_id, source_forwards.as_ref(), cx);
                 let pseudo = Profile {
                     id: auth_profile_id.unwrap_or_else(Uuid::nil),
                     name: label.clone(),
@@ -588,7 +592,7 @@ impl TabManager {
                             new_id,
                             &kind,
                             auth,
-                            Vec::new(),
+                            auto_forwards,
                             &font_family,
                             cx,
                         );
@@ -1336,6 +1340,9 @@ impl TabManager {
                 }
             }
             ProfileKind::Ssh { host, port, user, .. } => {
+                let source_forwards = source.ssh_forwards.clone();
+                let auto_forwards =
+                    collect_auto_forwards(store, auth_pid, source_forwards.as_ref(), cx);
                 let pseudo = Profile {
                     id: auth_pid.unwrap_or_else(Uuid::nil),
                     name: label.clone(),
@@ -1371,7 +1378,7 @@ impl TabManager {
                             pane_id,
                             &kind,
                             auth,
-                            Vec::new(),
+                            auto_forwards,
                             &font_family,
                             cx,
                         );
@@ -1444,6 +1451,10 @@ fn wire_terminal_session(
                     },
                     cx,
                 );
+            }
+            TerminalViewEvent::DuplicateTabRequested => {
+                this.focus_pane_id(pane_id, cx);
+                AppBus::emit(&this.app_bus, AppBusEvent::DuplicateActiveTab, cx);
             }
             TerminalViewEvent::SessionEnded => {
                 this.on_pane_session_ended(pane_id, cx);
@@ -1638,4 +1649,45 @@ pub fn state_color(state: ConnectionState) -> Hsla {
         ConnectionState::Failed => theme::DANGER,
         ConnectionState::Disconnected | ConnectionState::Idle => theme::TEXT_MUTED,
     }
+}
+
+/// Enabled Profile forwards, or a copy of the source pane's non-temporary rules.
+fn collect_auto_forwards(
+    store: &Entity<WorkspaceStore>,
+    profile_id: Option<Uuid>,
+    source_forwards: Option<&ForwardHandle>,
+    cx: &App,
+) -> Vec<PortForwardRule> {
+    if let Some(pid) = profile_id {
+        if let Some(profile) = store.read(cx).workspace.find_profile(pid) {
+            let rules: Vec<_> = profile
+                .forwards
+                .iter()
+                .filter(|f| f.enabled)
+                .cloned()
+                .collect();
+            if !rules.is_empty() {
+                return rules;
+            }
+        }
+    }
+    let Some(handle) = source_forwards else {
+        return Vec::new();
+    };
+    handle
+        .snapshot()
+        .rows
+        .into_iter()
+        .filter(|r| !r.temporary)
+        .map(|r| PortForwardRule {
+            id: r.id,
+            kind: crate::model::PortForwardKind::Local,
+            bind_host: r.bind_host,
+            bind_port: r.bind_port,
+            target_host: r.target_host,
+            target_port: r.target_port,
+            name: r.name,
+            enabled: true,
+        })
+        .collect()
 }

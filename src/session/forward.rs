@@ -90,6 +90,48 @@ impl ForwardSnapshot {
     pub fn error_count(&self) -> usize {
         self.rows.iter().filter(|r| r.status.is_error()).count()
     }
+
+    /// Compact status-bar label for forward failures (`None` = nothing to show).
+    pub fn status_bar_error_label(&self) -> Option<String> {
+        let errors: Vec<_> = self
+            .rows
+            .iter()
+            .filter_map(|r| match &r.status {
+                ForwardStatus::Error(msg) => Some((r.bind_port, msg.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        if errors.is_empty() {
+            return if self.forwarding_denied {
+                Some("⇄ Forward denied".into())
+            } else {
+                None
+            };
+        }
+
+        if errors.len() == 1 {
+            let (port, msg) = errors[0];
+            if msg.ends_with(" already in use") {
+                return Some(format!("⇄ {port} in use"));
+            }
+            let short = truncate_status(msg, 36);
+            return Some(format!("⇄ {short}"));
+        }
+
+        Some(format!("⇄ {} errors", errors.len()))
+    }
+}
+
+fn truncate_status(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 pub(crate) struct SharedState {

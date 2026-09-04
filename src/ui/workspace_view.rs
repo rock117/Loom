@@ -136,6 +136,13 @@ impl WorkspaceView {
                         m.split_pane(pane_id, direction, &store, window, cx);
                     });
                 }
+                AppBusEvent::DuplicateActiveTab => {
+                    let store = this.store.clone();
+                    this.tabs.update(cx, |m, cx| {
+                        m.duplicate_active_ephemeral(&store, window, cx);
+                    });
+                    this.persist_tabs(cx);
+                }
                 _ => {}
             },
         ));

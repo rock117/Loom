@@ -22,6 +22,8 @@ pub enum AppBusEvent {
         pane_id: Uuid,
         direction: SplitDirection,
     },
+    /// Duplicate the active tab (from terminal context menu).
+    DuplicateActiveTab,
 }
 
 /// Empty emitter entity for [`AppBusEvent`].

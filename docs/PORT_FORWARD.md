@@ -236,7 +236,8 @@ Port forwarding
 | （无） | 无 Listening 且无 Error |
 | `⇄ bind → target`（有 Name 时带备注） | 仅 1 条 Listening，展开详情 |
 | `⇄ N` | N≥2 条 Listening |
-| `Forward error`（危险色） | 至少一条 Error；点击 → 聚焦 Info 转发区 |
+| `⇄ 9988 in use`（危险色） | 本机端口占用（如另一会话已占用）；点击 → Info，可 Retry |
+| `⇄ <短错误>` / `⇄ N errors` / `⇄ Forward denied` | 其他转发失败；点击 → 聚焦 Info |
 
 ### 生命周期
 
@@ -422,7 +423,7 @@ sudo sshd -T | grep -i allowtcpforwarding
 | ForwardHub | `src/session/forward.rs`（Local listener + `direct-tcpip`） |
 | Handler 扩展 | `src/session/ssh.rs`（Remote 回调 — 阶段 2） |
 | Profile 字段 | `src/model/forward.rs` + `Profile.forwards` |
-| UI | SSH 表单 Port forwarding；Context → Info；状态栏 `⇄ N` / Forward error |
+| UI | SSH 表单 Port forwarding；Context → Info；状态栏 `⇄` 详情 / `⇄ port in use` 等 |
 | Teardown | `tab_manager` 关 pane 时 drop `ssh_forwards`（与 SFTP 对齐） |
 
 ## 验收（阶段 1）

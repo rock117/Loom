@@ -26,6 +26,8 @@ pub enum TerminalViewEvent {
     CloseRequested,
     /// Split this pane in the given direction (same session as source).
     SplitRequested(TerminalSplitDirection),
+    /// Duplicate the active tab as a new ephemeral session.
+    DuplicateTabRequested,
     /// PTY / SSH channel ended — host should mark the pane failed and offer reconnect.
     SessionEnded,
     /// Shell reported a new working directory (OSC / hooks).
@@ -283,6 +285,16 @@ impl TerminalView {
                                 "Split Down",
                                 TerminalSplitDirection::Down,
                                 cx,
+                            ))
+                            .child(self.menu_divider())
+                            .child(self.menu_item(
+                                "term-ctx-duplicate",
+                                "Duplicate Tab",
+                                true,
+                                cx,
+                                |_this, _, cx| {
+                                    cx.emit(TerminalViewEvent::DuplicateTabRequested);
+                                },
                             ))
                             .child(self.menu_divider())
                             .child(self.menu_item(
