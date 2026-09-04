@@ -205,7 +205,7 @@ Port forwarding                          [+ Add]
 | Target | host + port（经 SSH 可达；`127.0.0.1:5432` = **远端本机**服务） |
 | Name | 可选备注，如 `Postgres` |
 
-辅助文案一行：「Connect 成功后自动监听；本机用 `localhost:<port>` 访问。」
+辅助文案一行：「Connect 成功后自动监听；本机用 `localhost:<port>` 访问。」规则行提供 **Copy**，区头 **Copy ssh** 可复制全部 enabled 规则对应的 `ssh -L …` 命令。
 
 ### 会话态：Context → Info
 
@@ -222,6 +222,7 @@ Port forwarding
 |------|------|
 | 行 / 状态点 | 启停该条（不停 SSH） |
 | Temporary | 仅当前 pane；关 Tab 丢弃；可不写 Profile |
+| Copy / Copy ssh | 复制等价 OpenSSH 命令（`ssh -L … user@host`，私钥时带 `-i`）到剪贴板，可在其他终端粘贴执行 |
 | 错误行 | hover / 展开短原因；可 Retry |
 | SSH 未连接 | 灰显：「Connect to enable forwards」 |
 | Connecting | 「Waiting for connection…」 |

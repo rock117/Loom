@@ -7,7 +7,7 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::{ConnectionState, ProfileKind};
+use crate::model::{ConnectionState, ProfileKind, SshAuth, format_open_ssh_command};
 use crate::platform;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
@@ -4284,23 +4284,54 @@ impl ContextPanel {
                             .text_color(theme::TEXT_MUTED)
                             .child("Port forwarding"),
                     )
-                    .when(connected && focused.is_some(), |d| {
-                        d.child(
-                            div()
-                                .id("ctx-fwd-temp")
-                                .px(px(theme::SPACE_2))
-                                .py(px(2.0))
-                                .rounded(px(theme::RADIUS_SM))
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .cursor_pointer()
-                                .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                                .child("+ Temporary")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.begin_temporary_forward(cx);
-                                })),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .when(
+                                connected
+                                    && snap.as_ref().is_some_and(|s| !s.rows.is_empty()),
+                                |d| {
+                                    d.child(
+                                        div()
+                                            .id("ctx-fwd-copy-all")
+                                            .px(px(theme::SPACE_2))
+                                            .py(px(2.0))
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.bg(theme::HOVER).text_color(theme::TEXT)
+                                            })
+                                            .child("Copy ssh")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.copy_open_ssh_forwards(None, cx);
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(connected && focused.is_some(), |d| {
+                                d.child(
+                                    div()
+                                        .id("ctx-fwd-temp")
+                                        .px(px(theme::SPACE_2))
+                                        .py(px(2.0))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .hover(|s| {
+                                            s.bg(theme::HOVER).text_color(theme::TEXT)
+                                        })
+                                        .child("+ Temporary")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.begin_temporary_forward(cx);
+                                        })),
+                                )
+                            }),
+                    ),
             )
             .when(
                 snap.as_ref().is_some_and(|s| s.forwarding_denied),
@@ -4424,6 +4455,17 @@ impl ContextPanel {
                                                 })),
                                         )
                                     })
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("ctx-fwd-copy-{id}")))
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .cursor_pointer()
+                                            .child("Copy")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.copy_open_ssh_forwards(Some(id), cx);
+                                            })),
+                                    )
                                     .when(is_err, |d| {
                                         d.child(
                                             div()
@@ -4523,6 +4565,61 @@ impl ContextPanel {
             }
         }
         cx.notify();
+    }
+
+    /// Copy `ssh -L … user@host` for one forward (`Some(id)`) or all runtime rows (`None`).
+    fn copy_open_ssh_forwards(&mut self, only_id: Option<Uuid>, cx: &mut Context<Self>) {
+        let Some((user, host, port, identity)) = self.focused_ssh_open_ssh_target(cx) else {
+            cx.emit(ContextPanelEvent::Toast("No SSH connection details".into()));
+            return;
+        };
+        let Some((_, handle, _)) = self.focused_forwards(cx) else {
+            cx.emit(ContextPanelEvent::Toast("No forwards".into()));
+            return;
+        };
+        let snap = handle.snapshot();
+        let flags: Vec<String> = snap
+            .rows
+            .iter()
+            .filter(|r| only_id.is_none_or(|id| r.id == id))
+            .map(|r| r.open_ssh_flag())
+            .collect();
+        if flags.is_empty() {
+            cx.emit(ContextPanelEvent::Toast("No forwards to copy".into()));
+            return;
+        }
+        let cmd = format_open_ssh_command(
+            &user,
+            &host,
+            port,
+            identity.as_deref(),
+            &flags,
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+        cx.emit(ContextPanelEvent::Toast("Copied ssh command".into()));
+    }
+
+    fn focused_ssh_open_ssh_target(
+        &self,
+        cx: &App,
+    ) -> Option<(String, String, u16, Option<PathBuf>)> {
+        let pane = self.tabs.read(cx).active_tab()?.focused_pane()?;
+        // Prefer live pane kind (covers ephemeral / unsaved sessions).
+        match &pane.kind {
+            ProfileKind::Ssh {
+                host,
+                port,
+                user,
+                auth,
+            } => {
+                let identity = match auth {
+                    SshAuth::PrivateKey { path } => Some(path.clone()),
+                    SshAuth::Password { .. } => None,
+                };
+                Some((user.clone(), host.clone(), *port, identity))
+            }
+            ProfileKind::Local { .. } => None,
+        }
     }
 
     fn retry_forward(&mut self, id: Uuid, cx: &mut Context<Self>) {

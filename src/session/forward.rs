@@ -61,6 +61,19 @@ impl ForwardStatus {
     }
 }
 
+impl ForwardRuntime {
+    /// OpenSSH `-L` flag for this runtime row (stage 1 = Local only).
+    pub fn open_ssh_flag(&self) -> String {
+        crate::model::open_ssh_forward_flag(
+            PortForwardKind::Local,
+            &self.bind_host,
+            self.bind_port,
+            &self.target_host,
+            self.target_port,
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ForwardSnapshot {
     pub rows: Vec<ForwardRuntime>,

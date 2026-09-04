@@ -1,5 +1,7 @@
 //! Persisted SSH port-forward rules (Profile template). See docs/PORT_FORWARD.md.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -73,6 +75,17 @@ impl PortForwardRule {
         )
     }
 
+    /// OpenSSH forward flag only (`-L host:port:host:port`, later `-R` / `-D`).
+    pub fn open_ssh_flag(&self) -> String {
+        open_ssh_forward_flag(
+            self.kind,
+            &self.bind_host,
+            self.bind_port,
+            &self.target_host,
+            self.target_port,
+        )
+    }
+
     /// Fresh id for Profile duplicate.
     pub fn duplicate(&self) -> Self {
         Self {
@@ -80,4 +93,69 @@ impl PortForwardRule {
             ..self.clone()
         }
     }
+}
+
+/// OpenSSH `-L` / `-R` / `-D` flag for one forward.
+pub fn open_ssh_forward_flag(
+    kind: PortForwardKind,
+    bind_host: &str,
+    bind_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> String {
+    let bind = bind_host.trim();
+    match kind {
+        PortForwardKind::Local => format!(
+            "-L {bind}:{bind_port}:{}:{target_port}",
+            target_host.trim()
+        ),
+        // Remote / Socks reserved — keep generating sensible flags when kinds land.
+    }
+}
+
+/// Quote a path/arg for paste into a typical shell (spaces / quotes).
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        return "\"\"".into();
+    }
+    if s.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '$' | '`' | '!'))
+    {
+        format!("\"{}\"", s.replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Full `ssh … user@host` line ready to paste into another terminal.
+pub fn format_open_ssh_command(
+    user: &str,
+    host: &str,
+    port: u16,
+    identity_file: Option<&Path>,
+    forward_flags: impl IntoIterator<Item = impl AsRef<str>>,
+) -> String {
+    let mut parts: Vec<String> = vec!["ssh".into()];
+    for flag in forward_flags {
+        let f = flag.as_ref().trim();
+        if !f.is_empty() {
+            parts.push(f.to_string());
+        }
+    }
+    if let Some(path) = identity_file {
+        parts.push("-i".into());
+        parts.push(shell_quote(&path.display().to_string()));
+    }
+    if port != 22 {
+        parts.push("-p".into());
+        parts.push(port.to_string());
+    }
+    let user = user.trim();
+    let host = host.trim();
+    if user.is_empty() {
+        parts.push(host.to_string());
+    } else {
+        parts.push(format!("{user}@{host}"));
+    }
+    parts.join(" ")
 }

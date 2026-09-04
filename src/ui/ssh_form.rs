@@ -6,7 +6,9 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::{PortForwardRule, Profile, ProfileKind, SshAuth};
+use crate::model::{
+    PortForwardRule, Profile, ProfileKind, SshAuth, format_open_ssh_command,
+};
 use crate::session::credentials;
 use crate::shared::theme;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
@@ -656,9 +658,53 @@ impl SshForm {
         cx.notify();
     }
 
+    /// Connection bits for `ssh -L …` from the form fields.
+    fn open_ssh_target(&self) -> (String, String, u16, Option<PathBuf>) {
+        let user = self.user.text.trim().to_string();
+        let host = self.host.text.trim().to_string();
+        let port = self
+            .port
+            .text
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(22);
+        let identity = if self.use_private_key {
+            let p = self.key_path.text.trim();
+            if p.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(p))
+            }
+        } else {
+            None
+        };
+        (user, host, port, identity)
+    }
+
+    fn copy_open_ssh_for_rules(&self, rules: &[&PortForwardRule], cx: &mut Context<Self>) {
+        if rules.is_empty() {
+            return;
+        }
+        let (user, host, port, identity) = self.open_ssh_target();
+        if host.is_empty() {
+            return;
+        }
+        let flags: Vec<String> = rules.iter().map(|r| r.open_ssh_flag()).collect();
+        let cmd = format_open_ssh_command(
+            &user,
+            &host,
+            port,
+            identity.as_deref(),
+            &flags,
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+    }
+
     fn render_forwards_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.forwards_open;
         let count = self.forwards.len();
+        let can_copy_all = self.forwards.iter().any(|r| r.enabled)
+            && !self.host.text.trim().is_empty();
         div()
             .flex()
             .flex_col()
@@ -688,19 +734,48 @@ impl SshForm {
                     )
                     .child(
                         div()
-                            .id("ssh-forward-add")
-                            .px(px(theme::SPACE_2))
-                            .py(px(2.0))
-                            .rounded(px(theme::RADIUS_SM))
-                            .text_xs()
-                            .text_color(theme::TEXT_MUTED)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                            .child("+ Add")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.begin_add_forward(cx);
-                                cx.stop_propagation();
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .when(can_copy_all, |d| {
+                                d.child(
+                                    div()
+                                        .id("ssh-forward-copy-all")
+                                        .px(px(theme::SPACE_2))
+                                        .py(px(2.0))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                        .child("Copy ssh")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let rules: Vec<&PortForwardRule> = this
+                                                .forwards
+                                                .iter()
+                                                .filter(|r| r.enabled)
+                                                .collect();
+                                            this.copy_open_ssh_for_rules(&rules, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("ssh-forward-add")
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(2.0))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .text_xs()
+                                    .text_color(theme::TEXT_MUTED)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                    .child("+ Add")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.begin_add_forward(cx);
+                                        cx.stop_propagation();
+                                    })),
+                            ),
                     ),
             )
             .when(open, |d| {
@@ -708,7 +783,9 @@ impl SshForm {
                     div()
                         .text_xs()
                         .text_color(theme::TEXT_DISABLED)
-                        .child("Enabled rules listen after Connect. Use localhost:<port> locally."),
+                        .child(
+                            "Enabled rules listen after Connect. Copy ssh pastes OpenSSH -L for another terminal.",
+                        ),
                 )
                 .children(self.forwards.iter().map(|rule| {
                     let id = rule.id;
@@ -750,6 +827,22 @@ impl SshForm {
                                 .text_color(theme::TEXT)
                                 .overflow_hidden()
                                 .child(line),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ssh-fwd-copy-{id}")))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .child("Copy")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(rule) =
+                                        this.forwards.iter().find(|f| f.id == id)
+                                    {
+                                        this.copy_open_ssh_for_rules(&[rule], cx);
+                                    }
+                                    cx.stop_propagation();
+                                })),
                         )
                         .child(
                             div()
