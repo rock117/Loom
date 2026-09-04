@@ -234,7 +234,8 @@ Port forwarding
 | 显示 | 含义 |
 |------|------|
 | （无） | 无 Listening 且无 Error |
-| `⇄ N` | N 条 Listening |
+| `⇄ bind → target`（有 Name 时带备注） | 仅 1 条 Listening，展开详情 |
+| `⇄ N` | N≥2 条 Listening |
 | `Forward error`（危险色） | 至少一条 Error；点击 → 聚焦 Info 转发区 |
 
 ### 生命周期

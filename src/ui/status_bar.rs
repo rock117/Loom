@@ -236,6 +236,32 @@ impl Render for StatusBar {
             let fwd_denied = fwd_snap
                 .as_ref()
                 .is_some_and(|s| s.forwarding_denied);
+            let fwd_label = match fwd_snap.as_ref() {
+                Some(snap) if fwd_listening == 1 => snap
+                    .rows
+                    .iter()
+                    .find(|r| r.status.is_listening())
+                    .map(|r| {
+                        let endpoints = format!(
+                            "{}:{} → {}:{}",
+                            r.bind_host, r.bind_port, r.target_host, r.target_port
+                        );
+                        let name = r.name.trim();
+                        if name.is_empty() {
+                            format!("⇄ {endpoints}")
+                        } else {
+                            format!("⇄ {name} · {endpoints}")
+                        }
+                    })
+                    .unwrap_or_else(|| format!("⇄ {fwd_listening}")),
+                _ if fwd_listening > 0 => format!("⇄ {fwd_listening}"),
+                _ => String::new(),
+            };
+            let fwd_tooltip = if fwd_listening == 1 {
+                "Port forward — open Info"
+            } else {
+                "Port forwards — open Info"
+            };
 
             let (cols, rows) = pane
                 .and_then(|p| p.terminal.as_ref())
@@ -309,7 +335,7 @@ impl Render for StatusBar {
                     d.child(Self::segment(
                         "sb-fwd",
                         cx,
-                        "Port forwards — open Info",
+                        fwd_tooltip,
                         None,
                         |_, _, cx| {
                             cx.emit(StatusBarEvent::FocusPortForwards);
@@ -322,7 +348,8 @@ impl Render for StatusBar {
                                 div()
                                     .text_xs()
                                     .text_color(theme::TEXT_MUTED)
-                                    .child(format!("⇄ {fwd_listening}")),
+                                    .whitespace_nowrap()
+                                    .child(fwd_label),
                             ),
                     ))
                 })
