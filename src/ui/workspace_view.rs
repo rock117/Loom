@@ -294,8 +294,8 @@ impl WorkspaceView {
             &context_panel,
             window,
             |this, _, event, _window, cx| match event {
-                ContextPanelEvent::None => {
-                    let _ = cx;
+                ContextPanelEvent::Toast(msg) => {
+                    this.set_toast(msg.clone(), cx);
                 }
             },
         ));

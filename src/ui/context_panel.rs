@@ -16,6 +16,7 @@ use crate::session::sftp::{
     parent_remote, transfer_cancel_flag,
 };
 use crate::shared::theme;
+use crate::ui::file_icon;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::tab_manager::TabManager;
 use crate::ui::tooltip::Tooltip;
@@ -88,6 +89,8 @@ struct TransferRow {
     /// Local path for Reveal (download destination or upload source).
     local_path: Option<PathBuf>,
     is_dir: bool,
+    /// After a successful download, open with the OS default app (non-blocking).
+    open_after: bool,
     /// When the SFTP transfer actually started (after file dialogs).
     started_at: Option<std::time::Instant>,
     /// Set when the transfer finishes or fails.
@@ -126,6 +129,10 @@ enum FilesPrompt {
         path: String,
         is_dir: bool,
         name: String,
+    },
+    /// Remote file: confirm download-to-temp then open with default app.
+    ConfirmOpenRemote {
+        entry: RemoteEntry,
     },
 }
 
@@ -183,9 +190,7 @@ pub struct ContextPanel {
 
 #[derive(Clone, Debug)]
 pub enum ContextPanelEvent {
-    /// Reserved for future actions (kept for subscribe wiring).
-    #[allow(dead_code)]
-    None,
+    Toast(SharedString),
 }
 
 impl ContextPanel {
@@ -565,9 +570,37 @@ impl ContextPanel {
             return;
         }
         match self.files_kind {
-            Some(FilesKind::Sftp) => self.download_entry(entry, cx),
+            Some(FilesKind::Sftp) => self.begin_open_remote(entry, cx),
             Some(FilesKind::Local) => {
-                let _ = platform::reveal_in_file_manager(Path::new(&entry.path));
+                platform::open_path_detached(PathBuf::from(entry.path));
+            }
+            None => {}
+        }
+    }
+
+    fn begin_open_remote(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
+        if entry.is_dir {
+            return;
+        }
+        self.prompt = Some(FilesPrompt::ConfirmOpenRemote { entry });
+        cx.notify();
+    }
+
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() else {
+            return;
+        };
+        if entry.is_dir {
+            self.load_dir(entry.path, cx);
+            return;
+        }
+        match self.files_kind {
+            Some(FilesKind::Sftp) => self.begin_open_remote(entry, cx),
+            Some(FilesKind::Local) => {
+                platform::open_path_detached(PathBuf::from(entry.path));
             }
             None => {}
         }
@@ -583,15 +616,22 @@ impl ContextPanel {
         let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() else {
             return;
         };
-        self.download_entry(entry, cx);
+        self.download_entry(entry, false, cx);
     }
 
-    fn download_entry(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
+    /// Download a remote entry. When `open_after`, skip the save dialog, write under
+    /// a temp folder, and open with the OS default app when the transfer completes.
+    fn download_entry(&mut self, entry: RemoteEntry, open_after: bool, cx: &mut Context<Self>) {
         let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
         };
+        if open_after && entry.is_dir {
+            self.error = Some("Cannot open a remote folder this way".into());
+            cx.notify();
+            return;
+        }
         let remote = entry.path.clone();
         let name = entry.name.clone();
         let is_dir = entry.is_dir;
@@ -607,6 +647,7 @@ impl ContextPanel {
                 status: TransferStatus::Queued,
                 local_path: None,
                 is_dir,
+                open_after,
                 started_at: None,
                 elapsed: None,
                 bytes_done: 0,
@@ -614,10 +655,27 @@ impl ContextPanel {
                 cancel: cancel.clone(),
             },
         );
+        if open_after {
+            cx.emit(ContextPanelEvent::Toast(
+                format!("Downloading “{name}” — opens when ready").into(),
+            ));
+        }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let local = if is_dir {
+            let local = if open_after {
+                match open_cache_path(&name) {
+                    Ok(p) => Some(p),
+                    Err(err) => {
+                        this.update(cx, |this, cx| {
+                            this.fail_transfer(id, format!("Temp folder: {err:#}"));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+            } else if is_dir {
                 rfd::AsyncFileDialog::new()
                     .set_title("Download folder to…")
                     .pick_folder()
@@ -819,6 +877,7 @@ impl ContextPanel {
                 status: TransferStatus::Queued,
                 local_path: Some(local.clone()),
                 is_dir,
+                open_after: false,
                 started_at: None,
                 elapsed: None,
                 bytes_done: 0,
@@ -934,6 +993,7 @@ impl ContextPanel {
     }
 
     fn finish_transfer(&mut self, id: Uuid, files: Option<u32>, bytes: Option<u64>) {
+        let mut open_path: Option<PathBuf> = None;
         if let Some(row) = self.find_transfer_mut(id) {
             let files = files.or_else(|| match &row.status {
                 TransferStatus::Running { files_done, .. } if row.is_dir => *files_done,
@@ -950,7 +1010,13 @@ impl ContextPanel {
                     .map(|t| t.elapsed())
                     .unwrap_or_default(),
             );
+            if row.open_after {
+                open_path = row.local_path.clone();
+            }
             row.status = TransferStatus::Done { files };
+        }
+        if let Some(path) = open_path {
+            platform::open_path_detached(path);
         }
     }
 
@@ -1617,6 +1683,9 @@ impl ContextPanel {
             } => {
                 self.run_remove(path, is_dir, cx);
             }
+            FilesPrompt::ConfirmOpenRemote { entry } => {
+                self.download_entry(entry, true, cx);
+            }
         }
     }
 
@@ -1874,6 +1943,7 @@ impl ContextPanel {
             FilesPrompt::Rename { .. } => "Rename",
             FilesPrompt::Chmod { .. } => "Permissions (octal)",
             FilesPrompt::ConfirmDelete { .. } => "Delete?",
+            FilesPrompt::ConfirmOpenRemote { .. } => "Open remote file?",
         }
     }
 
@@ -1882,7 +1952,7 @@ impl ContextPanel {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit),
-            FilesPrompt::ConfirmDelete { .. } => None,
+            FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. } => None,
         }
     }
 
@@ -1890,7 +1960,10 @@ impl ContextPanel {
         if self.prompt.is_none() {
             return false;
         }
-        if matches!(self.prompt, Some(FilesPrompt::ConfirmDelete { .. })) {
+        if matches!(
+            self.prompt,
+            Some(FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. })
+        ) {
             let key = event.keystroke.key.as_str();
             if key == "escape" {
                 self.cancel_prompt(cx);
@@ -2359,13 +2432,19 @@ impl ContextPanel {
                     format!("Delete “{name}”?")
                 }
             }
+            FilesPrompt::ConfirmOpenRemote { entry } => {
+                format!(
+                    "“{}” will download to a temporary folder, then open with the default app when finished.",
+                    entry.name
+                )
+            }
             _ => String::new(),
         };
         let edit_el = match prompt {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
-            FilesPrompt::ConfirmDelete { .. } => None,
+            FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. } => None,
         };
 
         Some(
@@ -2417,13 +2496,10 @@ impl ContextPanel {
                                 .bg(theme::ACCENT)
                                 .text_color(theme::TEXT)
                                 .cursor_pointer()
-                                .child(if matches!(
-                                    self.prompt,
-                                    Some(FilesPrompt::ConfirmDelete { .. })
-                                ) {
-                                    "Delete"
-                                } else {
-                                    "OK"
+                                .child(match &self.prompt {
+                                    Some(FilesPrompt::ConfirmDelete { .. }) => "Delete",
+                                    Some(FilesPrompt::ConfirmOpenRemote { .. }) => "Download & open",
+                                    _ => "OK",
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
                         )
@@ -2559,7 +2635,7 @@ impl ContextPanel {
                             .children(entries.into_iter().map(|entry| {
                                 let path = entry.path.clone();
                                 let is_sel = selected.as_deref() == Some(path.as_str());
-                                let icon = if entry.is_dir { "📁" } else { "📄" };
+                                let icon = file_icon::entry_icon(&entry.name, entry.is_dir);
                                 let size = if entry.is_dir {
                                     String::new()
                                 } else {
@@ -2584,7 +2660,7 @@ impl ContextPanel {
                                     .cursor_pointer()
                                     .when(is_sel, |d| d.bg(theme::HOVER))
                                     .hover(|s| s.bg(theme::HOVER))
-                                    .child(div().text_xs().flex_shrink_0().child(icon))
+                                    .child(icon)
                                     .child(name_el)
                                     .when(cols.mtime, |d| {
                                         d.child(
@@ -2998,6 +3074,18 @@ impl ContextPanel {
                                     this.entry_menu = None;
                                 },
                             ))
+                            .when(!is_dir, |d| {
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-open",
+                                    "Open",
+                                    true,
+                                    cx,
+                                    |this, _, cx| {
+                                        this.entry_menu = None;
+                                        this.open_selected(cx);
+                                    },
+                                ))
+                            })
                             .child(self.transfer_menu_item(
                                 "file-ctx-new",
                                 "New folder…",
@@ -3628,6 +3716,31 @@ fn column_width(field: SortField) -> f32 {
         SortField::Ext => 44.0,
         SortField::Size => 56.0,
     }
+}
+
+/// Temp path for download-then-open: `%TEMP%/Loom/open/<uuid>/<safe-name>`.
+fn open_cache_path(name: &str) -> std::io::Result<PathBuf> {
+    let safe = name
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' || c == ':' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect::<String>();
+    let safe = if safe.is_empty() {
+        "download".into()
+    } else {
+        safe
+    };
+    let dir = std::env::temp_dir()
+        .join("Loom")
+        .join("open")
+        .join(Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join(safe))
 }
 
 fn entry_extension(name: &str) -> String {

@@ -16,7 +16,22 @@ pub fn native_monospace_font_family() -> &'static str {
 
 pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    std::process::Command::new("open").arg(path.as_os_str()).spawn()?;
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path.as_os_str())
+        .spawn()?;
+    Ok(())
+}
+
+pub fn native_open_path(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    std::process::Command::new("open")
+        .arg(path.as_os_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
     Ok(())
 }
 

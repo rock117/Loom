@@ -53,6 +53,20 @@ pub fn reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     native_reveal_in_file_manager(path)
 }
 
+/// Open a file or directory with the OS default application.
+///
+/// Spawns the handler and returns immediately — must not block the UI thread.
+pub fn open_path(path: &std::path::Path) -> std::io::Result<()> {
+    native_open_path(path)
+}
+
+/// Open a path on a background thread so ShellExecute / `xdg-open` never stalls GPUI.
+pub fn open_path_detached(path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let _ = open_path(&path);
+    });
+}
+
 /// Open a URL with the OS default handler (browser, etc.).
 ///
 /// Refuses empty / oversized / control-character strings and unknown schemes so

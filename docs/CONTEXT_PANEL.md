@@ -31,14 +31,16 @@ Windows-style navigation:
 | Action | Behavior |
 |--------|----------|
 | Double-click folder | Enter directory |
-| Double-click file | **SSH:** download (save dialog). **Local:** Reveal in File Explorer |
+| Double-click file | **Local:** open with OS default app (non-blocking). **SSH:** confirm → download to temp → open when finished (Transfers footer + toast; UI stays responsive) |
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
 | Toolbar Upload (SSH) | Pick local **file** → upload into **current** remote dir |
 | Toolbar Upload folder (SSH) | Pick local **folder** → recursive upload (`upload_tree`) |
 | Drag-drop (SSH) | Drop files/folders from OS onto the file list → upload into current remote dir |
-| ↓ button (SSH) | Download selected (file or recursive folder) |
+| ↓ button (SSH) | Download selected (file or recursive folder) via save dialog |
+
+File rows use **type-specific SVG icons** tinted with Seti colors (VS Code built-in Explorer palette): folders, git, Rust hexagon, Python, Markdown `M↓`, JSON braces, shell green, etc.
 
 Path bar shows current cwd (`/home/user/...` or `C:\Users\...`).
 
@@ -48,12 +50,13 @@ Right-click an entry (or use prompts from the menu):
 
 | Action | Notes |
 |--------|--------|
+| Open | Same as double-click (remote confirms download-then-open) |
 | New folder | Name prompt |
 | Rename | Name prompt |
 | Permissions… | Octal mode (e.g. `755`). Local on Windows approximates via readonly bit |
 | Delete… | Confirm; directories removed recursively |
 | Reveal (Local) | File Explorer |
-| Download (SSH file) | Same as toolbar download |
+| Download (SSH file) | Save dialog (does not auto-open) |
 
 ### Transfers footer
 
@@ -104,7 +107,8 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 | SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
-| UI | `src/ui/context_panel.rs` |
+| UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs` |
+| Open path | `src/platform.rs` (`open_path` / `open_path_detached`) |
 | Pane handle | `PaneSession.ssh_sftp` |
 
 ## Stack
