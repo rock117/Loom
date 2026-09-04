@@ -395,7 +395,17 @@ impl TabManager {
             anyhow::bail!("not a local profile");
         };
         let configured = shell.as_deref().or(default_shell);
-        let shell = resolve_shell(configured);
+        let resolved = resolve_shell(configured);
+        let shell = resolved.path;
+        if let Some(bad) = resolved.invalid_configured.as_ref() {
+            AppBus::emit(
+                &self.app_bus,
+                AppBusEvent::Toast(
+                    format!("Shell \"{bad}\" not found — opened default instead").into(),
+                ),
+                cx,
+            );
+        }
         let (proxy_mode, proxy_url, proxy_no) = {
             let s = store.read(cx);
             (

@@ -24,6 +24,8 @@ pub enum AppBusEvent {
     },
     /// Duplicate the active tab (from terminal context menu).
     DuplicateActiveTab,
+    /// Brief status-bar toast (e.g. invalid shell fallback).
+    Toast(SharedString),
 }
 
 /// Empty emitter entity for [`AppBusEvent`].

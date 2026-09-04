@@ -218,6 +218,4 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 /// Resolve default shell executable for this platform.
-pub fn resolve_shell(configured: Option<&str>) -> String {
-    platform::resolve_shell(configured)
-}
+pub use platform::{ResolvedShell, resolve_shell};

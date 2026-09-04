@@ -41,6 +41,7 @@ impl Persistence {
                 }
                 AppBusEvent::SplitPane { .. } => {}
                 AppBusEvent::DuplicateActiveTab => {}
+                AppBusEvent::Toast(_) => {}
             }
         });
 

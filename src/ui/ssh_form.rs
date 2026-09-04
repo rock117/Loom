@@ -867,10 +867,19 @@ impl SshForm {
                         .child(
                             div()
                                 .id(SharedString::from(format!("ssh-fwd-en-{id}")))
+                                .w(px(14.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
                                 .text_xs()
-                                .text_color(theme::TEXT)
+                                .text_color(if enabled {
+                                    theme::ACCENT
+                                } else {
+                                    theme::TEXT_MUTED
+                                })
                                 .cursor_pointer()
-                                .child(if enabled { "☑" } else { "☐" })
+                                .child(if enabled { "☑\u{FE0E}" } else { "☐\u{FE0E}" })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(r) = this.forwards.iter_mut().find(|f| f.id == id) {
                                         r.enabled = !r.enabled;
@@ -883,68 +892,76 @@ impl SshForm {
                             div()
                                 .flex_1()
                                 .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
                                 .text_xs()
                                 .text_color(theme::TEXT)
-                                .overflow_hidden()
                                 .child(line),
                         )
                         .child(
                             div()
-                                .id(SharedString::from(format!("ssh-fwd-copy-{id}")))
-                                .text_xs()
-                                .text_color(if copied {
-                                    theme::SUCCESS
-                                } else {
-                                    theme::TEXT_MUTED
-                                })
-                                .cursor_pointer()
-                                .child(if copied { "Copied" } else { "Copy" })
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let Some(rule) =
-                                        this.forwards.iter().find(|f| f.id == id).cloned()
-                                    else {
-                                        return;
-                                    };
-                                    this.copy_open_ssh_for_rules(
-                                        &[&rule],
-                                        FwdCopyFlash::Rule(id),
-                                        cx,
-                                    );
-                                    cx.stop_propagation();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("ssh-fwd-edit-{id}")))
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .cursor_pointer()
-                                .child("Edit")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.begin_edit_forward(id, cx);
-                                    cx.stop_propagation();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("ssh-fwd-del-{id}")))
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
-                                .cursor_pointer()
-                                .child("Del")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.forwards.retain(|f| f.id != id);
-                                    if this
-                                        .forward_edit
-                                        .as_ref()
-                                        .and_then(|e| e.id)
-                                        == Some(id)
-                                    {
-                                        this.forward_edit = None;
-                                    }
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                })),
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACE_1))
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ssh-fwd-copy-{id}")))
+                                        .text_xs()
+                                        .text_color(if copied {
+                                            theme::SUCCESS
+                                        } else {
+                                            theme::TEXT_MUTED
+                                        })
+                                        .cursor_pointer()
+                                        .child(if copied { "Copied" } else { "Copy" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let Some(rule) =
+                                                this.forwards.iter().find(|f| f.id == id).cloned()
+                                            else {
+                                                return;
+                                            };
+                                            this.copy_open_ssh_for_rules(
+                                                &[&rule],
+                                                FwdCopyFlash::Rule(id),
+                                                cx,
+                                            );
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ssh-fwd-edit-{id}")))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .child("Edit")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.begin_edit_forward(id, cx);
+                                            cx.stop_propagation();
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("ssh-fwd-del-{id}")))
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .child("Del")
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.forwards.retain(|f| f.id != id);
+                                            if this
+                                                .forward_edit
+                                                .as_ref()
+                                                .and_then(|e| e.id)
+                                                == Some(id)
+                                            {
+                                                this.forward_edit = None;
+                                            }
+                                            cx.notify();
+                                            cx.stop_propagation();
+                                        })),
+                                ),
                         )
                 }))
                 .when_some(self.forward_edit.as_ref(), |d, edit| {

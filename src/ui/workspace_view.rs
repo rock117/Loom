@@ -143,6 +143,9 @@ impl WorkspaceView {
                     });
                     this.persist_tabs(cx);
                 }
+                AppBusEvent::Toast(msg) => {
+                    this.set_toast(msg.clone(), cx);
+                }
                 _ => {}
             },
         ));

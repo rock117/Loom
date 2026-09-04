@@ -38,14 +38,46 @@ pub fn monospace_font_family() -> &'static str {
     native_monospace_font_family()
 }
 
+/// Result of resolving a configured shell to a runnable path/name.
+#[derive(Debug, Clone)]
+pub struct ResolvedShell {
+    pub path: String,
+    /// Non-empty configured value that was rejected; [`path`](Self::path) is the fallback.
+    pub invalid_configured: Option<String>,
+}
+
 /// Resolve a configured shell or fall back to [`default_shell`].
-pub fn resolve_shell(configured: Option<&str>) -> String {
-    if let Some(shell) = configured {
-        if !shell.is_empty() {
-            return shell.to_string();
+///
+/// Invalid / missing configured values (typos like `sss`) fall back so Local
+/// sessions still start. Callers should surface [`ResolvedShell::invalid_configured`].
+pub fn resolve_shell(configured: Option<&str>) -> ResolvedShell {
+    if let Some(shell) = configured.map(str::trim).filter(|s| !s.is_empty()) {
+        if shell_is_runnable(shell) {
+            return ResolvedShell {
+                path: shell.to_string(),
+                invalid_configured: None,
+            };
         }
+        eprintln!(
+            "loom: configured shell `{shell}` not found; using platform default"
+        );
+        return ResolvedShell {
+            path: default_shell(),
+            invalid_configured: Some(shell.to_string()),
+        };
     }
-    default_shell()
+    ResolvedShell {
+        path: default_shell(),
+        invalid_configured: None,
+    }
+}
+
+fn shell_is_runnable(shell: &str) -> bool {
+    let path = PathBuf::from(shell);
+    if path.is_file() {
+        return true;
+    }
+    which::which(shell).is_ok() || which::which_global(shell).is_ok()
 }
 
 /// Reveal a file or directory in the OS file manager (Explorer / Finder / file manager).

@@ -23,8 +23,8 @@
 TabManager::spawn_local
   → session::local::resolve_shell(configured)
     → platform::resolve_shell(configured)
-      → 有配置且非空 → 原样返回
-      → 否则 → platform::native_default_shell()
+      → 有配置且非空，且路径存在 / 能在 PATH 找到 → 使用该值
+      → 否则（含无效值如笔误）→ platform::native_default_shell()，并 Toast 提示后仍打开会话
 ```
 
 Local PTY spawn 使用解析后的路径/名称；集成终端里的 shell **应当** 有窗口（ConPTY / openpty），与后台 helper 不同。
