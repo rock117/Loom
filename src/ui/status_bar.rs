@@ -15,6 +15,7 @@ pub struct StatusBar {
     pub store: Entity<WorkspaceStore>,
     pub tabs: Entity<TabManager>,
     toast: Option<SharedString>,
+    _toast_clear: Option<Task<()>>,
     _observe_store: Subscription,
     _observe_tabs: Subscription,
     _observe_terminal: Option<Subscription>,
@@ -49,6 +50,7 @@ impl StatusBar {
             store,
             tabs,
             toast: None,
+            _toast_clear: None,
             _observe_store,
             _observe_tabs,
             _observe_terminal: None,
@@ -74,11 +76,23 @@ impl StatusBar {
 
     pub fn set_toast(&mut self, msg: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.toast = Some(msg.into());
+        self._toast_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(2500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.toast = None;
+                this._toast_clear = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
     pub fn clear_toast(&mut self, cx: &mut Context<Self>) {
         self.toast = None;
+        self._toast_clear = None;
         cx.notify();
     }
 
@@ -418,7 +432,8 @@ impl Render for StatusBar {
                                 .id("sb-toast")
                                 .px(px(theme::SPACE_2))
                                 .text_xs()
-                                .text_color(theme::TEXT_MUTED)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::SUCCESS)
                                 .cursor_pointer()
                                 .hover(|s| s.text_color(theme::TEXT))
                                 .child(msg)

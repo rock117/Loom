@@ -23,6 +23,13 @@ pub enum SshFormEvent {
         /// Present when password was not saved to the keyring (one-shot connect).
         oneshot_password: Option<String>,
     },
+    Toast(SharedString),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FwdCopyFlash {
+    All,
+    Rule(Uuid),
 }
 
 pub struct SshForm {
@@ -45,6 +52,9 @@ pub struct SshForm {
     forwards_open: bool,
     /// Inline editor for add/edit (`None` = list only).
     forward_edit: Option<ForwardEditState>,
+    /// Brief "Copied" label flash after clipboard write.
+    fwd_copy_flash: Option<FwdCopyFlash>,
+    _fwd_copy_flash_task: Option<Task<()>>,
     error: Option<String>,
     field: Field,
     /// Mouse-drag text selection in the active field.
@@ -103,6 +113,8 @@ impl SshForm {
             forwards: Vec::new(),
             forwards_open: false,
             forward_edit: None,
+            fwd_copy_flash: None,
+            _fwd_copy_flash_task: None,
             error: None,
             field: Field::Host,
             selecting: false,
@@ -128,6 +140,8 @@ impl SshForm {
         self.forwards.clear();
         self.forwards_open = false;
         self.forward_edit = None;
+        self.fwd_copy_flash = None;
+        self._fwd_copy_flash_task = None;
         self.error = None;
         self.field = Field::Host;
         self.selecting = false;
@@ -681,12 +695,18 @@ impl SshForm {
         (user, host, port, identity)
     }
 
-    fn copy_open_ssh_for_rules(&self, rules: &[&PortForwardRule], cx: &mut Context<Self>) {
+    fn copy_open_ssh_for_rules(
+        &mut self,
+        rules: &[&PortForwardRule],
+        flash: FwdCopyFlash,
+        cx: &mut Context<Self>,
+    ) {
         if rules.is_empty() {
             return;
         }
         let (user, host, port, identity) = self.open_ssh_target();
         if host.is_empty() {
+            cx.emit(SshFormEvent::Toast("Set Host before copying".into()));
             return;
         }
         let flags: Vec<String> = rules.iter().map(|r| r.open_ssh_flag()).collect();
@@ -698,6 +718,20 @@ impl SshForm {
             &flags,
         );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+        self.fwd_copy_flash = Some(flash);
+        self._fwd_copy_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.fwd_copy_flash = None;
+                this._fwd_copy_flash_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.emit(SshFormEvent::Toast("Copied ssh command".into()));
+        cx.notify();
     }
 
     fn render_forwards_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -705,6 +739,16 @@ impl SshForm {
         let count = self.forwards.len();
         let can_copy_all = self.forwards.iter().any(|r| r.enabled)
             && !self.host.text.trim().is_empty();
+        let copy_all_label = if self.fwd_copy_flash == Some(FwdCopyFlash::All) {
+            "Copied"
+        } else {
+            "Copy ssh"
+        };
+        let copy_all_color = if self.fwd_copy_flash == Some(FwdCopyFlash::All) {
+            theme::SUCCESS
+        } else {
+            theme::TEXT_MUTED
+        };
         div()
             .flex()
             .flex_col()
@@ -745,17 +789,24 @@ impl SshForm {
                                         .py(px(2.0))
                                         .rounded(px(theme::RADIUS_SM))
                                         .text_xs()
-                                        .text_color(theme::TEXT_MUTED)
+                                        .text_color(copy_all_color)
                                         .cursor_pointer()
                                         .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                                        .child("Copy ssh")
+                                        .child(copy_all_label)
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            let rules: Vec<&PortForwardRule> = this
+                                            let rules: Vec<PortForwardRule> = this
                                                 .forwards
                                                 .iter()
                                                 .filter(|r| r.enabled)
+                                                .cloned()
                                                 .collect();
-                                            this.copy_open_ssh_for_rules(&rules, cx);
+                                            let refs: Vec<&PortForwardRule> =
+                                                rules.iter().collect();
+                                            this.copy_open_ssh_for_rules(
+                                                &refs,
+                                                FwdCopyFlash::All,
+                                                cx,
+                                            );
                                             cx.stop_propagation();
                                         })),
                                 )
@@ -790,6 +841,7 @@ impl SshForm {
                 .children(self.forwards.iter().map(|rule| {
                     let id = rule.id;
                     let enabled = rule.enabled;
+                    let copied = self.fwd_copy_flash == Some(FwdCopyFlash::Rule(id));
                     let line = if rule.name.trim().is_empty() {
                         format!("Local  {}", rule.endpoint_line())
                     } else {
@@ -832,15 +884,24 @@ impl SshForm {
                             div()
                                 .id(SharedString::from(format!("ssh-fwd-copy-{id}")))
                                 .text_xs()
-                                .text_color(theme::TEXT_MUTED)
+                                .text_color(if copied {
+                                    theme::SUCCESS
+                                } else {
+                                    theme::TEXT_MUTED
+                                })
                                 .cursor_pointer()
-                                .child("Copy")
+                                .child(if copied { "Copied" } else { "Copy" })
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(rule) =
-                                        this.forwards.iter().find(|f| f.id == id)
-                                    {
-                                        this.copy_open_ssh_for_rules(&[rule], cx);
-                                    }
+                                    let Some(rule) =
+                                        this.forwards.iter().find(|f| f.id == id).cloned()
+                                    else {
+                                        return;
+                                    };
+                                    this.copy_open_ssh_for_rules(
+                                        &[&rule],
+                                        FwdCopyFlash::Rule(id),
+                                        cx,
+                                    );
                                     cx.stop_propagation();
                                 })),
                         )

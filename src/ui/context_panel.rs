@@ -158,6 +158,12 @@ enum TempForwardField {
     Name,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FwdCopyFlash {
+    All,
+    Rule(Uuid),
+}
+
 pub struct ContextPanel {
     store: Entity<WorkspaceStore>,
     tabs: Entity<TabManager>,
@@ -206,6 +212,9 @@ pub struct ContextPanel {
     host_info_error: Option<String>,
     /// Inline Temporary Local forward form on the Info tab.
     forward_temp: Option<ForwardTempEdit>,
+    /// Brief "Copied" label flash after clipboard write.
+    fwd_copy_flash: Option<FwdCopyFlash>,
+    _fwd_copy_flash_task: Option<Task<()>>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
     list_ratio: f32,
     files_body_bounds: Option<Bounds<Pixels>>,
@@ -271,6 +280,8 @@ impl ContextPanel {
             host_info_loading: false,
             host_info_error: None,
             forward_temp: None,
+            fwd_copy_flash: None,
+            _fwd_copy_flash_task: None,
             list_ratio,
             files_body_bounds: None,
             files_sash_drag: false,
@@ -4263,6 +4274,7 @@ impl ContextPanel {
             .is_some_and(|p| !p.kind.is_local());
         let connecting = matches!(state, ConnectionState::Connecting);
         let connected = matches!(state, ConnectionState::Connected);
+        let copy_all_flash = self.fwd_copy_flash == Some(FwdCopyFlash::All);
 
         div()
             .flex()
@@ -4300,12 +4312,20 @@ impl ContextPanel {
                                             .py(px(2.0))
                                             .rounded(px(theme::RADIUS_SM))
                                             .text_xs()
-                                            .text_color(theme::TEXT_MUTED)
+                                            .text_color(if copy_all_flash {
+                                                theme::SUCCESS
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
                                             .cursor_pointer()
                                             .hover(|s| {
                                                 s.bg(theme::HOVER).text_color(theme::TEXT)
                                             })
-                                            .child("Copy ssh")
+                                            .child(if copy_all_flash {
+                                                "Copied"
+                                            } else {
+                                                "Copy ssh"
+                                            })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.copy_open_ssh_forwards(None, cx);
                                             })),
@@ -4406,6 +4426,7 @@ impl ContextPanel {
                         let dial = row.last_dial_error.clone();
                         let listening = row.status.is_listening();
                         let is_err = row.status.is_error();
+                        let copied = self.fwd_copy_flash == Some(FwdCopyFlash::Rule(id));
                         div()
                             .id(SharedString::from(format!("ctx-fwd-{id}")))
                             .flex()
@@ -4459,9 +4480,13 @@ impl ContextPanel {
                                         div()
                                             .id(SharedString::from(format!("ctx-fwd-copy-{id}")))
                                             .text_xs()
-                                            .text_color(theme::TEXT_MUTED)
+                                            .text_color(if copied {
+                                                theme::SUCCESS
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
                                             .cursor_pointer()
-                                            .child("Copy")
+                                            .child(if copied { "Copied" } else { "Copy" })
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.copy_open_ssh_forwards(Some(id), cx);
                                             })),
@@ -4596,7 +4621,24 @@ impl ContextPanel {
             &flags,
         );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
+        let flash = match only_id {
+            Some(id) => FwdCopyFlash::Rule(id),
+            None => FwdCopyFlash::All,
+        };
+        self.fwd_copy_flash = Some(flash);
+        self._fwd_copy_flash_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1500))
+                .await;
+            this.update(cx, |this, cx| {
+                this.fwd_copy_flash = None;
+                this._fwd_copy_flash_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.emit(ContextPanelEvent::Toast("Copied ssh command".into()));
+        cx.notify();
     }
 
     fn focused_ssh_open_ssh_target(

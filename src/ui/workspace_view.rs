@@ -195,6 +195,9 @@ impl WorkspaceView {
                     }
                     cx.notify();
                 }
+                SshFormEvent::Toast(msg) => {
+                    this.set_toast(msg.clone(), cx);
+                }
             },
         ));
 
