@@ -7,7 +7,7 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::{ConnectionState, ProfileKind, SshAuth, format_open_ssh_command};
+use crate::model::{ConnectionState, ProfileKind, SshAuth, format_open_ssh_command, suggest_free_bind_port};
 use crate::platform;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
@@ -4523,12 +4523,28 @@ impl ContextPanel {
     }
 
     fn begin_temporary_forward(&mut self, cx: &mut Context<Self>) {
+        let avoid: Vec<u16> = self
+            .focused_forwards(cx)
+            .map(|(_, handle, _)| {
+                handle
+                    .snapshot()
+                    .rows
+                    .into_iter()
+                    .map(|r| r.bind_port)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let suggested = suggest_free_bind_port("127.0.0.1", &avoid);
+        let (bind_port, focus) = match suggested {
+            Some(p) => (RenameEdit::new(p.to_string()), TempForwardField::TargetPort),
+            None => (RenameEdit::new(""), TempForwardField::BindPort),
+        };
         self.forward_temp = Some(ForwardTempEdit {
-            bind_port: RenameEdit::new(""),
+            bind_port,
             target_host: RenameEdit::new("127.0.0.1"),
             target_port: RenameEdit::new(""),
             name: RenameEdit::new(""),
-            focus: TempForwardField::BindPort,
+            focus,
         });
         self.start_prompt_caret_blink(cx);
         cx.notify();

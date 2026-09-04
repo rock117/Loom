@@ -8,6 +8,7 @@ pub mod workspace;
 
 pub use forward::{
     PortForwardKind, PortForwardRule, format_open_ssh_command, open_ssh_forward_flag,
+    suggest_free_bind_port,
 };
 pub use persist::{
     export_workspace_to, import_workspace_from, load_settings, load_snippets, load_ui_state,

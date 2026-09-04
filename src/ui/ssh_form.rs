@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::model::{
     PortForwardRule, Profile, ProfileKind, SshAuth, format_open_ssh_command,
+    suggest_free_bind_port,
 };
 use crate::session::credentials;
 use crate::shared::theme;
@@ -584,15 +585,22 @@ impl SshForm {
 
     fn begin_add_forward(&mut self, cx: &mut Context<Self>) {
         self.forwards_open = true;
+        let bind_host = "127.0.0.1";
+        let avoid: Vec<u16> = self.forwards.iter().map(|f| f.bind_port).collect();
+        let suggested = suggest_free_bind_port(bind_host, &avoid);
+        let (bind_port, focus) = match suggested {
+            Some(p) => (field_edit(p.to_string()), ForwardEditField::TargetPort),
+            None => (field_edit(""), ForwardEditField::BindPort),
+        };
         self.forward_edit = Some(ForwardEditState {
             id: None,
             name: field_edit(""),
-            bind_host: field_edit("127.0.0.1"),
-            bind_port: field_edit(""),
+            bind_host: field_edit(bind_host),
+            bind_port,
             target_host: field_edit("127.0.0.1"),
             target_port: field_edit(""),
             enabled: true,
-            focus: ForwardEditField::BindPort,
+            focus,
         });
         cx.notify();
     }

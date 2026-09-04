@@ -95,6 +95,29 @@ impl PortForwardRule {
     }
 }
 
+/// Suggest a free local TCP listen port on `bind_host` (OS assigns via port `0`).
+///
+/// Skips ports in `avoid` (e.g. other rules on the same profile). There is a small
+/// race until the forward actually binds; retries reduce collision odds.
+pub fn suggest_free_bind_port(bind_host: &str, avoid: &[u16]) -> Option<u16> {
+    let host = bind_host.trim();
+    let host = if host.is_empty() { "127.0.0.1" } else { host };
+    for _ in 0..24 {
+        let Ok(listener) = std::net::TcpListener::bind((host, 0)) else {
+            continue;
+        };
+        let Ok(addr) = listener.local_addr() else {
+            continue;
+        };
+        let port = addr.port();
+        drop(listener);
+        if port != 0 && !avoid.contains(&port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// OpenSSH `-L` / `-R` / `-D` flag for one forward.
 pub fn open_ssh_forward_flag(
     kind: PortForwardKind,

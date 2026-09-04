@@ -201,7 +201,7 @@ Port forwarding                          [+ Add]
 | 字段 | 说明 |
 |------|------|
 | Type | MVP 仅 Local；Remote / SOCKS 二期再露出 |
-| Listen | host + port（host 默认 `127.0.0.1`） |
+| Listen | host + port（host 默认 `127.0.0.1`；新增时 Listen port 由 OS 分配空闲端口预填，可改） |
 | Target | host + port（经 SSH 可达；`127.0.0.1:5432` = **远端本机**服务） |
 | Name | 可选备注，如 `Postgres` |
 
