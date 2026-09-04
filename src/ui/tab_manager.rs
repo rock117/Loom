@@ -34,6 +34,8 @@ pub struct PaneSession {
     pub ssh_shutdown: Option<flume::Sender<()>>,
     /// Same-session SFTP handle (SSH panes only).
     pub ssh_sftp: Option<crate::session::sftp::SftpHandle>,
+    /// Same-session Local port forwards (SSH panes only).
+    pub ssh_forwards: Option<crate::session::forward::ForwardHandle>,
     _term_subscriptions: Vec<Subscription>,
 }
 
@@ -197,6 +199,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_forwards: None,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
@@ -233,6 +236,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_forwards: None,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
@@ -253,7 +257,21 @@ impl TabManager {
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
-        self.spawn_ssh_connect_kind(tab_id, pane_id, &profile.kind, auth, font_family, cx);
+        let auto_forwards: Vec<_> = profile
+            .forwards
+            .iter()
+            .filter(|f| f.enabled)
+            .cloned()
+            .collect();
+        self.spawn_ssh_connect_kind(
+            tab_id,
+            pane_id,
+            &profile.kind,
+            auth,
+            auto_forwards,
+            font_family,
+            cx,
+        );
     }
 
     fn spawn_ssh_connect_kind(
@@ -262,6 +280,7 @@ impl TabManager {
         pane_id: Uuid,
         kind: &ProfileKind,
         auth: SshAuthMaterial,
+        auto_forwards: Vec<crate::model::PortForwardRule>,
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
@@ -320,8 +339,28 @@ impl TabManager {
                         pane._term_subscriptions = term_subs;
                         pane.ssh_shutdown = Some(handles.shutdown);
                         pane.ssh_sftp = Some(handles.sftp);
+                        let forwards = handles.forwards;
+                        for rule in &auto_forwards {
+                            if let Err(err) = forwards.start(rule.clone(), false) {
+                                eprintln!(
+                                    "loom: start forward {}:{}: {err:#}",
+                                    rule.bind_host, rule.bind_port
+                                );
+                            }
+                        }
+                        let changes = forwards.changes.clone();
+                        pane.ssh_forwards = Some(forwards);
                         pane.state = ConnectionState::Connected;
                         pane.status_message = format!("ssh · {label}");
+                        // Refresh UI when forward status changes (Error / dial hint).
+                        cx.spawn(async move |this, cx| {
+                            while changes.recv_async().await.is_ok() {
+                                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                                    break;
+                                }
+                            }
+                        })
+                        .detach();
                     }
                     Ok(Err(err)) => {
                         pane.state = ConnectionState::Failed;
@@ -427,6 +466,7 @@ impl TabManager {
             pty_killer: Some(killer),
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_forwards: None,
             _term_subscriptions: term_subs,
         })
     }
@@ -517,6 +557,7 @@ impl TabManager {
                     id: auth_profile_id.unwrap_or_else(Uuid::nil),
                     name: label.clone(),
                     kind: kind.clone(),
+                    forwards: Vec::new(),
                 };
                 match resolve_ssh_auth(&pseudo, None) {
                     Ok(Some(auth)) => {
@@ -533,6 +574,7 @@ impl TabManager {
                             pty_killer: None,
                             ssh_shutdown: None,
                             ssh_sftp: None,
+                            ssh_forwards: None,
                             _term_subscriptions: Vec::new(),
                         };
                         let tab = &mut self.tabs[tab_idx];
@@ -546,6 +588,7 @@ impl TabManager {
                             new_id,
                             &kind,
                             auth,
+                            Vec::new(),
                             &font_family,
                             cx,
                         );
@@ -713,10 +756,26 @@ impl TabManager {
                 cx.notify();
             }
             ProfileKind::Ssh { host, port, user, .. } => {
+                let auto_forwards: Vec<_> = profile_id
+                    .and_then(|pid| {
+                        store
+                            .read(cx)
+                            .workspace
+                            .find_profile(pid)
+                            .map(|p| {
+                                p.forwards
+                                    .iter()
+                                    .filter(|f| f.enabled)
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            })
+                    })
+                    .unwrap_or_default();
                 let pseudo = Profile {
                     id: profile_id.unwrap_or_else(Uuid::nil),
                     name: label.clone(),
                     kind: kind.clone(),
+                    forwards: Vec::new(),
                 };
                 match resolve_ssh_auth(&pseudo, password) {
                     Ok(Some(auth)) => {
@@ -732,6 +791,7 @@ impl TabManager {
                             focused,
                             &kind,
                             auth,
+                            auto_forwards,
                             &font_family,
                             cx,
                         );
@@ -769,10 +829,14 @@ impl TabManager {
             ConnectionState::Connecting | ConnectionState::Failed | ConnectionState::Disconnected
         ) {
             // Still drop IO if a late Exit races with reconnect teardown.
-            if pane.ssh_sftp.is_some() || pane.ssh_shutdown.is_some() || pane.pty_master.is_some()
+            if pane.ssh_sftp.is_some()
+                || pane.ssh_forwards.is_some()
+                || pane.ssh_shutdown.is_some()
+                || pane.pty_master.is_some()
             {
                 let master = pane.pty_master.take();
                 let killer = pane.pty_killer.take();
+                drop(pane.ssh_forwards.take());
                 drop(pane.ssh_sftp.take());
                 if let Some(tx) = pane.ssh_shutdown.take() {
                     let _ = tx.send(());
@@ -786,6 +850,7 @@ impl TabManager {
         pane.status_message = "disconnected — use Reconnect in the status bar".into();
         let master = pane.pty_master.take();
         let killer = pane.pty_killer.take();
+        drop(pane.ssh_forwards.take());
         drop(pane.ssh_sftp.take());
         if let Some(tx) = pane.ssh_shutdown.take() {
             let _ = tx.send(());
@@ -1275,6 +1340,7 @@ impl TabManager {
                     id: auth_pid.unwrap_or_else(Uuid::nil),
                     name: label.clone(),
                     kind: kind.clone(),
+                    forwards: Vec::new(),
                 };
                 match resolve_ssh_auth(&pseudo, None) {
                     Ok(Some(auth)) => {
@@ -1291,6 +1357,7 @@ impl TabManager {
                             pty_killer: None,
                             ssh_shutdown: None,
                             ssh_sftp: None,
+                            ssh_forwards: None,
                             _term_subscriptions: Vec::new(),
                         };
                         let title = self.unique_tab_title(&label);
@@ -1304,6 +1371,7 @@ impl TabManager {
                             pane_id,
                             &kind,
                             auth,
+                            Vec::new(),
                             &font_family,
                             cx,
                         );
@@ -1435,8 +1503,8 @@ fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
 }
 
 fn teardown_pane_io(pane: &mut PaneSession) {
-    // Drop SFTP handle first so the pool shuts down and returns channel budget
-    // before (or as) the SSH session disconnects.
+    // Drop forward + SFTP handles first so workers shut down before SSH disconnect.
+    drop(pane.ssh_forwards.take());
     drop(pane.ssh_sftp.take());
     if let Some(tx) = pane.ssh_shutdown.take() {
         let _ = tx.send(());

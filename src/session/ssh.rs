@@ -44,6 +44,8 @@ pub struct SshSessionHandles {
     pub shutdown: Sender<()>,
     /// Same-session SFTP (opens subsystem channel on first use).
     pub sftp: crate::session::sftp::SftpHandle,
+    /// Same-session Local port forwards.
+    pub forwards: crate::session::forward::ForwardHandle,
 }
 
 struct ChannelReader {
@@ -126,6 +128,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let (shutdown_tx, shutdown_rx) = flume::bounded::<()>(1);
     let (ready_tx, ready_rx) = flume::bounded::<Result<()>>(1);
     let (sftp_handle, sftp_rx) = crate::session::sftp::channel_pair();
+    let (forward_handle, forward_rx, forward_state) = crate::session::forward::channel_pair();
 
     let host = params.host.clone();
     let port = params.port;
@@ -162,6 +165,8 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                     resize_rx,
                     shutdown_rx,
                     sftp_rx,
+                    forward_rx,
+                    forward_state,
                     &ready_tx,
                 )
                 .await
@@ -198,6 +203,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
         resize,
         shutdown: shutdown_tx,
         sftp: sftp_handle,
+        forwards: forward_handle,
     })
 }
 
@@ -213,6 +219,8 @@ async fn run_session(
     resize_rx: Receiver<(u32, u32)>,
     shutdown_rx: Receiver<()>,
     sftp_rx: Receiver<crate::session::sftp::SftpRequest>,
+    forward_rx: Receiver<crate::session::forward::ForwardCmd>,
+    forward_state: Arc<crate::session::forward::SharedState>,
     ready_tx: &Sender<Result<()>>,
 ) -> Result<()> {
     let config = Arc::new(client::Config {
@@ -248,11 +256,16 @@ async fn run_session(
         .await
         .context("request shell")?;
 
-    // Share Handle via Arc so SFTP can open another channel while the shell runs.
+    // Share Handle via Arc so SFTP / forwards can open channels while the shell runs.
     let session = Arc::new(session);
     tokio::spawn(crate::session::sftp::run_sftp_worker(
         Arc::clone(&session),
         sftp_rx,
+    ));
+    tokio::spawn(crate::session::forward::run_forward_worker(
+        Arc::clone(&session),
+        forward_rx,
+        forward_state,
     ));
 
     if ready_tx.send(Ok(())).is_err() {

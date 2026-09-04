@@ -2,7 +2,7 @@
 
 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[BACKLOG.md](./BACKLOG.md)、[SFTP_POOL.md](./SFTP_POOL.md)。
 
-> **状态**：规格已定（含使用场景与 UI），**尚未实现**。实现须由用户明确点名后开始。  
+> **状态**：规格已定（含使用场景与 UI）；**阶段 1（Local）已落地**。Remote / SOCKS 仍未实现。  
 > **产品定位**：**增强能力，非核心**。主线仍是终端 + SSH + Files；转发做成 Profile / 会话上的可靠附件即可。  
 > **文档约定**：新增规格默认中文。
 
@@ -407,21 +407,21 @@ sudo sshd -T | grep -i allowtcpforwarding
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | 0 | 本规格文档 | **完成** |
-| 1 | Local：会话级启停 + Profile 自动启用；默认 bind `127.0.0.1`；**含转发权限侦测与归因** | 未做 |
+| 1 | Local：会话级启停 + Profile 自动启用；默认 bind `127.0.0.1`；**含转发权限侦测与归因**；Info / 状态栏 / Temporary | **完成** |
 | 2 | Remote：Handler + registry；错误文案 | 未做 |
 | 3 | SOCKS5；可选流量 / 连接数 | 未做 |
-| 4 | 断线重连后恢复规则、与 jump host 组合打磨 | 未做 |
+| 4 | 断线重连后恢复规则、与 jump host 组合打磨 | 未做（Reconnect 已按 Profile enabled 规则再拉；Temporary 仍丢弃） |
 
 ## 实现映射（落地时填写）
 
 | 块 | 预期位置 |
 |----|----------|
 | 规格 | `docs/PORT_FORWARD.md`（本文） |
-| ForwardHub | `src/session/`（新建 forward 模块，挂在 SSH pane） |
-| Handler 扩展 | `src/session/ssh.rs`（Remote 回调） |
-| Profile 字段 | profile / workspace 模型增加 `forwards` |
-| UI | Profile 编辑 + Info 会话态 + 状态栏；见上文「UI / 交互设计」 |
-| Teardown | 与 `tab_manager` 关 pane 路径对齐 SFTP 回收 |
+| ForwardHub | `src/session/forward.rs`（Local listener + `direct-tcpip`） |
+| Handler 扩展 | `src/session/ssh.rs`（Remote 回调 — 阶段 2） |
+| Profile 字段 | `src/model/forward.rs` + `Profile.forwards` |
+| UI | SSH 表单 Port forwarding；Context → Info；状态栏 `⇄ N` / Forward error |
+| Teardown | `tab_manager` 关 pane 时 drop `ssh_forwards`（与 SFTP 对齐） |
 
 ## 验收（阶段 1）
 

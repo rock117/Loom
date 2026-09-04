@@ -287,6 +287,18 @@ impl WorkspaceView {
                 StatusBarEvent::ToggleContextPanel => {
                     this.toggle_context_panel(cx);
                 }
+                StatusBarEvent::FocusPortForwards => {
+                    if !this.context_panel_visible {
+                        this.context_panel_visible = true;
+                        this.store.update(cx, |s, _| {
+                            s.ui_state.context_panel_visible = true;
+                        });
+                    }
+                    this.context_panel.update(cx, |panel, cx| {
+                        panel.focus_port_forwards(cx);
+                    });
+                    cx.notify();
+                }
             },
         ));
 
@@ -533,6 +545,7 @@ impl WorkspaceView {
             id: uuid::Uuid::new_v4(),
             name: name.clone(),
             kind,
+            forwards: Vec::new(),
         };
         let pid = profile.id;
         let target = match group_id {

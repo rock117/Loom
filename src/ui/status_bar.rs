@@ -29,6 +29,8 @@ pub enum StatusBarEvent {
     ToggleSidebar,
     /// Toggle right context panel visibility.
     ToggleContextPanel,
+    /// Focus Context → Info port-forward section.
+    FocusPortForwards,
 }
 
 impl StatusBar {
@@ -214,6 +216,13 @@ impl Render for StatusBar {
                 ConnectionState::Disconnected | ConnectionState::Failed
             );
 
+            let fwd_snap = pane.and_then(|p| p.ssh_forwards.as_ref().map(|h| h.snapshot()));
+            let fwd_listening = fwd_snap.as_ref().map(|s| s.listening_count()).unwrap_or(0);
+            let fwd_errors = fwd_snap.as_ref().map(|s| s.error_count()).unwrap_or(0);
+            let fwd_denied = fwd_snap
+                .as_ref()
+                .is_some_and(|s| s.forwarding_denied);
+
             let (cols, rows) = pane
                 .and_then(|p| p.terminal.as_ref())
                 .map(|t| t.read(cx).dimensions())
@@ -261,6 +270,48 @@ impl Render for StatusBar {
                                 .child(format!("·  {profile_name}")),
                         ),
                 ))
+                .when(fwd_errors > 0 || fwd_denied, |d| {
+                    d.child(Self::segment(
+                        "sb-fwd-err",
+                        cx,
+                        "Port forward error — open Info",
+                        None,
+                        |_, _, cx| {
+                            cx.emit(StatusBarEvent::FocusPortForwards);
+                        },
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::DANGER)
+                                    .child("Forward error"),
+                            ),
+                    ))
+                })
+                .when(fwd_errors == 0 && !fwd_denied && fwd_listening > 0, |d| {
+                    d.child(Self::segment(
+                        "sb-fwd",
+                        cx,
+                        "Port forwards — open Info",
+                        None,
+                        |_, _, cx| {
+                            cx.emit(StatusBarEvent::FocusPortForwards);
+                        },
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child(format!("⇄ {fwd_listening}")),
+                            ),
+                    ))
+                })
                 .when(needs_reconnect, |d| {
                     d.child(Self::segment(
                         "sb-reconnect",

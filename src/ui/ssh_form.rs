@@ -6,7 +6,7 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::{Profile, ProfileKind, SshAuth};
+use crate::model::{PortForwardRule, Profile, ProfileKind, SshAuth};
 use crate::session::credentials;
 use crate::shared::theme;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
@@ -38,12 +38,39 @@ pub struct SshForm {
     /// Keyring already has a password for this profile (edit mode).
     has_stored_password: bool,
     remember: bool,
+    /// Persistent Local forward rules for this SSH profile.
+    forwards: Vec<PortForwardRule>,
+    forwards_open: bool,
+    /// Inline editor for add/edit (`None` = list only).
+    forward_edit: Option<ForwardEditState>,
     error: Option<String>,
     field: Field,
     /// Mouse-drag text selection in the active field.
     selecting: bool,
     field_bounds: [Option<Bounds<Pixels>>; 6],
     _caret_blink: Option<Task<()>>,
+}
+
+#[derive(Clone)]
+struct ForwardEditState {
+    /// `None` = adding; `Some(id)` = editing existing rule.
+    id: Option<Uuid>,
+    name: RenameEdit,
+    bind_host: RenameEdit,
+    bind_port: RenameEdit,
+    target_host: RenameEdit,
+    target_port: RenameEdit,
+    enabled: bool,
+    focus: ForwardEditField,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForwardEditField {
+    Name,
+    BindHost,
+    BindPort,
+    TargetHost,
+    TargetPort,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +98,9 @@ impl SshForm {
             use_private_key: false,
             has_stored_password: false,
             remember: true,
+            forwards: Vec::new(),
+            forwards_open: false,
+            forward_edit: None,
             error: None,
             field: Field::Host,
             selecting: false,
@@ -93,6 +123,9 @@ impl SshForm {
         self.use_private_key = false;
         self.has_stored_password = false;
         self.remember = true;
+        self.forwards.clear();
+        self.forwards_open = false;
+        self.forward_edit = None;
         self.error = None;
         self.field = Field::Host;
         self.selecting = false;
@@ -130,6 +163,9 @@ impl SshForm {
         self.port = field_edit(port.to_string());
         self.user = field_edit(user);
         self.password = field_edit("");
+        self.forwards = profile.forwards.clone();
+        self.forwards_open = !self.forwards.is_empty();
+        self.forward_edit = None;
         self.error = None;
         match auth {
             SshAuth::Password { remember } => {
@@ -254,6 +290,15 @@ impl SshForm {
     }
 
     fn active_edit_mut(&mut self) -> &mut RenameEdit {
+        if let Some(edit) = self.forward_edit.as_mut() {
+            return match edit.focus {
+                ForwardEditField::Name => &mut edit.name,
+                ForwardEditField::BindHost => &mut edit.bind_host,
+                ForwardEditField::BindPort => &mut edit.bind_port,
+                ForwardEditField::TargetHost => &mut edit.target_host,
+                ForwardEditField::TargetPort => &mut edit.target_port,
+            };
+        }
         match self.field {
             Field::Name => &mut self.name,
             Field::Host => &mut self.host,
@@ -265,6 +310,15 @@ impl SshForm {
     }
 
     fn active_edit(&self) -> &RenameEdit {
+        if let Some(edit) = self.forward_edit.as_ref() {
+            return match edit.focus {
+                ForwardEditField::Name => &edit.name,
+                ForwardEditField::BindHost => &edit.bind_host,
+                ForwardEditField::BindPort => &edit.bind_port,
+                ForwardEditField::TargetHost => &edit.target_host,
+                ForwardEditField::TargetPort => &edit.target_port,
+            };
+        }
         match self.field {
             Field::Name => &self.name,
             Field::Host => &self.host,
@@ -482,6 +536,7 @@ impl SshForm {
                     user,
                     auth,
                 },
+                forwards: self.forwards.clone(),
             };
             let ok = self.store.update(cx, |s, cx| s.add_ssh_profile(profile, cx));
             if !ok && self.remember && !self.use_private_key {
@@ -490,7 +545,7 @@ impl SshForm {
             ok
         } else {
             self.store.update(cx, |s, cx| {
-                s.update_ssh_profile(id, name, host, port, user, auth, cx)
+                s.update_ssh_profile(id, name, host, port, user, auth, self.forwards.clone(), cx)
             })
         };
 
@@ -509,6 +564,437 @@ impl SshForm {
             connect,
             oneshot_password: oneshot,
         });
+    }
+
+    fn begin_add_forward(&mut self, cx: &mut Context<Self>) {
+        self.forwards_open = true;
+        self.forward_edit = Some(ForwardEditState {
+            id: None,
+            name: field_edit(""),
+            bind_host: field_edit("127.0.0.1"),
+            bind_port: field_edit(""),
+            target_host: field_edit("127.0.0.1"),
+            target_port: field_edit(""),
+            enabled: true,
+            focus: ForwardEditField::BindPort,
+        });
+        cx.notify();
+    }
+
+    fn begin_edit_forward(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let Some(rule) = self.forwards.iter().find(|f| f.id == id).cloned() else {
+            return;
+        };
+        self.forwards_open = true;
+        self.forward_edit = Some(ForwardEditState {
+            id: Some(rule.id),
+            name: field_edit(rule.name),
+            bind_host: field_edit(rule.bind_host),
+            bind_port: field_edit(rule.bind_port.to_string()),
+            target_host: field_edit(rule.target_host),
+            target_port: field_edit(rule.target_port.to_string()),
+            enabled: rule.enabled,
+            focus: ForwardEditField::BindPort,
+        });
+        cx.notify();
+    }
+
+    fn save_forward_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.forward_edit.as_ref() else {
+            return;
+        };
+        let bind_port: u16 = match edit.bind_port.text.trim().parse() {
+            Ok(0) | Err(_) => {
+                self.error = Some("Forward listen port must be 1–65535".into());
+                cx.notify();
+                return;
+            }
+            Ok(p) => p,
+        };
+        let target_port: u16 = match edit.target_port.text.trim().parse() {
+            Ok(0) | Err(_) => {
+                self.error = Some("Forward target port must be 1–65535".into());
+                cx.notify();
+                return;
+            }
+            Ok(p) => p,
+        };
+        let bind_host = {
+            let h = edit.bind_host.text.trim();
+            if h.is_empty() {
+                "127.0.0.1".into()
+            } else {
+                h.to_string()
+            }
+        };
+        let target_host = {
+            let h = edit.target_host.text.trim();
+            if h.is_empty() {
+                self.error = Some("Forward target host is required".into());
+                cx.notify();
+                return;
+            }
+            h.to_string()
+        };
+        let rule = PortForwardRule {
+            id: edit.id.unwrap_or_else(Uuid::new_v4),
+            kind: crate::model::PortForwardKind::Local,
+            bind_host,
+            bind_port,
+            target_host,
+            target_port,
+            name: edit.name.text.trim().to_string(),
+            enabled: edit.enabled,
+        };
+        if let Some(idx) = self.forwards.iter().position(|f| f.id == rule.id) {
+            self.forwards[idx] = rule;
+        } else {
+            self.forwards.push(rule);
+        }
+        self.forward_edit = None;
+        self.error = None;
+        cx.notify();
+    }
+
+    fn render_forwards_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.forwards_open;
+        let count = self.forwards.len();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .mt(px(theme::SPACE_1))
+            .child(
+                div()
+                    .id("ssh-forwards-toggle")
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.forwards_open = !this.forwards_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::TEXT_MUTED)
+                            .child(if open {
+                                format!("▾ Port forwarding ({count})")
+                            } else {
+                                format!("▸ Port forwarding ({count})")
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("ssh-forward-add")
+                            .px(px(theme::SPACE_2))
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                            .child("+ Add")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.begin_add_forward(cx);
+                                cx.stop_propagation();
+                            })),
+                    ),
+            )
+            .when(open, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_DISABLED)
+                        .child("Enabled rules listen after Connect. Use localhost:<port> locally."),
+                )
+                .children(self.forwards.iter().map(|rule| {
+                    let id = rule.id;
+                    let enabled = rule.enabled;
+                    let line = if rule.name.trim().is_empty() {
+                        format!("Local  {}", rule.endpoint_line())
+                    } else {
+                        format!("Local  {}  ·  {}", rule.name, rule.endpoint_line())
+                    };
+                    div()
+                        .id(SharedString::from(format!("ssh-fwd-{id}")))
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACE_1))
+                        .px(px(theme::SPACE_1))
+                        .py(px(2.0))
+                        .rounded(px(theme::RADIUS_SM))
+                        .hover(|s| s.bg(theme::HOVER))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ssh-fwd-en-{id}")))
+                                .text_xs()
+                                .text_color(theme::TEXT)
+                                .cursor_pointer()
+                                .child(if enabled { "[x]" } else { "[ ]" })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(r) = this.forwards.iter_mut().find(|f| f.id == id) {
+                                        r.enabled = !r.enabled;
+                                    }
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(theme::TEXT)
+                                .overflow_hidden()
+                                .child(line),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ssh-fwd-edit-{id}")))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .child("Edit")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.begin_edit_forward(id, cx);
+                                    cx.stop_propagation();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ssh-fwd-del-{id}")))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .child("Del")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.forwards.retain(|f| f.id != id);
+                                    if this
+                                        .forward_edit
+                                        .as_ref()
+                                        .and_then(|e| e.id)
+                                        == Some(id)
+                                    {
+                                        this.forward_edit = None;
+                                    }
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                })),
+                        )
+                }))
+                .when_some(self.forward_edit.as_ref(), |d, edit| {
+                    d.child(self.render_forward_edit(edit, cx))
+                })
+            })
+    }
+
+    fn render_forward_edit(
+        &self,
+        edit: &ForwardEditState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let title = if edit.id.is_some() {
+            "Edit Local forward"
+        } else {
+            "Add Local forward"
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .p(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_SM))
+            .border_1()
+            .border_color(theme::BORDER_SUBTLE)
+            .bg(theme::BG)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::TEXT)
+                    .child(title),
+            )
+            .child(self.forward_mini_field("Name (optional)", &edit.name, ForwardEditField::Name, cx))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(self.forward_mini_field(
+                                "Listen host",
+                                &edit.bind_host,
+                                ForwardEditField::BindHost,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(px(88.0))
+                            .child(self.forward_mini_field(
+                                "Port",
+                                &edit.bind_port,
+                                ForwardEditField::BindPort,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(self.forward_mini_field(
+                                "Target host",
+                                &edit.target_host,
+                                ForwardEditField::TargetHost,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .w(px(88.0))
+                            .child(self.forward_mini_field(
+                                "Port",
+                                &edit.target_port,
+                                ForwardEditField::TargetPort,
+                                cx,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .id("ssh-fwd-edit-enabled")
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::TEXT)
+                            .child(if edit.enabled {
+                                "[x] Enabled on connect"
+                            } else {
+                                "[ ] Enabled on connect"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(e) = this.forward_edit.as_mut() {
+                            e.enabled = !e.enabled;
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .id("ssh-fwd-edit-cancel")
+                            .px(px(theme::SPACE_2))
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(theme::HOVER))
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.forward_edit = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("ssh-fwd-edit-save")
+                            .px(px(theme::SPACE_2))
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .text_xs()
+                            .text_color(theme::TEXT)
+                            .bg(theme::HOVER)
+                            .cursor_pointer()
+                            .child("Save rule")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_forward_edit(cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn forward_mini_field(
+        &self,
+        label: &'static str,
+        edit: &RenameEdit,
+        field: ForwardEditField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self
+            .forward_edit
+            .as_ref()
+            .is_some_and(|e| e.focus == field);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::TEXT_MUTED)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("ssh-fwd-field-{label}")))
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_1))
+                    .rounded(px(theme::RADIUS_SM))
+                    .bg(theme::ELEVATED)
+                    .border_1()
+                    .border_color(if active {
+                        theme::ACCENT
+                    } else {
+                        theme::BORDER_SUBTLE
+                    })
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(e) = this.forward_edit.as_mut() {
+                                e.focus = field;
+                            }
+                            this.focus_handle.focus(window);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(if active {
+                        edit.into_element_bare()
+                    } else {
+                        div()
+                            .text_xs()
+                            .text_color(if edit.text.is_empty() {
+                                theme::TEXT_DISABLED
+                            } else {
+                                theme::TEXT
+                            })
+                            .child(if edit.text.is_empty() {
+                                "…".to_string()
+                            } else {
+                                edit.text.clone()
+                            })
+                            .into_any_element()
+                    }),
+            )
     }
 
     fn field_row(
@@ -726,7 +1212,11 @@ impl Render for SshForm {
                             return;
                         }
                         if key == "enter" {
-                            this.submit(true, cx);
+                            if this.forward_edit.is_some() {
+                                this.save_forward_edit(cx);
+                            } else {
+                                this.submit(true, cx);
+                            }
                             cx.stop_propagation();
                             return;
                         }
@@ -884,6 +1374,7 @@ impl Render for SshForm {
                             cx,
                         ))
                     })
+                    .child(self.render_forwards_section(cx))
                     .when_some(err, |d, msg| {
                         d.child(
                             div()

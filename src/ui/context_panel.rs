@@ -141,6 +141,23 @@ enum FilesPrompt {
     TransferSettings(TransferSettingsForm),
 }
 
+/// Temporary Local forward editor on Info.
+struct ForwardTempEdit {
+    bind_port: RenameEdit,
+    target_host: RenameEdit,
+    target_port: RenameEdit,
+    name: RenameEdit,
+    focus: TempForwardField,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TempForwardField {
+    BindPort,
+    TargetHost,
+    TargetPort,
+    Name,
+}
+
 pub struct ContextPanel {
     store: Entity<WorkspaceStore>,
     tabs: Entity<TabManager>,
@@ -187,6 +204,8 @@ pub struct ContextPanel {
     host_info_pane: Option<Uuid>,
     host_info_loading: bool,
     host_info_error: Option<String>,
+    /// Inline Temporary Local forward form on the Info tab.
+    forward_temp: Option<ForwardTempEdit>,
     /// Height share for the file list vs Transfers footer (0.35..=0.9).
     list_ratio: f32,
     files_body_bounds: Option<Bounds<Pixels>>,
@@ -251,6 +270,7 @@ impl ContextPanel {
             host_info_pane: None,
             host_info_loading: false,
             host_info_error: None,
+            forward_temp: None,
             list_ratio,
             files_body_bounds: None,
             files_sash_drag: false,
@@ -2121,7 +2141,86 @@ impl ContextPanel {
         }
     }
 
+    fn handle_temp_forward_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.forward_temp.is_none() {
+            return false;
+        }
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let chord = mods.control || mods.platform;
+        let shift = mods.shift;
+
+        if key == "escape" {
+            self.forward_temp = None;
+            cx.notify();
+            return true;
+        }
+        if key == "enter" {
+            self.submit_temporary_forward(cx);
+            return true;
+        }
+        if key == "tab" {
+            if let Some(edit) = self.forward_temp.as_mut() {
+                edit.focus = match (edit.focus, shift) {
+                    (TempForwardField::BindPort, false) => TempForwardField::TargetHost,
+                    (TempForwardField::TargetHost, false) => TempForwardField::TargetPort,
+                    (TempForwardField::TargetPort, false) => TempForwardField::Name,
+                    (TempForwardField::Name, false) => TempForwardField::BindPort,
+                    (TempForwardField::BindPort, true) => TempForwardField::Name,
+                    (TempForwardField::Name, true) => TempForwardField::TargetPort,
+                    (TempForwardField::TargetPort, true) => TempForwardField::TargetHost,
+                    (TempForwardField::TargetHost, true) => TempForwardField::BindPort,
+                };
+            }
+            cx.notify();
+            return true;
+        }
+
+        let Some(edit) = self.forward_temp.as_mut() else {
+            return false;
+        };
+        let field = match edit.focus {
+            TempForwardField::BindPort => &mut edit.bind_port,
+            TempForwardField::TargetHost => &mut edit.target_host,
+            TempForwardField::TargetPort => &mut edit.target_port,
+            TempForwardField::Name => &mut edit.name,
+        };
+        if chord && key.eq_ignore_ascii_case("a") {
+            field.select_all();
+            cx.notify();
+            return true;
+        }
+        if key == "backspace" {
+            field.backspace();
+            cx.notify();
+            return true;
+        }
+        if key == "delete" {
+            field.delete_forward();
+            cx.notify();
+            return true;
+        }
+        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+            if !chord {
+                field.insert(&cleaned);
+                cx.notify();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Switch to Info and scroll attention to port forwards (status bar click).
+    pub fn focus_port_forwards(&mut self, cx: &mut Context<Self>) {
+        self.active_tab = PanelTab::Info;
+        self.ensure_host_info(cx);
+        cx.notify();
+    }
+
     fn handle_prompt_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.handle_temp_forward_key(event, cx) {
+            return true;
+        }
         if self.prompt.is_none() {
             return false;
         }
@@ -4134,7 +4233,450 @@ impl ContextPanel {
                         ),
                 )
             })
+            .child(self.render_port_forwards(cx))
             .into_any_element()
+    }
+
+    fn focused_forwards(
+        &self,
+        cx: &App,
+    ) -> Option<(Uuid, crate::session::forward::ForwardHandle, ConnectionState)> {
+        let tab = self.tabs.read(cx).active_tab()?;
+        let pane = tab.focused_pane()?;
+        let fwd = pane.ssh_forwards.clone()?;
+        Some((pane.id, fwd, pane.state))
+    }
+
+    fn render_port_forwards(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::session::forward::ForwardStatus;
+
+        let focused = self.focused_forwards(cx);
+        let (state, snap) = match &focused {
+            Some((_, handle, state)) => (*state, Some(handle.snapshot())),
+            None => (ConnectionState::Idle, None),
+        };
+        let is_ssh = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .and_then(|t| t.focused_pane())
+            .is_some_and(|p| !p.kind.is_local());
+        let connecting = matches!(state, ConnectionState::Connecting);
+        let connected = matches!(state, ConnectionState::Connected);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .mt(px(theme::SPACE_2))
+            .pt(px(theme::SPACE_2))
+            .border_t_1()
+            .border_color(theme::BORDER_SUBTLE)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::TEXT_MUTED)
+                            .child("Port forwarding"),
+                    )
+                    .when(connected && focused.is_some(), |d| {
+                        d.child(
+                            div()
+                                .id("ctx-fwd-temp")
+                                .px(px(theme::SPACE_2))
+                                .py(px(2.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                .child("+ Temporary")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.begin_temporary_forward(cx);
+                                })),
+                        )
+                    }),
+            )
+            .when(
+                snap.as_ref().is_some_and(|s| s.forwarding_denied),
+                |d| {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::DANGER)
+                            .child(
+                                "Server disabled TCP forwarding (AllowTcpForwarding)",
+                            ),
+                    )
+                },
+            )
+            .when(!is_ssh, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_DISABLED)
+                        .child("SSH sessions only"),
+                )
+            })
+            .when(is_ssh && connecting, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Waiting for connection…"),
+                )
+            })
+            .when(is_ssh && !connecting && !connected, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Connect to enable forwards"),
+                )
+            })
+            .when_some(snap.filter(|_| connected), |d, snap| {
+                if snap.rows.is_empty() {
+                    d.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::TEXT_DISABLED)
+                            .child("No active forwards"),
+                    )
+                } else {
+                    d.children(snap.rows.into_iter().map(|row| {
+                        let id = row.id;
+                        let status_color = match &row.status {
+                            ForwardStatus::Listening => theme::SUCCESS,
+                            ForwardStatus::Error(_) => theme::DANGER,
+                            ForwardStatus::Starting => theme::TEXT_MUTED,
+                            ForwardStatus::Stopped => theme::TEXT_DISABLED,
+                        };
+                        let status_text = row.status.label().to_string();
+                        let title = if row.name.trim().is_empty() {
+                            format!(
+                                "{}:{} → {}:{}",
+                                row.bind_host, row.bind_port, row.target_host, row.target_port
+                            )
+                        } else {
+                            format!(
+                                "{}  {}:{} → {}:{}",
+                                row.name,
+                                row.bind_host,
+                                row.bind_port,
+                                row.target_host,
+                                row.target_port
+                            )
+                        };
+                        let dial = row.last_dial_error.clone();
+                        let listening = row.status.is_listening();
+                        let is_err = row.status.is_error();
+                        div()
+                            .id(SharedString::from(format!("ctx-fwd-{id}")))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .px(px(theme::SPACE_1))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SM))
+                            .hover(|s| s.bg(theme::HOVER))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(
+                                        div()
+                                            .size(px(7.0))
+                                            .rounded_full()
+                                            .bg(status_color)
+                                            .flex_shrink_0(),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(theme::TEXT)
+                                            .overflow_hidden()
+                                            .child(title),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(status_color)
+                                            .child(status_text),
+                                    )
+                                    .when(listening, |d| {
+                                        d.child(
+                                            div()
+                                                .id(SharedString::from(format!("ctx-fwd-stop-{id}")))
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .cursor_pointer()
+                                                .child("Stop")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.stop_forward(id, cx);
+                                                })),
+                                        )
+                                    })
+                                    .when(is_err, |d| {
+                                        d.child(
+                                            div()
+                                                .id(SharedString::from(format!("ctx-fwd-retry-{id}")))
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .cursor_pointer()
+                                                .child("Retry")
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.retry_forward(id, cx);
+                                                })),
+                                        )
+                                    }),
+                            )
+                            .when_some(dial, |d, msg| {
+                                d.child(
+                                    div()
+                                        .pl(px(14.0))
+                                        .text_xs()
+                                        .text_color(theme::DANGER)
+                                        .child(msg),
+                                )
+                            })
+                    }))
+                }
+            })
+            .when_some(self.forward_temp.as_ref(), |d, edit| {
+                d.child(self.render_temp_forward_form(edit, cx))
+            })
+    }
+
+    fn begin_temporary_forward(&mut self, cx: &mut Context<Self>) {
+        self.forward_temp = Some(ForwardTempEdit {
+            bind_port: RenameEdit::new(""),
+            target_host: RenameEdit::new("127.0.0.1"),
+            target_port: RenameEdit::new(""),
+            name: RenameEdit::new(""),
+            focus: TempForwardField::BindPort,
+        });
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn submit_temporary_forward(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.forward_temp.as_ref() else {
+            return;
+        };
+        let bind_port: u16 = match edit.bind_port.text.trim().parse() {
+            Ok(0) | Err(_) => {
+                self.host_info_error = Some("Listen port must be 1–65535".into());
+                cx.notify();
+                return;
+            }
+            Ok(p) => p,
+        };
+        let target_port: u16 = match edit.target_port.text.trim().parse() {
+            Ok(0) | Err(_) => {
+                self.host_info_error = Some("Target port must be 1–65535".into());
+                cx.notify();
+                return;
+            }
+            Ok(p) => p,
+        };
+        let target_host = {
+            let h = edit.target_host.text.trim();
+            if h.is_empty() {
+                self.host_info_error = Some("Target host is required".into());
+                cx.notify();
+                return;
+            }
+            h.to_string()
+        };
+        let mut rule = crate::model::PortForwardRule::new_local(bind_port, target_host, target_port);
+        rule.name = edit.name.text.trim().to_string();
+        let Some((_, handle, _)) = self.focused_forwards(cx) else {
+            self.host_info_error = Some("No SSH session".into());
+            cx.notify();
+            return;
+        };
+        match handle.start(rule, true) {
+            Ok(()) => {
+                self.forward_temp = None;
+                self.host_info_error = None;
+                cx.emit(ContextPanelEvent::Toast("Temporary forward started".into()));
+            }
+            Err(err) => {
+                self.host_info_error = Some(format!("{err:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn stop_forward(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some((_, handle, _)) = self.focused_forwards(cx) {
+            if let Err(err) = handle.stop(id) {
+                self.host_info_error = Some(format!("{err:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn retry_forward(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some((_, handle, _)) = self.focused_forwards(cx) {
+            if let Err(err) = handle.retry(id) {
+                self.host_info_error = Some(format!("{err:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_temp_forward_form(
+        &self,
+        edit: &ForwardTempEdit,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(theme::SPACE_1))
+            .p(px(theme::SPACE_2))
+            .rounded(px(theme::RADIUS_SM))
+            .border_1()
+            .border_color(theme::BORDER_SUBTLE)
+            .bg(theme::BG)
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::TEXT)
+                    .child("Temporary Local forward"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .child(self.temp_fwd_field("Listen", &edit.bind_port, TempForwardField::BindPort, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(self.temp_fwd_field("Target host", &edit.target_host, TempForwardField::TargetHost, cx)),
+                    )
+                    .child(
+                        div()
+                            .w(px(72.0))
+                            .child(self.temp_fwd_field("Port", &edit.target_port, TempForwardField::TargetPort, cx)),
+                    ),
+            )
+            .child(self.temp_fwd_field("Name (optional)", &edit.name, TempForwardField::Name, cx))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(theme::SPACE_1))
+                    .child(
+                        div()
+                            .id("ctx-fwd-temp-cancel")
+                            .px(px(theme::SPACE_2))
+                            .py(px(2.0))
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.forward_temp = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("ctx-fwd-temp-start")
+                            .px(px(theme::SPACE_2))
+                            .py(px(2.0))
+                            .rounded(px(theme::RADIUS_SM))
+                            .bg(theme::HOVER)
+                            .text_xs()
+                            .text_color(theme::TEXT)
+                            .cursor_pointer()
+                            .child("Start")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_temporary_forward(cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn temp_fwd_field(
+        &self,
+        label: &'static str,
+        edit: &RenameEdit,
+        field: TempForwardField,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self
+            .forward_temp
+            .as_ref()
+            .is_some_and(|e| e.focus == field);
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::TEXT_MUTED)
+                    .child(label),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("ctx-fwd-temp-{label}")))
+                    .px(px(theme::SPACE_2))
+                    .py(px(theme::SPACE_1))
+                    .rounded(px(theme::RADIUS_SM))
+                    .bg(theme::ELEVATED)
+                    .border_1()
+                    .border_color(if active {
+                        theme::ACCENT
+                    } else {
+                        theme::BORDER_SUBTLE
+                    })
+                    .cursor_text()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            if let Some(e) = this.forward_temp.as_mut() {
+                                e.focus = field;
+                            }
+                            this.focus_handle.focus(window);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(if active {
+                        edit.into_element_bare()
+                    } else {
+                        div()
+                            .text_xs()
+                            .text_color(if edit.text.is_empty() {
+                                theme::TEXT_DISABLED
+                            } else {
+                                theme::TEXT
+                            })
+                            .child(if edit.text.is_empty() {
+                                "…".to_string()
+                            } else {
+                                edit.text.clone()
+                            })
+                            .into_any_element()
+                    }),
+            )
     }
 }
 

@@ -217,6 +217,7 @@ impl WorkspaceStore {
         port: u16,
         user: String,
         auth: crate::model::SshAuth,
+        forwards: Vec<crate::model::PortForwardRule>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(profile) = self.workspace.find_profile_mut(id) else {
@@ -232,6 +233,7 @@ impl WorkspaceStore {
             user,
             auth,
         };
+        profile.forwards = forwards;
         self.selection = Selection::Profile(id);
         self.mark_dirty();
         self.persist_now();

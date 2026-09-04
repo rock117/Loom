@@ -1,6 +1,7 @@
 //! Local PTY and SSH session backends.
 
 pub mod credentials;
+pub mod forward;
 pub mod known_hosts;
 pub mod host_info;
 pub mod local;

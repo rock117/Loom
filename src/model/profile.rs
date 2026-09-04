@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
 
+use super::forward::PortForwardRule;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SshAuth {
@@ -70,6 +72,9 @@ pub struct Profile {
     pub id: Uuid,
     pub name: String,
     pub kind: ProfileKind,
+    /// SSH Local forwards (ignored for Local profiles). Empty by default for older files.
+    #[serde(default)]
+    pub forwards: Vec<PortForwardRule>,
 }
 
 impl Profile {
@@ -78,6 +83,7 @@ impl Profile {
             id: Uuid::new_v4(),
             name: name.into(),
             kind: ProfileKind::local_default(),
+            forwards: Vec::new(),
         }
     }
 
@@ -91,6 +97,7 @@ impl Profile {
                 user,
                 auth: SshAuth::Password { remember: true },
             },
+            forwards: Vec::new(),
         }
     }
 
@@ -99,6 +106,15 @@ impl Profile {
             id: Uuid::new_v4(),
             name: format!("{} (copy)", self.name),
             kind: self.kind.clone(),
+            forwards: self.forwards.iter().map(|f| f.duplicate()).collect(),
+        }
+    }
+
+    pub fn ssh_forwards(&self) -> &[PortForwardRule] {
+        if self.kind.is_local() {
+            &[]
+        } else {
+            &self.forwards
         }
     }
 }
