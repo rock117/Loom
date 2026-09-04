@@ -1585,6 +1585,22 @@ impl TerminalView {
             self.ime_marked = None;
             return;
         }
+        // Find bar owns printable / IME text while open.
+        if self.find.is_some() {
+            let cleaned = text.replace('\r', "").replace('\n', "");
+            if cleaned.is_empty() {
+                self.ime_marked = None;
+                return;
+            }
+            if let Some(find) = self.find.as_mut() {
+                find.query.insert(&cleaned);
+                find.query.caret_visible = true;
+            }
+            self.ime_marked = None;
+            self.state.with_term_mut(|term| term.selection = None);
+            self.find_next(cx);
+            return;
+        }
         if !self.session_alive {
             self.ime_marked = None;
             return;
@@ -1597,6 +1613,21 @@ impl TerminalView {
         self.write_to_pty(normalized.as_bytes(), cx);
         self.ime_marked = None;
         cx.notify();
+    }
+
+    fn find_char_to_utf16(s: &str, char_idx: usize) -> usize {
+        s.chars().take(char_idx).map(|c| c.len_utf16()).sum()
+    }
+
+    fn find_utf16_to_char(s: &str, utf16_idx: usize) -> usize {
+        let mut u = 0usize;
+        for (i, ch) in s.chars().enumerate() {
+            if u >= utf16_idx {
+                return i;
+            }
+            u += ch.len_utf16();
+        }
+        s.chars().count()
     }
 
     /// Cursor cell bounds in window coordinates (for IME candidate window).
@@ -1810,6 +1841,14 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if let Some(find) = self.find.as_ref() {
+            let text = find.query.text.as_str();
+            let utf16: Vec<u16> = text.encode_utf16().collect();
+            let start = range.start.min(utf16.len());
+            let end = range.end.min(utf16.len());
+            *adjusted_range = Some(start..end);
+            return String::from_utf16(&utf16[start..end]).ok();
+        }
         let (text, _) = self.ime_marked.as_ref()?;
         let utf16: Vec<u16> = text.encode_utf16().collect();
         let start = range.start.min(utf16.len());
@@ -1824,6 +1863,15 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if let Some(find) = self.find.as_ref() {
+            let (lo, hi) = find.query.sel_range();
+            let start = Self::find_char_to_utf16(&find.query.text, lo);
+            let end = Self::find_char_to_utf16(&find.query.text, hi);
+            return Some(UTF16Selection {
+                range: start..end,
+                reversed: find.query.cursor < find.query.anchor,
+            });
+        }
         // Zed terminal: always report a caret at 0 when not in alt-screen; keeps
         // IME candidate positioning stable and avoids a “stuck composing” empty range.
         Some(UTF16Selection {
@@ -1852,11 +1900,23 @@ impl EntityInputHandler for TerminalView {
 
     fn replace_text_in_range(
         &mut self,
-        _range: Option<std::ops::Range<usize>>,
+        range: Option<std::ops::Range<usize>>,
         text: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.find.is_some() {
+            if let Some(r) = range {
+                if let Some(find) = self.find.as_mut() {
+                    let lo = Self::find_utf16_to_char(&find.query.text, r.start);
+                    let hi = Self::find_utf16_to_char(&find.query.text, r.end);
+                    find.query.anchor = lo;
+                    find.query.cursor = hi;
+                }
+            }
+            self.insert_composed_text(text, cx);
+            return;
+        }
         self.insert_composed_text(text, cx);
     }
 
@@ -1875,7 +1935,7 @@ impl EntityInputHandler for TerminalView {
         } else {
             self.ime_marked = Some((new_text.to_string(), marked));
         }
-        // Preedit is not written to the PTY; candidacy UI is owned by the OS IME.
+        // Preedit is not written to the PTY / find query; candidacy UI is owned by the OS IME.
         cx.notify();
     }
 
@@ -1886,6 +1946,11 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if let Some(find) = self.find.as_ref() {
+            if let Some(b) = find.query_bounds {
+                return Some(b);
+            }
+        }
         self.cursor_bounds_window()
     }
 
@@ -1895,6 +1960,10 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        if let Some(find) = self.find.as_ref() {
+            let (lo, _) = find.query.sel_range();
+            return Some(Self::find_char_to_utf16(&find.query.text, lo));
+        }
         Some(0)
     }
 }
@@ -1941,11 +2010,21 @@ impl Render for TerminalView {
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
 
-                        // Register IME / text input handler while this terminal is focused.
-                        let focus = view_paint.read(cx).focus_handle.clone();
+                        // Register IME / text input handler for the focused surface.
+                        // When Find is open, bind to the find focus so Chinese IME commits
+                        // land in the query field instead of being dropped.
+                        let (input_focus, input_bounds) =
+                            if let Some(find) = view_paint.read(cx).find.as_ref() {
+                                (
+                                    find.focus_handle.clone(),
+                                    find.query_bounds.unwrap_or(bounds),
+                                )
+                            } else {
+                                (view_paint.read(cx).focus_handle.clone(), bounds)
+                            };
                         window.handle_input(
-                            &focus,
-                            ElementInputHandler::new(bounds, view_paint.clone()),
+                            &input_focus,
+                            ElementInputHandler::new(input_bounds, view_paint.clone()),
                             cx,
                         );
 

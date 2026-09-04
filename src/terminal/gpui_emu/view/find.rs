@@ -1,7 +1,7 @@
 //! Terminal scrollback / viewport text search (Ctrl+F).
 
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Direction, Line, Point, Side};
+use alacritty_terminal::index::{Column, Direction, Line, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::search::{Match, RegexIter, RegexSearch};
 use gpui::prelude::*;
@@ -9,22 +9,31 @@ use gpui::*;
 
 use super::TerminalView;
 use crate::shared::theme;
+use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
+
+/// Approximate monospace width for find-query hit-testing (`text_xs`).
+const FIND_CHAR_W: f32 = 7.0;
 
 /// In-view find bar state (owned by [`TerminalView`]).
 pub struct FindState {
-    pub query: String,
+    pub query: RenameEdit,
     pub status: SharedString,
     pub focus_handle: FocusHandle,
-    pub caret_visible: bool,
+    /// Mouse-drag selection in the query field.
+    selecting: bool,
+    pub(super) query_bounds: Option<Bounds<Pixels>>,
 }
 
 impl FindState {
     pub fn new(focus_handle: FocusHandle) -> Self {
+        let mut query = RenameEdit::new("");
+        query.clear_selection();
         Self {
-            query: String::new(),
+            query,
             status: SharedString::default(),
             focus_handle,
-            caret_visible: true,
+            selecting: false,
+            query_bounds: None,
         }
     }
 }
@@ -46,10 +55,10 @@ pub fn escape_literal(query: &str) -> String {
 
 fn collect_matches<T>(term: &alacritty_terminal::Term<T>, regex: &mut RegexSearch) -> Vec<Match> {
     let history = term.history_size() as i32;
-    let start = Point::new(Line(-history), Column(0));
+    let start = AlacPoint::new(Line(-history), Column(0));
     let last_line = term.screen_lines() as i32 - 1;
     let last_col = term.columns().saturating_sub(1);
-    let end = Point::new(Line(last_line), Column(last_col));
+    let end = AlacPoint::new(Line(last_line), Column(last_col));
     RegexIter::new(start, end, Direction::Right, term, regex).collect()
 }
 
@@ -67,7 +76,7 @@ impl TerminalView {
                 let keep = this
                     .update(cx, |this, cx| {
                         if let Some(find) = this.find.as_mut() {
-                            find.caret_visible = !find.caret_visible;
+                            find.query.caret_visible = !find.query.caret_visible;
                             cx.notify();
                             true
                         } else {
@@ -89,7 +98,12 @@ impl TerminalView {
             self.start_find_caret_blink(cx);
         }
         if let Some(find) = self.find.as_mut() {
-            find.caret_visible = true;
+            if !find.query.text.is_empty() {
+                find.query.select_all();
+            } else {
+                find.query.caret_visible = true;
+            }
+            find.selecting = false;
             find.focus_handle.clone().focus(window);
         }
         cx.notify();
@@ -114,14 +128,14 @@ impl TerminalView {
         let Some(find) = self.find.as_mut() else {
             return;
         };
-        if find.query.is_empty() {
+        if find.query.text.is_empty() {
             find.status = "".into();
             self.state.with_term_mut(|term| term.selection = None);
             cx.notify();
             return;
         }
 
-        let pattern = escape_literal(&find.query);
+        let pattern = escape_literal(&find.query.text);
         let mut regex = match RegexSearch::new(&pattern) {
             Ok(r) => r,
             Err(_) => {
@@ -182,13 +196,71 @@ impl TerminalView {
         cx.notify();
     }
 
+    fn find_char_index_at(&self, position: gpui::Point<Pixels>) -> usize {
+        let Some(find) = self.find.as_ref() else {
+            return 0;
+        };
+        let Some(bounds) = find.query_bounds else {
+            return find.query.char_len();
+        };
+        let local_x = f32::from(position.x - bounds.origin.x - px(theme::SPACE_2));
+        find.query.char_index_at_x(local_x, FIND_CHAR_W)
+    }
+
+    fn on_find_query_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(find) = self.find.as_mut() else {
+            return;
+        };
+        find.focus_handle.clone().focus(window);
+        let idx = self.find_char_index_at(event.position);
+        if let Some(find) = self.find.as_mut() {
+            let extend = event.modifiers.shift;
+            if extend {
+                find.query.set_caret(idx, true);
+                find.selecting = false;
+            } else {
+                find.query.set_caret(idx, false);
+                find.selecting = true;
+            }
+            find.query.caret_visible = true;
+        }
+        cx.notify();
+        cx.stop_propagation();
+    }
+
+    fn on_find_query_mouse_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(find) = self.find.as_ref() else {
+            return;
+        };
+        if !find.selecting {
+            return;
+        }
+        let idx = self.find_char_index_at(event.position);
+        if let Some(find) = self.find.as_mut() {
+            find.query.set_caret(idx, true);
+            find.query.caret_visible = true;
+        }
+        cx.notify();
+    }
+
+    fn on_find_query_mouse_up(&mut self, cx: &mut Context<Self>) {
+        if let Some(find) = self.find.as_mut() {
+            find.selecting = false;
+        }
+        cx.notify();
+    }
+
     pub(crate) fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let find = self.find.as_ref()?;
-        let query = find.query.clone();
         let status = find.status.clone();
-        let caret_visible = find.caret_visible;
         let focus = find.focus_handle.clone();
-        let empty_query = query.is_empty();
+        let empty_query = find.query.text.is_empty();
+        let query_el = find.query.into_element_bare();
 
         Some(
             div()
@@ -228,6 +300,44 @@ impl TerminalView {
                         .text_xs()
                         .text_color(theme::TEXT)
                         .overflow_hidden()
+                        .cursor_text()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.on_find_query_mouse_down(event, window, cx);
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                            this.on_find_query_mouse_move(event, cx);
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.on_find_query_mouse_up(cx);
+                            }),
+                        )
+                        .on_mouse_up_out(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.on_find_query_mouse_up(cx);
+                            }),
+                        )
+                        .child({
+                            let view = cx.entity();
+                            canvas(
+                                move |bounds, _, cx| {
+                                    view.update(cx, |this, _| {
+                                        if let Some(find) = this.find.as_mut() {
+                                            find.query_bounds = Some(bounds);
+                                        }
+                                    });
+                                    bounds
+                                },
+                                |_bounds, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full()
+                        })
                         .when(empty_query, |d| {
                             d.child(
                                 div()
@@ -238,31 +348,7 @@ impl TerminalView {
                                     .child("Search…"),
                             )
                         })
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .whitespace_nowrap()
-                                        .overflow_hidden()
-                                        .child(query),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(1.0))
-                                        .h(px(13.0))
-                                        .flex_shrink_0()
-                                        .bg(if caret_visible {
-                                            theme::TEXT
-                                        } else {
-                                            theme::TEXT.opacity(0.0)
-                                        }),
-                                ),
-                        ),
+                        .child(query_el),
                 )
                 .child(
                     div()
@@ -321,6 +407,7 @@ impl TerminalView {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         let chord = mods.control || mods.platform;
+        let shift = mods.shift;
 
         if key == "escape" {
             self.close_find(window, cx);
@@ -328,7 +415,7 @@ impl TerminalView {
             return;
         }
         if key == "enter" {
-            if mods.shift {
+            if shift {
                 self.find_prev(cx);
             } else {
                 self.find_next(cx);
@@ -337,7 +424,7 @@ impl TerminalView {
             return;
         }
         if key == "f3" {
-            if mods.shift {
+            if shift {
                 self.find_prev(cx);
             } else {
                 self.find_next(cx);
@@ -347,14 +434,65 @@ impl TerminalView {
         }
         if chord && key.eq_ignore_ascii_case("f") {
             if let Some(find) = self.find.as_mut() {
-                find.caret_visible = true;
+                if !find.query.text.is_empty() {
+                    find.query.select_all();
+                }
+                find.query.caret_visible = true;
                 find.focus_handle.clone().focus(window);
             }
             cx.stop_propagation();
             return;
         }
+        if chord && key.eq_ignore_ascii_case("a") {
+            if let Some(find) = self.find.as_mut() {
+                find.query.select_all();
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if chord && key.eq_ignore_ascii_case("c") {
+            if let Some(find) = self.find.as_ref() {
+                let text = if find.query.has_selection() {
+                    find.query.selected_text()
+                } else {
+                    find.query.text.clone()
+                };
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if chord && key.eq_ignore_ascii_case("x") {
+            let text = self.find.as_ref().map(|f| {
+                if f.query.has_selection() {
+                    f.query.selected_text()
+                } else {
+                    f.query.text.clone()
+                }
+            });
+            if let Some(text) = text.filter(|t| !t.is_empty()) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            if let Some(find) = self.find.as_mut() {
+                if find.query.has_selection() {
+                    find.query.delete_selection();
+                } else {
+                    find.query.text.clear();
+                    find.query.cursor = 0;
+                    find.query.anchor = 0;
+                }
+                find.query.caret_visible = true;
+            }
+            self.state.with_term_mut(|term| term.selection = None);
+            self.find_next(cx);
+            cx.stop_propagation();
+            return;
+        }
         if chord && key.eq_ignore_ascii_case("g") {
-            if mods.shift {
+            if shift {
                 self.find_prev(cx);
             } else {
                 self.find_next(cx);
@@ -366,8 +504,7 @@ impl TerminalView {
             if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
                 let cleaned = text.replace('\r', "").replace('\n', "");
                 if let Some(find) = self.find.as_mut() {
-                    find.query.push_str(&cleaned);
-                    find.caret_visible = true;
+                    find.query.insert(&cleaned);
                 }
                 self.state.with_term_mut(|term| term.selection = None);
                 self.find_next(cx);
@@ -375,36 +512,67 @@ impl TerminalView {
             cx.stop_propagation();
             return;
         }
+        if key == "left" {
+            if let Some(find) = self.find.as_mut() {
+                find.query.move_left(shift);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "right" {
+            if let Some(find) = self.find.as_mut() {
+                find.query.move_right(shift);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "home" {
+            if let Some(find) = self.find.as_mut() {
+                find.query.move_home(shift);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+        if key == "end" {
+            if let Some(find) = self.find.as_mut() {
+                find.query.move_end(shift);
+            }
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if key == "backspace" {
             if let Some(find) = self.find.as_mut() {
-                find.query.pop();
-                find.caret_visible = true;
+                find.query.backspace();
             }
             self.state.with_term_mut(|term| term.selection = None);
             self.find_next(cx);
             cx.stop_propagation();
             return;
         }
-        if !chord
-            && !mods.alt
-            && let Some(typed) = event.keystroke.key_char.as_deref()
-        {
-            let mut any = false;
+        if key == "delete" {
             if let Some(find) = self.find.as_mut() {
-                for ch in typed.chars() {
-                    if !ch.is_control() {
-                        find.query.push(ch);
-                        any = true;
-                    }
-                }
-                if any {
-                    find.caret_visible = true;
-                }
+                find.query.delete_forward();
             }
-            if any {
-                self.state.with_term_mut(|term| term.selection = None);
-                self.find_next(cx);
-                cx.stop_propagation();
+            self.state.with_term_mut(|term| term.selection = None);
+            self.find_next(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if !chord && !mods.alt {
+            if let Some(typed) = typed_text_from_keystroke(&event.keystroke) {
+                let cleaned: String = typed.chars().filter(|c| !c.is_control()).collect();
+                if !cleaned.is_empty() {
+                    if let Some(find) = self.find.as_mut() {
+                        find.query.insert(&cleaned);
+                    }
+                    self.state.with_term_mut(|term| term.selection = None);
+                    self.find_next(cx);
+                    cx.stop_propagation();
+                }
             }
         }
     }
