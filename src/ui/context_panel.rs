@@ -2863,7 +2863,7 @@ impl ContextPanel {
                     } else {
                         theme::TEXT_MUTED
                     })
-                    .child(format!("{} {label}", if checked { "✓" } else { "○" }))
+                    .child(format!("{} {label}", if checked { "☑" } else { "☐" }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(FilesPrompt::TransferSettings(form)) = this.prompt.as_mut() {
                             if let Some((_, on)) = form.exclude_presets.get_mut(i) {

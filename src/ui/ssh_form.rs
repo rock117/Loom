@@ -862,7 +862,7 @@ impl SshForm {
                                 .text_xs()
                                 .text_color(theme::TEXT)
                                 .cursor_pointer()
-                                .child(if enabled { "[x]" } else { "[ ]" })
+                                .child(if enabled { "☑" } else { "☐" })
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if let Some(r) = this.forwards.iter_mut().find(|f| f.id == id) {
                                         r.enabled = !r.enabled;
@@ -1034,9 +1034,9 @@ impl SshForm {
                             .text_xs()
                             .text_color(theme::TEXT)
                             .child(if edit.enabled {
-                                "[x] Enabled on connect"
+                                "☑ Enabled on connect"
                             } else {
-                                "[ ] Enabled on connect"
+                                "☐ Enabled on connect"
                             }),
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1505,9 +1505,9 @@ impl Render for SshForm {
                                         .text_sm()
                                         .text_color(theme::TEXT)
                                         .child(if self.remember {
-                                            "[x] Remember password (OS keyring)"
+                                            "☑ Remember password (OS keyring)"
                                         } else {
-                                            "[ ] Remember password (OS keyring)"
+                                            "☐ Remember password (OS keyring)"
                                         }),
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {

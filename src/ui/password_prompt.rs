@@ -238,9 +238,9 @@ impl Render for PasswordPrompt {
                             .text_sm()
                             .text_color(theme::TEXT)
                             .child(if self.remember {
-                                "[x] Remember password"
+                                "☑ Remember password"
                             } else {
-                                "[ ] Remember password"
+                                "☐ Remember password"
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.remember = !this.remember;
