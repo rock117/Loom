@@ -1,0 +1,20 @@
+---
+description: Loom 常犯硬坑速查（IME / 输入框 / UI 卡死）— 改 UI 前先过
+alwaysApply: true
+---
+
+# Loom recurring pitfalls (do not repeat)
+
+Before UI / terminal / session changes, skim:
+
+1. **`docs/HARD_PROBLEMS.md`** — UI freeze checklist (no block/nested `term` lock on frame or click path).
+2. **`docs/TERMINAL_IME.md`** — printable/CJK → InputHandler; Enter → KeyDown; `handle_input` FocusHandle must match the focused surface.
+3. **`docs/TEXT_FIELDS.md`** — every text field: `RenameEdit` + select + copy/cut/paste (+ IME if focused).
+
+**Quick bans:**
+- Bare `String` input with only push/pop and no selection
+- New focusable editor without wiring `handle_input` to the same focus (CJK silent drop)
+- `with_term*` while paint already holds `term_arc`
+- Sync SSH / disk / `recv` / keyring on the UI thread
+
+File-scoped rules also apply: `text-fields.mdc`, `terminal-ime-focus.mdc`, `ui-thread-freeze.mdc`.

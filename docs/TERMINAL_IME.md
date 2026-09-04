@@ -1,6 +1,6 @@
 # 终端 IME（中文输入）与回车
 
-知识笔记：记录 Loom 终端无法输入中文、以及接入 IME 后回车失效的排查过程与最终模型。  
+知识笔记：记录 Loom 终端无法输入中文、接入 IME 后回车失效、以及 **Ctrl+F 搜索框无法输入中文** 的排查与最终模型。  
 **不属于架构规格**；平台坑索引见 [HARD_PROBLEMS.md](./HARD_PROBLEMS.md)。
 
 ---
@@ -8,7 +8,8 @@
 ## 现象
 
 1. **只能打英文**：切换到中文输入法后，拼音/候选确认后的汉字进不了 shell。  
-2. **接入 IME 后回车没反应**：中英文输入后按 Enter，命令不提交。
+2. **接入 IME 后回车没反应**：中英文输入后按 Enter，命令不提交。  
+3. **搜索框（Ctrl+F）无法输入中文**：Find 打开后英文字母可打，中文组字确认后查询框不变；终端 PTY 路径本身正常。
 
 ---
 
@@ -74,6 +75,67 @@ KeyDown
 
 ---
 
+## Ctrl+F 搜索框无法输入中文（2026-09）
+
+### 现象
+
+Find 条聚焦后：
+
+- 英文仍可通过 Find 自己的 `on_key_down` + `key_char` / `typed_text_from_keystroke` 写入查询；  
+- 中文 IME 上屏后 **查询字符串不变**（与 shell 里中文是否正常无关）。
+
+### 根因
+
+Find 打开时焦点切到 **`find.focus_handle`**，而 paint 里原先始终：
+
+```text
+window.handle_input(&terminal.focus_handle, ElementInputHandler::new(term_bounds, …))
+```
+
+GPUI / Windows 只把 IME / `WM_CHAR` 交给 **当前焦点匹配** 的 `InputHandler`。  
+Find 聚焦 → 终端 `focus_handle` 对不上 → **组字结果被丢弃**。  
+Find 条又只靠 KeyDown 读 `key_char`，CJK 上屏不走这条路 → 表现为「搜不了中文」。
+
+这与上文「终端缺 IME」是同一类坑，只是 **焦点与 `handle_input` 绑定错位**。
+
+### 解决方案
+
+1. **Paint 时按模式绑定 InputHandler**  
+   - Find 打开：`handle_input(&find.focus_handle, …)`，bounds 优先用查询框 `query_bounds`（候选窗位置）。  
+   - Find 关闭：仍绑 `terminal.focus_handle` + 终端 bounds。
+
+2. **`EntityInputHandler` 在 Find 打开时改写查询，不写 PTY**  
+   - `replace_text_in_range` / `insert_composed_text`：把提交文本 `insert` 进 `FindState.query`（`RenameEdit`），再 `find_next`。  
+   - `selected_text_range` / `text_for_range`：按查询串的 UTF-16 选区汇报，方便 IME 替换范围。  
+   - `bounds_for_range`：返回查询框 bounds。  
+   - Preedit 仍只记 `ime_marked`，由系统候选 UI 展示（与 PTY 路径一致）。
+
+3. **Find 的 KeyDown 继续管** Esc / Enter / F3、剪贴板、方向键选区；**不要**指望 KeyDown 的 `key_char` 承载 CJK。
+
+```
+Find 打开 + 焦点在 find.focus_handle
+  ├─ KeyDown（find bar）→ 控制键 / 英文 key_char / 选区
+  └─ handle_input(find.focus_handle)
+       └─ IME commit / WM_CHAR → insert_composed_text → query.insert → find_next
+```
+
+### 失败尝试（勿重复）
+
+| 尝试 | 结果 |
+|------|------|
+| 只加强 Find 的 KeyDown / `typed_text_from_keystroke` | 英文可以，中文仍无（IME 根本没到 Find） |
+| Find 聚焦却仍 `handle_input(terminal.focus_handle)` | IME 提交对不上焦点，静默丢弃 |
+| IME 提交仍 `write_to_pty` | 汉字进 shell 而非搜索框 |
+
+### 相关代码（Find）
+
+| 路径 | 职责 |
+|------|------|
+| `src/terminal/gpui_emu/view/mod.rs` | paint 里按 Find 切换 `handle_input` 焦点；`insert_composed_text` / `EntityInputHandler` 分流 |
+| `src/terminal/gpui_emu/view/find.rs` | Find 条 UI、`RenameEdit` 查询、KeyDown 选区 |
+
+---
+
 ## 失败尝试（勿重复）
 
 | 尝试 | 结果 |
@@ -89,7 +151,8 @@ KeyDown
 
 | 路径 | 职责 |
 |------|------|
-| `src/terminal/gpui_emu/view/mod.rs` | `EntityInputHandler`、`on_key_down`、`handle_input`、IME 状态 |
+| `src/terminal/gpui_emu/view/mod.rs` | `EntityInputHandler`、`on_key_down`、`handle_input`、IME 状态、Find 分流 |
+| `src/terminal/gpui_emu/view/find.rs` | Ctrl+F 查询条 |
 | `src/terminal/gpui_emu/input.rs` | `keystroke_to_bytes`（仅 Escape/控制） |
 | GPUI `platform/windows/events.rs` | `WM_IME_*`、`WM_CHAR`、`marked_text_range` 与 TranslateMessage |
 
@@ -100,4 +163,6 @@ KeyDown
 1. **可打印 / CJK → InputHandler**；**Enter / Tab / 方向键 / Ctrl 序列 → KeyDown**。  
 2. KeyDown 一旦写入 PTY，必须 **`stop_propagation`**，避免再走 `WM_CHAR` 重复。  
 3. **不要用 `key_char.is_some()` 判断「交给 IME」**——Enter 也可能带 `key_char`。  
-4. `marked_text_range` 只在真正有 preedit 时返回 `Some`，否则 Windows 会吞掉后续 KeyDown（含 Enter）。
+4. `marked_text_range` 只在真正有 preedit 时返回 `Some`，否则 Windows 会吞掉后续 KeyDown（含 Enter）。  
+5. **`handle_input` 的 `FocusHandle` 必须与当前接收文本的表面一致**（终端 vs Find）；另开焦点却仍绑旧 handle → CJK 静默丢失。  
+6. **可编辑文本一律 `RenameEdit` + 选区/剪贴板**，见 [TEXT_FIELDS.md](./TEXT_FIELDS.md)；禁止再加裸 `String` 输入行。

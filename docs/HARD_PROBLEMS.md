@@ -4,6 +4,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 
 - Prefer a short **symptom → failed attempts → what worked → rule** write-up for each incident.
 - Keep the standing **UI freeze checklist** (below) up to date whenever a new freeze class appears — include **GPUI framework** patterns, not only Loom bugs.
+- Text-field UX (selection / clipboard / IME): [TEXT_FIELDS.md](./TEXT_FIELDS.md).
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---
@@ -144,6 +145,32 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **完整过程（失败尝试 + 规则）：** [TERMINAL_IME.md](./TERMINAL_IME.md)。
 
 **代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/terminal/gpui_emu/input.rs`。
+
+---
+
+### 2026-09-05 — Ctrl+F 搜索框无法输入中文
+
+**现象：** Find 条能打英文，中文 IME 上屏后查询不变；终端 shell 内中文正常。
+
+**原因归类：** Find 聚焦到 `find.focus_handle`，但 `handle_input` 仍绑终端 `focus_handle` → IME / `WM_CHAR` 对不上焦点被丢弃；Find 只靠 KeyDown `key_char`，接不住 CJK。
+
+**有效做法：** Find 打开时 `handle_input` 改绑 find 焦点与查询框 bounds；`insert_composed_text` / `EntityInputHandler` 写入 `FindState.query` 而非 PTY。
+
+**完整说明：** [TERMINAL_IME.md](./TERMINAL_IME.md) 一节「Ctrl+F 搜索框无法输入中文」。
+
+**代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/terminal/gpui_emu/view/find.rs`。
+
+---
+
+### 2026-09-05 — 搜索框无选区 / 拷贝（同类：裸 String 输入）
+
+**现象：** Ctrl+F 查询只能在末尾增删，无法拖选、Ctrl+C 选区；同期常伴随「只有英文能打」。
+
+**原因归类：** 用裸 `String` + KeyDown `push`/`pop` 画文本，没有 `RenameEdit` 选区模型；CJK 另需 `handle_input` 与焦点一致（见上条）。
+
+**有效做法：** 查询改为 `RenameEdit`；键盘/鼠标选区与剪贴板对齐 SSH 表单；IME 见 [TERMINAL_IME.md](./TERMINAL_IME.md)。**凡新输入框**遵循 [TEXT_FIELDS.md](./TEXT_FIELDS.md)。
+
+**代码：** `src/ui/rename_edit.rs`、`src/terminal/gpui_emu/view/find.rs`。
 
 ---
 

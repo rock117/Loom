@@ -1,0 +1,20 @@
+---
+description: 文本输入必须用 RenameEdit，支持选区/拷贝粘贴/IME
+globs: src/ui/**/*.rs,src/terminal/gpui_emu/view/**/*.rs
+alwaysApply: false
+---
+
+# Text fields (selection + clipboard + IME)
+
+Read `docs/TEXT_FIELDS.md` before adding or changing any editable text UI.
+
+**Required for every input:**
+- Use `RenameEdit` (not a bare `String` + push/pop)
+- Selection visible via `into_element` / `into_element_bare` / masked variant
+- Ctrl+A / C / X / V, Shift+Insert; mouse drag-select
+- Paste/insert/backspace replace or respect selection
+- Chinese IME: if this surface has its own `FocusHandle`, `handle_input` must use **that** handle (see `docs/TERMINAL_IME.md`)
+
+**Do not ship:** KeyDown-only `query.push(ch)` fields without selection (Find bar regression class).
+
+**Known debt (fix when touching):** `PasswordPrompt`, Settings inline shell/font/proxy editors — migrate to `RenameEdit`.

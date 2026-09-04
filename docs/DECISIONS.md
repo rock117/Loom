@@ -141,7 +141,7 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 **Why:** Matches common terminal UX; avoids building a separate highlighter; reuses selection paint.
 
-**Consequences / follow-ups:** Regex mode / match count / highlight-all can come later if needed.
+**Consequences / follow-ups:** Regex mode / match count / highlight-all can come later if needed. Query field must bind `handle_input` to find focus for CJK — see [TERMINAL_IME.md](./TERMINAL_IME.md)（Ctrl+F 搜索框）。
 
 ---
 

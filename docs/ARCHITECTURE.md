@@ -6,6 +6,8 @@ It is a design guide, not a license to copy Zed source. Do not paste Zed crates 
 
 For **why we chose X over Y**, see [DECISIONS.md](./DECISIONS.md).  
 For **non-obvious GPUI/platform pitfalls** (including UI-thread freeze / deadlock checklist), see [HARD_PROBLEMS.md](./HARD_PROBLEMS.md).  
+For **自定义文本输入框（选区 / 拷贝粘贴 / IME）**, see [TEXT_FIELDS.md](./TEXT_FIELDS.md).  
+For **终端 IME / Ctrl+F 中文**, see [TERMINAL_IME.md](./TERMINAL_IME.md).  
 For **three-column context panel** (Files/SFTP + Info), see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md).  
 For **SFTP 连接池 / 浏览与传输并行 / 资源回收**（中文规格）, see [SFTP_POOL.md](./SFTP_POOL.md).  
 For **Docker 会话（exec + Files / docker cp）**（中文规格，尚未实现）, see [DOCKER_SESSION.md](./DOCKER_SESSION.md).  

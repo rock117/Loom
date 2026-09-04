@@ -1,0 +1,25 @@
+---
+description: Windows IME / 文本输入焦点必须与 handle_input 一致（防 CJK 静默丢失）
+globs: src/terminal/**/*.rs,src/ui/**/*edit*.rs,src/ui/**/find*.rs,docs/TERMINAL_IME.md
+alwaysApply: false
+---
+
+# Text input + IME (Loom)
+
+Before changing any **text field / find bar / overlay editor** that takes focus:
+
+1. Read `docs/TERMINAL_IME.md` (esp. Ctrl+F section + rules at the bottom).
+2. Ask: **who owns printable / CJK text?**
+   - Terminal PTY → `EntityInputHandler` + `handle_input(&terminal.focus_handle, …)`
+   - Find / other chrome → must `handle_input` the **same** `FocusHandle` that `track_focus` uses when that surface is active
+3. **Never** assume `KeyDown` + `key_char` is enough for Chinese — on Windows, IME commit is `WM_IME_*` / `WM_CHAR` → InputHandler only.
+4. If you add a new focusable input on `TerminalView` (or split focus away from the terminal):
+   - Paint-time `window.handle_input` must switch with that mode
+   - `replace_text_in_range` / `insert_composed_text` must write into **that** buffer, not only the PTY
+   - `bounds_for_range` should prefer the field bounds (IME candidate window)
+5. Checklist before done:
+   - [ ] English typing works
+   - [ ] Chinese IME commit lands in the **intended** field (not dropped, not sent to the wrong surface)
+   - [ ] Enter / Esc still work (KeyDown path; do not gate IME on `key_char.is_some()`)
+
+Anti-pattern that already bit us: Find bar got `RenameEdit` + KeyDown selection, but `handle_input` stayed on the terminal focus → CJK silently discarded.

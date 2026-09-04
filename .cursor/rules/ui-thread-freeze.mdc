@@ -1,0 +1,30 @@
+---
+description: 防止 UI 卡死——frame/事件路径禁止阻塞与嵌套 term 锁（对照 HARD_PROBLEMS）
+globs: src/terminal/**/*.rs,src/ui/**/*.rs,src/session/**/*.rs
+alwaysApply: false
+---
+
+# UI thread freezes (Loom + GPUI)
+
+Before changing paint, `Render`, click/key handlers, PTY/SSH connect, or anything under a `Mutex` on the UI path:
+
+1. Read `docs/HARD_PROBLEMS.md` → **UI thread freezes — checklist** (sections A–D).
+2. Ask: **can this run on the window thread while a frame or input is in flight?**
+   - If latency is unknown (SSH, disk, keyring, DNS, `recv`, dialogs) → **not** on that stack.
+3. Hard bans on UI / frame / click / paint stacks:
+   - Blocking `.recv()`, `sleep`, `block_on`, sync network/file/keyring
+   - Holding `term` / `stdin_writer` / store locks across `cx.notify()`, paint children, or nested GPUI
+   - Calling `with_term` / `with_term_mut` while canvas paint **already** holds `term_arc.lock()`
+   - Per-chunk `cx.notify()` on PTY flood (coalesce — see `docs/PTY_OUTPUT_COALESCE.md`; never drop bytes)
+4. Prefer proven patterns:
+   - SSH: worker thread + `flume` + `cx.spawn` await (see `tab_manager`)
+   - Paint: lock → snapshot / use `&Term` you already hold → **drop** → then notify
+   - Gutter / chrome sizing: cached `cols`/`rows`/`scrollback`, not a nested term lock
+5. Checklist before done:
+   - [ ] No new nested lock on the same `parking_lot::Mutex` in one call stack
+   - [ ] No blocking I/O on render/event path
+   - [ ] Smoke: open Local + SSH tab after the change (idle CPU hang = deadlock until proven otherwise)
+
+**Diagnosis reminder:** Idle CPU + frozen UI ≈ deadlock/blocking wait; high CPU ≈ notify spin or too much per-frame work. Do not first blame “feature is slow” when enabling it freezes the app.
+
+When a **new** freeze class is confirmed, add a dated incident under `HARD_PROBLEMS.md` Incident log (symptom → cause → fix → rule).
