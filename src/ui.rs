@@ -15,6 +15,7 @@ pub mod tab_bar;
 pub mod tab_manager;
 pub mod terminal_pane;
 pub mod tooltip;
+pub mod transfer_settings;
 pub mod widgets;
 pub mod workspace_store;
 pub mod workspace_view;

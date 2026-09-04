@@ -8,3 +8,5 @@ pub mod local_fs;
 pub mod local_proxy;
 pub mod sftp;
 pub mod ssh;
+pub mod transfer_archive;
+pub mod transfer_filter;

@@ -35,10 +35,14 @@ Windows-style navigation:
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
-| Toolbar Upload (SSH) | Pick local **file** → upload into **current** remote dir |
-| Toolbar Upload folder (SSH) | Pick local **folder** → recursive upload (`upload_tree`) |
-| Drag-drop (SSH) | Drop files/folders from OS onto the file list → upload into current remote dir |
-| ↓ button (SSH) | Download selected (file or recursive folder) via save dialog |
+| Toolbar Upload (SSH) | Pick local **file** → **settings** (remote dir / include·exclude / compress) → upload |
+| Toolbar Upload folder (SSH) | Pick local **folder** → same settings dialog → recursive upload |
+| Drag-drop (SSH) | Drop files/folders → settings dialog → upload into chosen remote dir |
+| ↓ button (SSH) | Download selected → **settings** (local folder / include·exclude / compress) → transfer |
+
+Settings dialog defaults: local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH double-click open** still skips settings (confirm → temp download → open).
+
+Compress: upload zips locally then sends `.zip`; download tries remote `zip` → `tar.gz` → `tar` → `7z` → `gzip`, then saves the archive file into the chosen local folder (does not auto-extract).
 
 File rows use **type-specific SVG icons** tinted with Seti colors (VS Code built-in Explorer palette): folders, git, Rust hexagon, Python, Markdown `M↓`, JSON braces, shell green, etc.
 
@@ -107,7 +111,8 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 | SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
-| UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs` |
+| UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs`、`src/ui/transfer_settings.rs` |
+| Transfer filter / archive | `src/session/transfer_filter.rs`、`src/session/transfer_archive.rs` |
 | Open path | `src/platform.rs` (`open_path` / `open_path_detached`) |
 | Pane handle | `PaneSession.ssh_sftp` |
 

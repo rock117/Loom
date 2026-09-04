@@ -11,6 +11,8 @@ use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::ssh::ClientHandler;
+use super::transfer_archive;
+use super::transfer_filter::{FilterMatcher, TransferFilter};
 
 /// Shared flag: UI sets true on Remove/Clear so the transfer lane aborts and frees up.
 pub type TransferCancel = Arc<AtomicBool>;
@@ -24,6 +26,13 @@ fn ensure_not_cancelled(cancel: &TransferCancel) -> Result<()> {
         bail!("cancelled");
     }
     Ok(())
+}
+
+/// Include/exclude globs plus optional remote/local compression for a transfer.
+#[derive(Debug, Clone, Default)]
+pub struct TransferOptions {
+    pub filter: TransferFilter,
+    pub compress: bool,
 }
 
 /// One remote directory entry for the Files browser.
@@ -50,6 +59,10 @@ pub struct TransferProgress {
     pub overall_done: Option<u64>,
     /// Total bytes for the whole job (file size or sum of folder files).
     pub overall_total: Option<u64>,
+    /// Optional UI label update (e.g. archive filename after remote compress).
+    pub label: Option<String>,
+    /// Optional local path update (e.g. final archive path).
+    pub local_path: Option<PathBuf>,
 }
 
 /// Result of a finished upload/download.
@@ -57,6 +70,8 @@ pub struct TransferProgress {
 pub struct TransferOutcome {
     pub files: u32,
     pub bytes: u64,
+    /// When set (compressed download), the archive path that was written.
+    pub saved_as: Option<PathBuf>,
 }
 
 fn progress_msg(
@@ -76,6 +91,8 @@ fn progress_msg(
         files_total,
         overall_done,
         overall_total,
+        label: None,
+        local_path: None,
     }
 }
 
@@ -92,6 +109,7 @@ pub enum SftpRequest {
         id: uuid::Uuid,
         remote: String,
         local: PathBuf,
+        options: TransferOptions,
         progress: Sender<TransferProgress>,
         reply: Sender<Result<TransferOutcome>>,
         cancel: TransferCancel,
@@ -100,6 +118,7 @@ pub enum SftpRequest {
         id: uuid::Uuid,
         local: PathBuf,
         remote_dir: String,
+        options: TransferOptions,
         progress: Sender<TransferProgress>,
         reply: Sender<Result<TransferOutcome>>,
         cancel: TransferCancel,
@@ -277,7 +296,7 @@ async fn run_lane(
                                 continue;
                             }
                             let Some((ref s, _)) = sftp else { continue };
-                            dispatch_request(s, req).await;
+                            dispatch_request(&session, s, req).await;
                         }
                         Err(_) => break,
                     }
@@ -296,7 +315,7 @@ async fn run_lane(
                 continue;
             }
             let Some((ref s, _)) = sftp else { continue };
-            dispatch_request(s, req).await;
+            dispatch_request(&session, s, req).await;
         }
     }
 
@@ -333,7 +352,11 @@ async fn ensure_session(
     }
 }
 
-async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
+async fn dispatch_request(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    req: SftpRequest,
+) {
     match req {
         SftpRequest::Home { reply } => {
             let _ = reply.send(
@@ -349,21 +372,28 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
             id,
             remote,
             local,
+            options,
             progress,
             reply,
             cancel,
         } => {
-            let _ = reply.send(download_path(sftp, id, &remote, &local, &progress, &cancel).await);
+            let _ = reply.send(
+                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
+                    .await,
+            );
         }
         SftpRequest::Upload {
             id,
             local,
             remote_dir,
+            options,
             progress,
             reply,
             cancel,
         } => {
-            let _ = reply.send(upload_path(sftp, id, &local, &remote_dir, &progress, &cancel).await);
+            let _ = reply.send(
+                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
+            );
         }
         SftpRequest::Mkdir { path, reply } => {
             let _ = reply.send(
@@ -491,9 +521,24 @@ async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {
     Ok(out)
 }
 
+fn join_rel(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn path_basename(path: &str) -> String {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
 async fn count_remote_files(
     sftp: &SftpSession,
     remote: &str,
+    rel: &str,
+    filter: &FilterMatcher,
     id: uuid::Uuid,
     progress: &Sender<TransferProgress>,
     found: &mut u32,
@@ -505,7 +550,11 @@ async fn count_remote_files(
         .metadata(remote.to_string())
         .await
         .with_context(|| format!("stat {remote}"))?;
-    if meta.file_type().is_dir() {
+    let is_dir = meta.file_type().is_dir();
+    if !filter.allows(rel, is_dir) {
+        return Ok(0);
+    }
+    if is_dir {
         let mut n = 0u32;
         for entry in sftp
             .read_dir(remote.to_string())
@@ -513,9 +562,13 @@ async fn count_remote_files(
             .with_context(|| format!("read_dir {remote}"))?
         {
             ensure_not_cancelled(cancel)?;
+            let name = entry.file_name();
+            let child_rel = join_rel(rel, &name);
             n += Box::pin(count_remote_files(
                 sftp,
                 &entry.path(),
+                &child_rel,
+                filter,
                 id,
                 progress,
                 found,
@@ -543,6 +596,8 @@ async fn count_remote_files(
 
 async fn count_local_files(
     local: &Path,
+    rel: &str,
+    filter: &FilterMatcher,
     id: uuid::Uuid,
     progress: &Sender<TransferProgress>,
     found: &mut u32,
@@ -553,15 +608,24 @@ async fn count_local_files(
     let meta = tokio::fs::metadata(local)
         .await
         .with_context(|| format!("stat {}", local.display()))?;
-    if meta.is_dir() {
+    let is_dir = meta.is_dir();
+    if !filter.allows(rel, is_dir) {
+        return Ok(0);
+    }
+    if is_dir {
         let mut n = 0u32;
         let mut rd = tokio::fs::read_dir(local)
             .await
             .with_context(|| format!("read_dir {}", local.display()))?;
         while let Some(entry) = rd.next_entry().await? {
             ensure_not_cancelled(cancel)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let child_rel = join_rel(rel, &name);
             n += Box::pin(count_local_files(
                 &entry.path(),
+                &child_rel,
+                filter,
                 id,
                 progress,
                 found,
@@ -590,14 +654,23 @@ async fn count_local_files(
 }
 
 async fn download_path(
+    session: &client::Handle<ClientHandler>,
     sftp: &SftpSession,
     id: uuid::Uuid,
     remote: &str,
     local: &Path,
+    options: &TransferOptions,
     progress: &Sender<TransferProgress>,
     cancel: &TransferCancel,
 ) -> Result<TransferOutcome> {
     ensure_not_cancelled(cancel)?;
+    if options.compress {
+        return download_compressed(session, sftp, id, remote, local, options, progress, cancel)
+            .await;
+    }
+
+    let filter = options.filter.matcher()?;
+    let root_rel = path_basename(remote);
     let meta = sftp
         .metadata(remote.to_string())
         .await
@@ -608,6 +681,8 @@ async fn download_path(
         let files_total = count_remote_files(
             sftp,
             remote,
+            &root_rel,
+            &filter,
             id,
             progress,
             &mut found,
@@ -632,6 +707,8 @@ async fn download_path(
             id,
             remote,
             local,
+            &root_rel,
+            &filter,
             progress,
             &mut files_done,
             files_total,
@@ -643,13 +720,82 @@ async fn download_path(
         Ok(TransferOutcome {
             files: files_done,
             bytes: bytes_done,
+            saved_as: None,
         })
     } else {
+        if !filter.allows(&root_rel, false) {
+            bail!("remote file excluded by filter");
+        }
         let bytes =
             download_file(sftp, id, remote, local, meta.size, progress, None, None, cancel)
                 .await?;
-        Ok(TransferOutcome { files: 1, bytes })
+        Ok(TransferOutcome {
+            files: 1,
+            bytes,
+            saved_as: None,
+        })
     }
+}
+
+async fn download_compressed(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    id: uuid::Uuid,
+    remote: &str,
+    local: &Path,
+    options: &TransferOptions,
+    progress: &Sender<TransferProgress>,
+    cancel: &TransferCancel,
+) -> Result<TransferOutcome> {
+    ensure_not_cancelled(cancel)?;
+    let filter = options.filter.matcher()?;
+    let excludes = filter.exclude_patterns();
+    let archive =
+        transfer_archive::remote_create_archive(session, remote, &excludes, cancel).await?;
+
+    let root_name = path_basename(remote);
+    tokio::fs::create_dir_all(local)
+        .await
+        .with_context(|| format!("mkdir {}", local.display()))?;
+    let archive_name = format!("{root_name}.{}", archive.ext);
+    let local_archive = local.join(&archive_name);
+
+    let meta = sftp
+        .metadata(archive.remote_path.clone())
+        .await
+        .with_context(|| format!("stat {}", archive.remote_path))?;
+    let size = meta.size;
+    let _ = progress.try_send(TransferProgress {
+        id,
+        done: 0,
+        total: size,
+        files_done: Some(0),
+        files_total: Some(1),
+        overall_done: Some(0),
+        overall_total: size,
+        label: Some(archive_name),
+        local_path: Some(local_archive.clone()),
+    });
+    let bytes = download_file(
+        sftp,
+        id,
+        &archive.remote_path,
+        &local_archive,
+        size,
+        progress,
+        None,
+        size,
+        cancel,
+    )
+    .await?;
+
+    let _ = sftp.remove_file(archive.remote_path.clone()).await;
+
+    Ok(TransferOutcome {
+        files: 1,
+        bytes,
+        saved_as: Some(local_archive),
+    })
 }
 
 async fn download_tree(
@@ -657,6 +803,8 @@ async fn download_tree(
     id: uuid::Uuid,
     remote: &str,
     local: &Path,
+    rel: &str,
+    filter: &FilterMatcher,
     progress: &Sender<TransferProgress>,
     files_done: &mut u32,
     files_total: u32,
@@ -669,7 +817,11 @@ async fn download_tree(
         .metadata(remote.to_string())
         .await
         .with_context(|| format!("stat {remote}"))?;
-    if meta.file_type().is_dir() {
+    let is_dir = meta.file_type().is_dir();
+    if !filter.allows(rel, is_dir) {
+        return Ok(());
+    }
+    if is_dir {
         tokio::fs::create_dir_all(local)
             .await
             .with_context(|| format!("mkdir {}", local.display()))?;
@@ -682,11 +834,14 @@ async fn download_tree(
             let name = entry.file_name();
             let child_remote = entry.path();
             let child_local = local.join(&name);
+            let child_rel = join_rel(rel, &name);
             Box::pin(download_tree(
                 sftp,
                 id,
                 &child_remote,
                 &child_local,
+                &child_rel,
+                filter,
                 progress,
                 files_done,
                 files_total,
@@ -792,6 +947,7 @@ async fn upload_path(
     id: uuid::Uuid,
     local: &Path,
     remote_dir: &str,
+    options: &TransferOptions,
     progress: &Sender<TransferProgress>,
     cancel: &TransferCancel,
 ) -> Result<TransferOutcome> {
@@ -800,6 +956,62 @@ async fn upload_path(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow::anyhow!("invalid local path"))?;
+
+    if options.compress {
+        let filter_opts = options.filter.clone();
+        let zip_path = transfer_archive::temp_zip_path(name);
+        let local_owned = local.to_path_buf();
+        let zip_owned = zip_path.clone();
+        let cancel_owned = cancel.clone();
+        let archive_name = format!("{name}.zip");
+        let _ = progress.try_send(TransferProgress {
+            id,
+            done: 0,
+            total: None,
+            files_done: Some(0),
+            files_total: Some(1),
+            overall_done: Some(0),
+            overall_total: None,
+            label: Some(archive_name.clone()),
+            local_path: None,
+        });
+        tokio::task::spawn_blocking(move || {
+            let matcher = filter_opts
+                .matcher()
+                .map_err(|e| anyhow::anyhow!("filter: {e:#}"))?;
+            transfer_archive::zip_local(&local_owned, &zip_owned, &matcher, &cancel_owned)
+                .map_err(|e| anyhow::anyhow!("local zip failed: {e:#}"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("zip task join: {e}"))??;
+
+        let remote = join_remote(remote_dir, &archive_name);
+        let meta = tokio::fs::metadata(&zip_path)
+            .await
+            .with_context(|| format!("stat {}", zip_path.display()))?;
+        let bytes = upload_file(
+            sftp,
+            id,
+            &zip_path,
+            &remote,
+            meta.len(),
+            progress,
+            None,
+            Some(meta.len()),
+            cancel,
+        )
+        .await;
+        let _ = tokio::fs::remove_file(&zip_path).await;
+        let bytes = bytes.with_context(|| format!("upload compressed {archive_name}"))?;
+        return Ok(TransferOutcome {
+            files: 1,
+            bytes,
+            saved_as: None,
+        });
+    }
+
+    let filter = options.filter.matcher()?;
+    let root_rel = name.to_string();
     let remote = join_remote(remote_dir, name);
     let meta = tokio::fs::metadata(local)
         .await
@@ -807,8 +1019,17 @@ async fn upload_path(
     if meta.is_dir() {
         let mut found = 0u32;
         let mut bytes_total = 0u64;
-        let files_total =
-            count_local_files(local, id, progress, &mut found, &mut bytes_total, cancel).await?;
+        let files_total = count_local_files(
+            local,
+            &root_rel,
+            &filter,
+            id,
+            progress,
+            &mut found,
+            &mut bytes_total,
+            cancel,
+        )
+        .await?;
         ensure_not_cancelled(cancel)?;
         let _ = progress.try_send(progress_msg(
             id,
@@ -826,6 +1047,8 @@ async fn upload_path(
             id,
             local,
             remote_dir,
+            &root_rel,
+            &filter,
             progress,
             &mut files_done,
             files_total,
@@ -837,8 +1060,12 @@ async fn upload_path(
         Ok(TransferOutcome {
             files: files_done,
             bytes: bytes_done,
+            saved_as: None,
         })
     } else if meta.is_file() {
+        if !filter.allows(&root_rel, false) {
+            bail!("local file excluded by filter");
+        }
         let bytes = upload_file(
             sftp,
             id,
@@ -851,7 +1078,11 @@ async fn upload_path(
             cancel,
         )
         .await?;
-        Ok(TransferOutcome { files: 1, bytes })
+        Ok(TransferOutcome {
+            files: 1,
+            bytes,
+            saved_as: None,
+        })
     } else {
         bail!("unsupported local entry {}", local.display());
     }
@@ -862,6 +1093,8 @@ async fn upload_tree(
     id: uuid::Uuid,
     local: &Path,
     remote_dir: &str,
+    rel: &str,
+    filter: &FilterMatcher,
     progress: &Sender<TransferProgress>,
     files_done: &mut u32,
     files_total: u32,
@@ -878,6 +1111,9 @@ async fn upload_tree(
     let meta = tokio::fs::metadata(local)
         .await
         .with_context(|| format!("stat {}", local.display()))?;
+    if !filter.allows(rel, meta.is_dir()) {
+        return Ok(());
+    }
     if meta.is_dir() {
         let _ = sftp.create_dir(remote.clone()).await;
         let mut rd = tokio::fs::read_dir(local)
@@ -885,11 +1121,16 @@ async fn upload_tree(
             .with_context(|| format!("read_dir {}", local.display()))?;
         while let Some(entry) = rd.next_entry().await? {
             ensure_not_cancelled(cancel)?;
+            let child_name = entry.file_name();
+            let child_name = child_name.to_string_lossy();
+            let child_rel = join_rel(rel, &child_name);
             Box::pin(upload_tree(
                 sftp,
                 id,
                 &entry.path(),
                 &remote,
+                &child_rel,
+                filter,
                 progress,
                 files_done,
                 files_total,

@@ -12,14 +12,17 @@ use crate::platform;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
 use crate::session::sftp::{
-    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferProgress, join_remote,
-    parent_remote, transfer_cancel_flag,
+    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferOptions, TransferProgress,
+    join_remote, parent_remote, transfer_cancel_flag,
 };
 use crate::shared::theme;
 use crate::ui::file_icon;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::tab_manager::TabManager;
 use crate::ui::tooltip::Tooltip;
+use crate::ui::transfer_settings::{
+    PendingTransfer, TransferField, TransferSettingsForm, default_download_dir,
+};
 use crate::ui::workspace_store::WorkspaceStore;
 
 const ICON: f32 = 13.0;
@@ -134,6 +137,8 @@ enum FilesPrompt {
     ConfirmOpenRemote {
         entry: RemoteEntry,
     },
+    /// Upload/download settings before starting the transfer.
+    TransferSettings(TransferSettingsForm),
 }
 
 pub struct ContextPanel {
@@ -159,6 +164,10 @@ pub struct ContextPanel {
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
     prompt: Option<FilesPrompt>,
+    /// Remember compress checkbox across transfers in this session.
+    last_compress: bool,
+    /// Last local download destination directory.
+    last_download_dir: Option<String>,
     /// Address-bar editor for the Files cwd (copy / paste / Enter to navigate).
     path_edit: RenameEdit,
     editing_path: bool,
@@ -227,6 +236,8 @@ impl ContextPanel {
             transfer_menu: None,
             entry_menu: None,
             prompt: None,
+            last_compress: false,
+            last_download_dir: None,
             path_edit: RenameEdit::new(""),
             editing_path: false,
             search_edit: RenameEdit::new(""),
@@ -616,12 +627,45 @@ impl ContextPanel {
         let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() else {
             return;
         };
-        self.download_entry(entry, false, cx);
+        self.begin_transfer_download(entry, cx);
     }
 
-    /// Download a remote entry. When `open_after`, skip the save dialog, write under
+    fn begin_transfer_download(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
+        let dest = self
+            .last_download_dir
+            .clone()
+            .unwrap_or_else(default_download_dir);
+        let form =
+            TransferSettingsForm::for_download(entry, dest, self.last_compress);
+        self.prompt = Some(FilesPrompt::TransferSettings(form));
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn begin_transfer_upload(
+        &mut self,
+        pane_id: Uuid,
+        locals: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let dest = self.cwd.clone().unwrap_or_else(|| ".".into());
+        let form =
+            TransferSettingsForm::for_upload(pane_id, locals, dest, self.last_compress);
+        self.prompt = Some(FilesPrompt::TransferSettings(form));
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    /// Download a remote entry. When `open_after`, skip the settings dialog, write under
     /// a temp folder, and open with the OS default app when the transfer completes.
-    fn download_entry(&mut self, entry: RemoteEntry, open_after: bool, cx: &mut Context<Self>) {
+    fn download_entry(
+        &mut self,
+        entry: RemoteEntry,
+        open_after: bool,
+        options: TransferOptions,
+        dest_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
@@ -637,27 +681,39 @@ impl ContextPanel {
         let is_dir = entry.is_dir;
         let id = Uuid::new_v4();
         let cancel = transfer_cancel_flag();
+        let compress = options.compress;
+        // Real archive name is set once remote packing finishes (via progress.label).
+        let label = name.clone();
 
         self.pane_transfers_mut(pane_id).insert(
             0,
             TransferRow {
                 id,
-                label: name.clone(),
+                label,
                 direction: TransferDir::Download,
                 status: TransferStatus::Queued,
                 local_path: None,
-                is_dir,
+                // Compressed download is always a single archive file.
+                is_dir: is_dir && !compress,
                 open_after,
                 started_at: None,
                 elapsed: None,
                 bytes_done: 0,
-                bytes_total: if is_dir { None } else { Some(entry.size) },
+                bytes_total: if is_dir || compress {
+                    None
+                } else {
+                    Some(entry.size)
+                },
                 cancel: cancel.clone(),
             },
         );
         if open_after {
             cx.emit(ContextPanelEvent::Toast(
                 format!("Downloading “{name}” — opens when ready").into(),
+            ));
+        } else if compress {
+            cx.emit(ContextPanelEvent::Toast(
+                format!("Compressing “{name}” on remote, then downloading archive…").into(),
             ));
         }
         cx.notify();
@@ -674,6 +730,14 @@ impl ContextPanel {
                         .ok();
                         return;
                     }
+                }
+            } else if let Some(dir) = dest_dir {
+                // Compress: `local` is the destination folder; archive is written inside it.
+                // Plain: place entry at dest/name.
+                if options.compress {
+                    Some(dir)
+                } else {
+                    Some(dir.join(&name))
                 }
             } else if is_dir {
                 rfd::AsyncFileDialog::new()
@@ -702,7 +766,6 @@ impl ContextPanel {
             this.update(cx, |this, cx| {
                 if let Some(row) = this.find_transfer_mut(id) {
                     row.local_path = Some(local.clone());
-                    // Stay Queued until the transfer lane actually starts (first progress).
                     row.status = TransferStatus::Queued;
                 }
                 cx.notify();
@@ -716,6 +779,7 @@ impl ContextPanel {
                     id,
                     remote,
                     local,
+                    options,
                     progress: progress_tx,
                     reply: reply_tx,
                     cancel,
@@ -745,7 +809,6 @@ impl ContextPanel {
                     }
                     result = reply_rx.recv_async() => {
                         this.update(cx, |this, cx| {
-                            // Row may already be gone after Remove/Clear — still OK.
                             if this.find_transfer(id).is_some() {
                                 match result {
                                     Ok(Ok(outcome)) => {
@@ -754,7 +817,12 @@ impl ContextPanel {
                                         } else {
                                             None
                                         };
-                                        this.finish_transfer(id, files, Some(outcome.bytes));
+                                        this.finish_transfer(
+                                            id,
+                                            files,
+                                            Some(outcome.bytes),
+                                            outcome.saved_as,
+                                        );
                                     }
                                     Ok(Err(err)) => {
                                         let msg = format!("{err:#}");
@@ -781,12 +849,12 @@ impl ContextPanel {
         if self.files_kind != Some(FilesKind::Sftp) {
             return;
         }
-        let Some(cwd) = self.cwd.clone() else {
+        let Some(_cwd) = self.cwd.clone() else {
             self.error = Some("Open a remote folder first".into());
             cx.notify();
             return;
         };
-        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
+        let Some((pane_id, _sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
@@ -801,7 +869,11 @@ impl ContextPanel {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.start_uploads(pane_id, sftp, cwd, vec![handle.path().to_path_buf()], cx);
+                this.begin_transfer_upload(
+                    pane_id,
+                    vec![handle.path().to_path_buf()],
+                    cx,
+                );
             })
             .ok();
         })
@@ -812,12 +884,12 @@ impl ContextPanel {
         if self.files_kind != Some(FilesKind::Sftp) {
             return;
         }
-        let Some(cwd) = self.cwd.clone() else {
+        let Some(_cwd) = self.cwd.clone() else {
             self.error = Some("Open a remote folder first".into());
             cx.notify();
             return;
         };
-        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
+        let Some((pane_id, _sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
@@ -832,7 +904,11 @@ impl ContextPanel {
                 return;
             };
             this.update(cx, |this, cx| {
-                this.start_uploads(pane_id, sftp, cwd, vec![handle.path().to_path_buf()], cx);
+                this.begin_transfer_upload(
+                    pane_id,
+                    vec![handle.path().to_path_buf()],
+                    cx,
+                );
             })
             .ok();
         })
@@ -845,10 +921,18 @@ impl ContextPanel {
         sftp: SftpHandle,
         remote_dir: String,
         locals: Vec<PathBuf>,
+        options: TransferOptions,
         cx: &mut Context<Self>,
     ) {
         for local in locals {
-            self.start_one_upload(pane_id, sftp.clone(), remote_dir.clone(), local, cx);
+            self.start_one_upload(
+                pane_id,
+                sftp.clone(),
+                remote_dir.clone(),
+                local,
+                options.clone(),
+                cx,
+            );
         }
     }
 
@@ -858,14 +942,21 @@ impl ContextPanel {
         sftp: SftpHandle,
         remote_dir: String,
         local: PathBuf,
+        options: TransferOptions,
         cx: &mut Context<Self>,
     ) {
         let id = Uuid::new_v4();
-        let label = local
+        let base_name = local
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| local.display().to_string());
-        let is_dir = local.is_dir();
+        let compress = options.compress;
+        let label = if compress {
+            format!("{base_name}.zip")
+        } else {
+            base_name
+        };
+        let is_dir = local.is_dir() && !compress;
         let cancel = transfer_cancel_flag();
 
         self.pane_transfers_mut(pane_id).insert(
@@ -895,6 +986,7 @@ impl ContextPanel {
                     id,
                     local,
                     remote_dir,
+                    options,
                     progress: progress_tx,
                     reply: reply_tx,
                     cancel,
@@ -932,7 +1024,12 @@ impl ContextPanel {
                                         } else {
                                             None
                                         };
-                                        this.finish_transfer(id, files, Some(outcome.bytes));
+                                        this.finish_transfer(
+                                            id,
+                                            files,
+                                            Some(outcome.bytes),
+                                            outcome.saved_as,
+                                        );
                                         if let Some(cwd) = this.cwd.clone() {
                                             this.load_dir(cwd, cx);
                                         }
@@ -989,10 +1086,23 @@ impl ContextPanel {
             } else if let Some(t) = p.total {
                 row.bytes_total = Some(t);
             }
+            if let Some(label) = p.label {
+                row.label = label;
+            }
+            if let Some(path) = p.local_path {
+                row.local_path = Some(path);
+                row.is_dir = false;
+            }
         }
     }
 
-    fn finish_transfer(&mut self, id: Uuid, files: Option<u32>, bytes: Option<u64>) {
+    fn finish_transfer(
+        &mut self,
+        id: Uuid,
+        files: Option<u32>,
+        bytes: Option<u64>,
+        saved_as: Option<PathBuf>,
+    ) {
         let mut open_path: Option<PathBuf> = None;
         if let Some(row) = self.find_transfer_mut(id) {
             let files = files.or_else(|| match &row.status {
@@ -1004,6 +1114,13 @@ impl ContextPanel {
                 if row.bytes_total.is_none() {
                     row.bytes_total = Some(b);
                 }
+            }
+            if let Some(path) = saved_as {
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    row.label = name.to_string();
+                }
+                row.local_path = Some(path);
+                row.is_dir = false;
             }
             row.elapsed = Some(
                 row.started_at
@@ -1684,7 +1801,53 @@ impl ContextPanel {
                 self.run_remove(path, is_dir, cx);
             }
             FilesPrompt::ConfirmOpenRemote { entry } => {
-                self.download_entry(entry, true, cx);
+                self.download_entry(entry, true, TransferOptions::default(), None, cx);
+            }
+            FilesPrompt::TransferSettings(form) => {
+                self.submit_transfer_settings(form, cx);
+            }
+        }
+    }
+
+    fn submit_transfer_settings(
+        &mut self,
+        form: TransferSettingsForm,
+        cx: &mut Context<Self>,
+    ) {
+        let dest = form.dest.text.trim().to_string();
+        if dest.is_empty() {
+            self.error = Some("Destination path is required".into());
+            self.prompt = Some(FilesPrompt::TransferSettings(form));
+            self.start_prompt_caret_blink(cx);
+            cx.notify();
+            return;
+        }
+        let options = form.build_options();
+        self.last_compress = options.compress;
+
+        match form.pending {
+            PendingTransfer::Download { entry } => {
+                let dest_path = PathBuf::from(&dest);
+                self.last_download_dir = Some(dest.clone());
+                self.download_entry(entry, false, options, Some(dest_path), cx);
+            }
+            PendingTransfer::Upload { pane_id, locals } => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.error = Some("No SSH session".into());
+                    cx.notify();
+                    return;
+                };
+                if options.compress {
+                    let names: Vec<String> = locals
+                        .iter()
+                        .filter_map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
+                        .collect();
+                    let preview = names.first().cloned().unwrap_or_else(|| "files".into());
+                    cx.emit(ContextPanelEvent::Toast(
+                        format!("Zipping “{preview}” locally, then uploading .zip…").into(),
+                    ));
+                }
+                self.start_uploads(pane_id, sftp, dest, locals, options, cx);
             }
         }
     }
@@ -1944,6 +2107,7 @@ impl ContextPanel {
             FilesPrompt::Chmod { .. } => "Permissions (octal)",
             FilesPrompt::ConfirmDelete { .. } => "Delete?",
             FilesPrompt::ConfirmOpenRemote { .. } => "Open remote file?",
+            FilesPrompt::TransferSettings(form) => form.title(),
         }
     }
 
@@ -1952,6 +2116,7 @@ impl ContextPanel {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit),
+            FilesPrompt::TransferSettings(form) => Some(form.focused_edit_mut()),
             FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. } => None,
         }
     }
@@ -1980,6 +2145,16 @@ impl ContextPanel {
         let mods = &event.keystroke.modifiers;
         let shift = mods.shift;
         let chord = mods.control || mods.platform;
+
+        if key == "tab"
+            && matches!(self.prompt, Some(FilesPrompt::TransferSettings(_)))
+        {
+            if let Some(FilesPrompt::TransferSettings(form)) = self.prompt.as_mut() {
+                form.cycle_focus(shift);
+            }
+            cx.notify();
+            return true;
+        }
 
         if key == "enter" {
             self.submit_prompt(cx);
@@ -2422,6 +2597,10 @@ impl ContextPanel {
     }
 
     fn render_prompt_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if matches!(self.prompt, Some(FilesPrompt::TransferSettings(_))) {
+            return self.render_transfer_settings(cx);
+        }
+
         let prompt = self.prompt.as_ref()?;
         let title = Self::prompt_title(prompt);
         let confirm_label = match prompt {
@@ -2444,7 +2623,9 @@ impl ContextPanel {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
-            FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. } => None,
+            FilesPrompt::ConfirmDelete { .. }
+            | FilesPrompt::ConfirmOpenRemote { .. }
+            | FilesPrompt::TransferSettings(_) => None,
         };
 
         Some(
@@ -2499,6 +2680,7 @@ impl ContextPanel {
                                 .child(match &self.prompt {
                                     Some(FilesPrompt::ConfirmDelete { .. }) => "Delete",
                                     Some(FilesPrompt::ConfirmOpenRemote { .. }) => "Download & open",
+                                    Some(FilesPrompt::TransferSettings(_)) => "Start",
                                     _ => "OK",
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
@@ -2519,6 +2701,282 @@ impl ContextPanel {
                 )
                 .into_any_element(),
         )
+    }
+
+    fn render_transfer_settings(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let FilesPrompt::TransferSettings(form) = self.prompt.as_ref()? else {
+            return None;
+        };
+        let dest_label = form.dest_label();
+        let is_download = form.is_download();
+        let focus = form.focus;
+        let compress = form.compress;
+        let presets: Vec<(String, bool)> = form.exclude_presets.clone();
+        let dest_el = form.dest.into_element();
+        let include_el = form.include.into_element();
+        let exclude_el = form.exclude_extra.into_element();
+        let title = form.title();
+
+        let field_style = |active: bool| {
+            div()
+                .w_full()
+                .border_1()
+                .border_color(if active {
+                    theme::ACCENT
+                } else {
+                    theme::BORDER_SUBTLE
+                })
+                .rounded(px(theme::RADIUS_SM))
+                .px(px(theme::SPACE_1))
+                .py(px(2.0))
+        };
+
+        let mut preset_row = div().flex().flex_wrap().gap(px(theme::SPACE_1));
+        for (i, (name, on)) in presets.iter().enumerate() {
+            let checked = *on;
+            let label = name.clone();
+            preset_row = preset_row.child(
+                div()
+                    .id(ElementId::Name(format!("xfer-ex-{i}").into()))
+                    .px(px(theme::SPACE_1))
+                    .py(px(1.0))
+                    .rounded(px(theme::RADIUS_SM))
+                    .text_xs()
+                    .cursor_pointer()
+                    .bg(if checked {
+                        theme::ACCENT.opacity(0.25)
+                    } else {
+                        theme::HOVER
+                    })
+                    .text_color(if checked {
+                        theme::TEXT
+                    } else {
+                        theme::TEXT_MUTED
+                    })
+                    .child(format!("{} {label}", if checked { "✓" } else { "○" }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(FilesPrompt::TransferSettings(form)) = this.prompt.as_mut() {
+                            if let Some((_, on)) = form.exclude_presets.get_mut(i) {
+                                *on = !*on;
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(theme::SPACE_1))
+                .px(px(theme::SPACE_1))
+                .py(px(theme::SPACE_1))
+                .rounded(px(theme::RADIUS_SM))
+                .border_1()
+                .border_color(theme::BORDER)
+                .bg(theme::ELEVATED)
+                .track_focus(&self.focus_handle)
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::TEXT)
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child(dest_label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(theme::SPACE_1))
+                        .items_center()
+                        .child(
+                            field_style(focus == TransferField::Dest)
+                                .id("xfer-dest")
+                                .flex_1()
+                                .child(dest_el)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        if let Some(FilesPrompt::TransferSettings(form)) =
+                                            this.prompt.as_mut()
+                                        {
+                                            form.focus = TransferField::Dest;
+                                        }
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
+                        .when(is_download, |d| {
+                            d.child(
+                                div()
+                                    .id("xfer-browse")
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .text_xs()
+                                    .cursor_pointer()
+                                    .bg(theme::HOVER)
+                                    .child("Browse…")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.browse_transfer_dest(cx);
+                                    })),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Include (globs, empty = all)"),
+                )
+                .child(
+                    field_style(focus == TransferField::Include)
+                        .id("xfer-include")
+                        .child(include_el)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(FilesPrompt::TransferSettings(form)) =
+                                    this.prompt.as_mut()
+                                {
+                                    form.focus = TransferField::Include;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Exclude presets (checked = skip)"),
+                )
+                .child(preset_row)
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Extra exclude globs"),
+                )
+                .child(
+                    field_style(focus == TransferField::ExcludeExtra)
+                        .id("xfer-exclude")
+                        .child(exclude_el)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(FilesPrompt::TransferSettings(form)) =
+                                    this.prompt.as_mut()
+                                {
+                                    form.focus = TransferField::ExcludeExtra;
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("xfer-compress")
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACE_1))
+                        .px(px(theme::SPACE_2))
+                        .py(px(theme::SPACE_1))
+                        .rounded(px(theme::RADIUS_SM))
+                        .cursor_pointer()
+                        .bg(if compress {
+                            theme::ACCENT.opacity(0.3)
+                        } else {
+                            theme::HOVER
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(FilesPrompt::TransferSettings(form)) =
+                                    this.prompt.as_mut()
+                                {
+                                    form.compress = !form.compress;
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::TEXT)
+                                .child(if compress {
+                                    "☑ Compress ON — upload as .zip / download archive"
+                                } else {
+                                    "☐ Compress OFF — transfer files as-is"
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(theme::SPACE_1))
+                        .child(
+                            div()
+                                .id("ctx-prompt-ok")
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .bg(theme::ACCENT)
+                                .text_color(theme::TEXT)
+                                .cursor_pointer()
+                                .child(if compress {
+                                    "Start (compressed)"
+                                } else {
+                                    "Start"
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("ctx-prompt-cancel")
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .text_xs()
+                                .text_color(theme::TEXT_MUTED)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_prompt(cx))),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn browse_transfer_dest(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let picked = rfd::AsyncFileDialog::new()
+                .set_title("Download to folder…")
+                .pick_folder()
+                .await;
+            let Some(handle) = picked else {
+                return;
+            };
+            let path = handle.path().to_string_lossy().into_owned();
+            this.update(cx, |this, cx| {
+                if let Some(FilesPrompt::TransferSettings(form)) = this.prompt.as_mut() {
+                    form.dest = RenameEdit::new(path);
+                    form.focus = TransferField::Dest;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// File list + Transfers with a draggable vertical sash.
@@ -2603,14 +3061,15 @@ impl ContextPanel {
                                     cx.notify();
                                     return;
                                 };
-                                let Some((pane_id, sftp)) = this.focused_sftp(cx) else {
+                                let Some((pane_id, _sftp)) = this.focused_sftp(cx) else {
                                     return;
                                 };
                                 let locals: Vec<PathBuf> = paths.paths().to_vec();
                                 if locals.is_empty() {
                                     return;
                                 }
-                                this.start_uploads(pane_id, sftp, cwd, locals, cx);
+                                let _ = cwd; // dest defaults to cwd inside the settings form
+                                this.begin_transfer_upload(pane_id, locals, cx);
                             },
                         ))
                     })
@@ -3128,7 +3587,7 @@ impl ContextPanel {
                                     },
                                 ))
                             })
-                            .when(!is_dir && !is_local, |d| {
+                            .when(!is_local, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-download",
                                     "Download",
