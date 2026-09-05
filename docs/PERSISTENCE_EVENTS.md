@@ -109,6 +109,10 @@ emit(WillQuit)              on_window_should_close:
 - **禁止**把 `observe_release → flush_persist` 当主路径；若保留，仅作 `!flushed_for_quit` 时的兜底。
 - `emit` 经 Effect 队列异步派发，故关窗必须用 `should_close` 返回 `false`，不能假设「emit 后立刻已写完再销毁」。
 
+### 已知风险（长会话关窗）
+
+`WillQuit` → `flush_persist` → `bound_local_cwds` 会在 **UI 线程** 同步调用 `process_cwd`。若此处阻塞，则 `cx.quit()` 达不到，窗口因 `should_close == false` **一直不消失**。分析与复现条件见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)（**尚未改代码**）。
+
 ## 与现有代码的对应
 
 | 现状 | 第一阶段后 |

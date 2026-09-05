@@ -22,6 +22,7 @@ For **终端 ANSI 配色预设**（已实现；默认 Default 不变）, see [TE
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
 For **Session / Profile / Group IA（根级 Profile、嵌套 Group、临时 Tab）**, see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md).  
 For **持久化事件（AppBus / Persistence / WillQuit）**, see [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md).  
+For **长会话点 X 窗口不消失（原因分析）**, see [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md).  
 For **Local shell 选型 / pwsh 慢 / cmd 快 / 启动性能**, see [LOCAL_SHELL.md](./LOCAL_SHELL.md).  
 For **low-priority icebox features** (do not build unless explicitly ordered), see [BACKLOG.md](./BACKLOG.md).
 
