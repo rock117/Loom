@@ -692,141 +692,148 @@ impl TabManager {
         tab_id: Uuid,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
-        window: Option<&mut Window>,
+        mut window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
-        let focused = self.tabs[idx].focused;
-        let Some((profile_id, kind, label)) = self.tabs[idx].panes.get(&focused).map(|p| {
-            (p.profile_id, p.kind.clone(), p.label.clone())
-        }) else {
+        // Status-bar Reconnect rebuilds every pane in the tab (all splits), not only focused.
+        let pane_ids: Vec<Uuid> = self.tabs[idx].panes.keys().copied().collect();
+        if pane_ids.is_empty() {
             return;
-        };
+        }
 
         let (default_shell, font_family) = {
             let s = store.read(cx);
             (s.settings.default_shell.clone(), s.settings.font_family.clone())
         };
 
-        // Prefer live Profile fields when Bound; otherwise use pane snapshot.
-        let kind = profile_id
-            .and_then(|pid| store.read(cx).workspace.find_profile(pid).map(|p| p.kind.clone()))
-            .unwrap_or(kind);
-        let label = profile_id
-            .and_then(|pid| {
-                store
-                    .read(cx)
-                    .workspace
-                    .find_profile(pid)
-                    .map(|p| p.name.clone())
-            })
-            .unwrap_or(label);
+        for pane_id in pane_ids {
+            let Some((profile_id, kind_snap, label_snap)) =
+                self.tabs[idx].panes.get(&pane_id).map(|p| {
+                    (p.profile_id, p.kind.clone(), p.label.clone())
+                })
+            else {
+                continue;
+            };
 
-        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-            teardown_pane_io(pane);
-            drop(pane.terminal.take());
-            pane.kind = kind.clone();
-            pane.label = label.clone();
-        }
+            // Prefer live Profile fields when Bound; otherwise use pane snapshot.
+            let kind = profile_id
+                .and_then(|pid| {
+                    store
+                        .read(cx)
+                        .workspace
+                        .find_profile(pid)
+                        .map(|p| p.kind.clone())
+                })
+                .unwrap_or(kind_snap);
+            let label = profile_id
+                .and_then(|pid| {
+                    store
+                        .read(cx)
+                        .workspace
+                        .find_profile(pid)
+                        .map(|p| p.name.clone())
+                })
+                .unwrap_or(label_snap);
 
-        match &kind {
-            ProfileKind::Local { .. } => {
-                let Some(window) = window else {
-                    if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                        pane.state = ConnectionState::Failed;
-                        pane.status_message = "reconnect requires window focus".into();
-                    }
-                    cx.notify();
-                    return;
-                };
-                if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                    pane.state = ConnectionState::Connecting;
-                    pane.status_message = "reconnecting…".into();
-                }
-                match self.spawn_local(
-                    profile_id,
-                    &kind,
-                    &label,
-                    default_shell.as_deref(),
-                    &font_family,
-                    store,
-                    None,
-                    window,
-                    cx,
-                ) {
-                    Ok(mut fresh) => {
-                        fresh.id = focused;
-                        self.tabs[idx].panes.insert(focused, fresh);
-                    }
-                    Err(err) => {
-                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
+            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                teardown_pane_io(pane);
+                drop(pane.terminal.take());
+                pane.kind = kind.clone();
+                pane.label = label.clone();
+            }
+
+            match &kind {
+                ProfileKind::Local { .. } => {
+                    let Some(window) = window.as_deref_mut() else {
+                        if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                             pane.state = ConnectionState::Failed;
-                            pane.status_message = format!("{err:#}");
+                            pane.status_message = "reconnect requires window focus".into();
+                        }
+                        continue;
+                    };
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                        pane.state = ConnectionState::Connecting;
+                        pane.status_message = "reconnecting…".into();
+                    }
+                    match self.spawn_local(
+                        profile_id,
+                        &kind,
+                        &label,
+                        default_shell.as_deref(),
+                        &font_family,
+                        store,
+                        None,
+                        window,
+                        cx,
+                    ) {
+                        Ok(mut fresh) => {
+                            fresh.id = pane_id;
+                            self.tabs[idx].panes.insert(pane_id, fresh);
+                        }
+                        Err(err) => {
+                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                                pane.state = ConnectionState::Failed;
+                                pane.status_message = format!("{err:#}");
+                            }
                         }
                     }
                 }
-                cx.notify();
-            }
-            ProfileKind::Ssh { host, port, user, .. } => {
-                let auto_forwards: Vec<_> = profile_id
-                    .and_then(|pid| {
-                        store
-                            .read(cx)
-                            .workspace
-                            .find_profile(pid)
-                            .map(|p| {
+                ProfileKind::Ssh { host, port, user, .. } => {
+                    let auto_forwards: Vec<_> = profile_id
+                        .and_then(|pid| {
+                            store.read(cx).workspace.find_profile(pid).map(|p| {
                                 p.forwards
                                     .iter()
                                     .filter(|f| f.enabled)
                                     .cloned()
                                     .collect::<Vec<_>>()
                             })
-                    })
-                    .unwrap_or_default();
-                let pseudo = Profile {
-                    id: profile_id.unwrap_or_else(Uuid::nil),
-                    name: label.clone(),
-                    kind: kind.clone(),
-                    forwards: Vec::new(),
-                };
-                match resolve_ssh_auth(&pseudo, password) {
-                    Ok(Some(auth)) => {
-                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                            pane.profile_id = profile_id;
-                            pane.state = ConnectionState::Connecting;
-                            pane.status_message =
-                                format!("connecting to {user}@{host}:{port}…");
+                        })
+                        .unwrap_or_default();
+                    let pseudo = Profile {
+                        id: profile_id.unwrap_or_else(Uuid::nil),
+                        name: label.clone(),
+                        kind: kind.clone(),
+                        forwards: Vec::new(),
+                    };
+                    match resolve_ssh_auth(&pseudo, password.clone()) {
+                        Ok(Some(auth)) => {
+                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                                pane.profile_id = profile_id;
+                                pane.state = ConnectionState::Connecting;
+                                pane.status_message =
+                                    format!("connecting to {user}@{host}:{port}…");
+                            }
+                            self.spawn_ssh_connect_kind(
+                                tab_id,
+                                pane_id,
+                                &kind,
+                                auth,
+                                auto_forwards,
+                                &font_family,
+                                cx,
+                            );
                         }
-                        cx.notify();
-                        self.spawn_ssh_connect_kind(
-                            tab_id,
-                            focused,
-                            &kind,
-                            auth,
-                            auto_forwards,
-                            &font_family,
-                            cx,
-                        );
-                    }
-                    Ok(None) => {
-                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                            pane.state = ConnectionState::Failed;
-                            pane.status_message = "password required".into();
+                        Ok(None) => {
+                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                                pane.state = ConnectionState::Failed;
+                                pane.status_message = "password required".into();
+                            }
                         }
-                        cx.notify();
-                    }
-                    Err(err) => {
-                        if let Some(pane) = self.tabs[idx].panes.get_mut(&focused) {
-                            pane.state = ConnectionState::Failed;
-                            pane.status_message = format!("{err:#}");
+                        Err(err) => {
+                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                                pane.state = ConnectionState::Failed;
+                                pane.status_message = format!("{err:#}");
+                            }
                         }
-                        cx.notify();
                     }
                 }
             }
         }
+        cx.notify();
     }
 
     fn on_pane_session_ended(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {

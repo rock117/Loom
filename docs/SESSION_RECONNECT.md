@@ -37,7 +37,8 @@
 
 - **主路径 = 可靠检测 + 手动重连**（状态栏 Reconnect），不是自动重连。  
 - 断线后 **保留最后一屏输出** 与横幅提示；同 tab 重建 IO，尽量保留分屏/tab 布局。  
-- 密码认证缺钥匙串时：弹已有 PasswordPrompt，提交后 **reconnect 当前 tab**。
+- 状态栏 **Reconnect = 重连该 tab 下所有 pane**（每个 split 各自一条会话，全部重建）。  
+- 密码认证缺钥匙串时：弹已有 PasswordPrompt，提交后 **reconnect 当前 tab（全部 pane）**。
 
 ---
 
@@ -62,7 +63,7 @@
   - 文案提示用状态栏重连  
   - 回收 SFTP / SSH shutdown / 本地 PTY  
   - **保留** `terminal` 实体（最后输出 + 横幅）  
-- `reconnect` / `reconnect_with_password`：teardown 旧 IO，同 pane id 拉起 Local 或 SSH。
+- `reconnect` / `reconnect_with_password`：遍历该 **tab 内全部 pane**（含 split），各自 teardown 旧 IO，保留 pane id 拉起 Local 或 SSH（布局不变）。
 
 ### 4. WorkspaceView
 
@@ -104,6 +105,7 @@ SSH/PTY 死
 - [ ] 远端断 SSH / 杀会话后：横幅出现，状态 Failed，Reconnect 可见。  
 - [ ] 断线后按键不产生「假输入」；重连成功后可正常输入。  
 - [ ] 密码 profile（无钥匙串）走 Reconnect → 输密码 → **同一 tab** 恢复，不另开一个。  
+- [ ] **Split 多 pane**：断线后点 Reconnect，该 tab 内所有分屏都进入 Connecting 并恢复（不只焦点 pane）。  
 - [ ] Files：断线 unavailable；重连后可再列目录。  
 - [ ] Local shell 退出同样 Failed + 可 Reconnect。
 
