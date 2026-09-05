@@ -5,6 +5,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 - Prefer a short **symptom → failed attempts → what worked → rule** write-up for each incident.
 - Keep the standing **UI freeze checklist** (below) up to date whenever a new freeze class appears — include **GPUI framework** patterns, not only Loom bugs.
 - Text-field UX (selection / clipboard / IME): [TEXT_FIELDS.md](./TEXT_FIELDS.md).
+- Logging design (Zed-aligned, phased): [LOGGING.md](./LOGGING.md).
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---
@@ -183,7 +184,8 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **原因归类（分析，未改代码）：** 方案 B 关窗先 `should_close → false`，依赖 `WillQuit` 同步 `flush_persist` 后再 `cx.quit()`。flush 经 `bound_local_cwds` → `process_cwd`（sysinfo）跑在 UI 线程；长寿命 Local shell 上该调用可阻塞 → 到不了 `quit` → 窗一直留下。方案 B + Windows `PostQuitMessage` 放大该问题。转发 `recv_timeout`、查找框已排除为本案主因。
 
 **完整说明：** [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)。  
-**协议：** [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)。
+**协议：** [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)。  
+**排障日志：** [LOGGING.md](./LOGGING.md) Phase 0（`LOOM_QUIT_TRACE`）。
 
 **代码：** `src/ui/workspace_view.rs`、`src/ui/persistence.rs`、`src/ui/tab_manager.rs` (`bound_local_cwds`)、`src/platform.rs` (`process_cwd`)。
 

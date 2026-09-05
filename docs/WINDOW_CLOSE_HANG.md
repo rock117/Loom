@@ -1,6 +1,6 @@
 # 多 Tab / 长会话：点 X 窗口不消失（原因分析）
 
-相关文档：[PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)、[SFTP_POOL.md](./SFTP_POOL.md)。
+相关文档：[PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[LOGGING.md](./LOGGING.md)。
 
 > **状态**：原因分析（**尚未改代码**）。  
 > **日期**：2026-09-05。  
@@ -163,6 +163,10 @@ Persistence::on_will_quit
 2. **关窗协议**：flush 与关窗解耦（超时、后台 flush、或先允许关窗再尽力写盘）；避免「false 之后永远等不到 quit」。
 3. **SFTP teardown**：关窗/关 tab 时 set cancel，worker 对 in-flight 传输设超时或 `select!` 取消，禁止无限 `await`。
 4. **（独立）转发**：`start`/`stop`/`retry` 移出 UI 线程同步 `recv_timeout`。
+
+### 排障日志（可选，先于或并行于修复）
+
+按 [LOGGING.md](./LOGGING.md) **Phase 0**：`LOOM_QUIT_TRACE=1` 时在关窗路径打 `quit: should_close` / `will_quit` / `cwd … begin|ok` / `cx.quit`。若停在 `cwd … begin` 则坐实本分析主嫌疑。
 
 验证计划（改完后）：
 
