@@ -15,7 +15,7 @@ pub struct Persistence {
     workspace: WeakEntity<WorkspaceView>,
     debounce_generation: u64,
     _debounce: Option<Task<()>>,
-    /// After a successful WillQuit flush; allows window close to proceed.
+    /// After a successful quit/close flush; allows window close to proceed.
     pub flushed_for_quit: bool,
     _subscription: Subscription,
 }
@@ -59,7 +59,7 @@ impl Persistence {
         self.flushed_for_quit
     }
 
-    /// Immediate full flush (Ctrl+S, WillQuit, debounce fire).
+    /// Immediate full flush with live cwd refresh (Ctrl+S, debounce).
     pub fn flush_now(&mut self, cx: &mut Context<Self>) {
         self.debounce_generation = self.debounce_generation.wrapping_add(1);
         self._debounce = None;
@@ -70,12 +70,30 @@ impl Persistence {
         }
     }
 
-    fn on_will_quit(&mut self, cx: &mut Context<Self>) {
+    /// Title-bar X: sync flush without `process_cwd`, mark ready (caller returns true to destroy).
+    pub fn prepare_window_close(&mut self, cx: &mut Context<Self>) {
         if self.flushed_for_quit {
             return;
         }
-        self.flush_now(cx);
+        self.flush_for_quit(cx);
+    }
+
+    /// Quit path flush: cached cwd only — never block WM_CLOSE on sysinfo PEB reads.
+    fn flush_for_quit(&mut self, cx: &mut Context<Self>) {
+        self.debounce_generation = self.debounce_generation.wrapping_add(1);
+        self._debounce = None;
+        if let Some(workspace) = self.workspace.upgrade() {
+            workspace.update(cx, |view, cx| view.flush_persist_for_quit(cx));
+        } else {
+            self.store.update(cx, |s, _| s.persist_if_dirty());
+        }
         self.flushed_for_quit = true;
+    }
+
+    fn on_will_quit(&mut self, cx: &mut Context<Self>) {
+        if !self.flushed_for_quit {
+            self.flush_for_quit(cx);
+        }
         cx.quit();
     }
 

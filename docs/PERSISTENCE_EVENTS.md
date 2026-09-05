@@ -88,30 +88,31 @@ pub enum AppBusEvent {
 
 辅助：`AppBus::emit` 通过 `app_bus.update(cx, \|_, cx\| cx.emit(...))`。
 
-## 退出路径（方案 B）
+## 退出路径（方案 B，2026-09-05 修订）
 
 ```text
 Ctrl+Q                          窗口标题栏 X
     │                                 │
     ▼                                 ▼
 emit(WillQuit)              on_window_should_close:
-    │                         emit(WillQuit); return false
-    │                         （先挡住销毁，等 flush）
+    │                         prepare_window_close()
+    │                         （flush_for_quit，无 process_cwd）
+    │                         return true → DestroyWindow
     └────────────┬────────────┘
                  ▼
-          Persistence 回调
-           flush_persist
+          Persistence
+           flush_persist_for_quit   ← 只用缓存 cwd
            flushed_for_quit = true
-           cx.quit()
+           （Ctrl+Q 再 cx.quit()；点 X 靠 on_window_closed）
 ```
 
 - **禁止**在 `QuitApp` 里直接 `persist_tabs` + `quit`。
 - **禁止**把 `observe_release → flush_persist` 当主路径；若保留，仅作 `!flushed_for_quit` 时的兜底。
-- `emit` 经 Effect 队列异步派发，故关窗必须用 `should_close` 返回 `false`，不能假设「emit 后立刻已写完再销毁」。
+- 点 X **不再** `return false` 等待 Effect：避免 flush/`process_cwd` 堵在 WM_CLOSE 里变成「未响应」。见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)。
 
-### 已知风险（长会话关窗）
+### 已知风险（长会话关窗）— 已缓解
 
-`WillQuit` → `flush_persist` → `bound_local_cwds` 会在 **UI 线程** 同步调用 `process_cwd`。若此处阻塞，则 `cx.quit()` 达不到，窗口因 `should_close == false` **一直不消失**。分析与复现条件见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)（**尚未改代码**）。
+`WillQuit` / 关窗 flush **不得**在 UI 线程同步调用 `process_cwd`。关窗用 `flush_persist_for_quit`（缓存 cwd）；Ctrl+S / debounce 仍可用带 refresh 的 `flush_persist`。细节见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)、[LOGGING.md](./LOGGING.md)。
 
 ## 与现有代码的对应
 

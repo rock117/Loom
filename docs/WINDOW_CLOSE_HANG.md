@@ -2,7 +2,7 @@
 
 相关文档：[PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[LOGGING.md](./LOGGING.md)。
 
-> **状态**：原因分析（**尚未改代码**）。  
+> **状态**：原因分析 + **已落地缓解**（2026-09-05：关窗 flush 跳过 `process_cwd`；点 X 同步 flush 后 `return true`）。  
 > **日期**：2026-09-05。  
 > **文档约定**：中文。
 
@@ -157,23 +157,24 @@ Persistence::on_will_quit
 
 ---
 
-## 建议修复方向（仅记录，本次不改代码）
+## 已落地缓解（2026-09-05）
 
-1. **WillQuit / `bound_local_cwds`**：退出路径 **不要** 再调 `process_cwd`；用内存里已有 cwd（OSC / 上次刷新）即可。
-2. **关窗协议**：flush 与关窗解耦（超时、后台 flush、或先允许关窗再尽力写盘）；避免「false 之后永远等不到 quit」。
-3. **SFTP teardown**：关窗/关 tab 时 set cancel，worker 对 in-flight 传输设超时或 `select!` 取消，禁止无限 `await`。
-4. **（独立）转发**：`start`/`stop`/`retry` 移出 UI 线程同步 `recv_timeout`。
+1. **`flush_persist_for_quit`**：关窗 / `WillQuit` 只用缓存 cwd，**不**调用 `process_cwd`。
+2. **点 X**：`prepare_window_close` 同步轻量 flush 后 **`return true`**，不再 `return false` 卡在 WM_CLOSE 等待 Effect/`PostQuitMessage`。
+3. Ctrl+S / debounce 仍用带 refresh 的 `flush_persist`（可接受短暂 sysinfo）。
 
-### 排障日志（可选，先于或并行于修复）
+仍待加固：SFTP teardown 无限 `await`；转发 `recv_timeout` 堵 UI。
 
-按 [LOGGING.md](./LOGGING.md) **Phase 0**：`LOOM_QUIT_TRACE=1` 时在关窗路径打 `quit: should_close` / `will_quit` / `cwd … begin|ok` / `cx.quit`。若停在 `cwd … begin` 则坐实本分析主嫌疑。
+### 排障日志（可选）
 
-验证计划（改完后）：
+按 [LOGGING.md](./LOGGING.md) **Phase 0**：`LOOM_QUIT_TRACE=1`。
 
-- [ ] Bound Local 开一整天（或人为挂起 shell）后点 X，窗应消失
-- [ ] 混开 SSH + 进行中/卡住的传输时点 X，窗应消失；进程可短暂收尾
+验证计划：
+
+- [ ] 多 SSH tab + Local，用一段时间后点 X，窗应消失、任务管理器无「未响应」残留
+- [ ] 混开 SSH + 进行中/卡住的传输时点 X，窗应消失
 - [ ] 连开多 tab 立刻关仍秒关
-- [ ] Ctrl+Q 与点 X 行为一致且会落盘（或明确「尽力写盘」语义）
+- [ ] Ctrl+Q 与点 X 都会落盘 open_tabs / ui_state
 
 ---
 
@@ -181,11 +182,12 @@ Persistence::on_will_quit
 
 | 区域 | 路径 |
 | --- | --- |
-| 关窗拦截 | `src/ui/workspace_view.rs` (`on_window_should_close`) |
-| WillQuit | `src/ui/persistence.rs`, `src/ui/app_bus.rs` |
-| flush + cwd | `src/ui/workspace_view.rs` (`flush_persist`), `src/ui/tab_manager.rs` (`bound_local_cwds`) |
-| process cwd | `src/platform.rs` (`process_cwd`), `src/terminal/gpui_emu/view/context_menu.rs` |
+| 关窗拦截 | `src/ui/workspace_view.rs` (`on_window_should_close` → `prepare_window_close`) |
+| WillQuit / flush | `src/ui/persistence.rs` (`flush_for_quit`, `prepare_window_close`) |
+| flush + cwd | `flush_persist` / `flush_persist_for_quit`；`bound_local_cwds(refresh, …)` |
+| process cwd | `src/platform.rs` (`process_cwd`) |
 | pane teardown | `src/ui/tab_manager.rs` (`teardown_pane_io`, `TabManager::Drop`) |
 | SFTP worker 收尾 | `src/session/sftp.rs` (`run_sftp_worker` 末尾 `await` lanes) |
 | 退出文档 | [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md) |
 | 冻结 checklist | [HARD_PROBLEMS.md](./HARD_PROBLEMS.md) |
+| 日志设计 | [LOGGING.md](./LOGGING.md) |

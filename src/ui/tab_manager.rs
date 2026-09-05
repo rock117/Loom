@@ -1216,8 +1216,16 @@ impl TabManager {
         cx.notify();
     }
 
-    /// Bound Local panes → (profile_id, live cwd) for persistence.
-    pub fn bound_local_cwds(&self, cx: &mut Context<Self>) -> Vec<(Uuid, std::path::PathBuf)> {
+    /// Bound Local panes → (profile_id, cwd) for persistence.
+    ///
+    /// When `refresh` is true, asks each terminal to refresh via `process_cwd` (sysinfo).
+    /// Quit/close paths must pass `false` — Windows can hang indefinitely reading PEB cwd
+    /// for long-lived shells (see `docs/WINDOW_CLOSE_HANG.md`).
+    pub fn bound_local_cwds(
+        &self,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) -> Vec<(Uuid, std::path::PathBuf)> {
         let mut out = Vec::new();
         for tab in &self.tabs {
             for pane in tab.panes.values() {
@@ -1231,7 +1239,9 @@ impl TabManager {
                     continue;
                 };
                 let Some(cwd) = term.update(cx, |view, _| {
-                    view.refresh_working_directory();
+                    if refresh {
+                        view.refresh_working_directory();
+                    }
                     view.working_directory()
                 }) else {
                     continue;

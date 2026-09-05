@@ -47,7 +47,7 @@ GPUI runs layout → prepaint → paint and input dispatch on the **window / UI 
 | `stdin_writer.lock()` held across notify/paint | Same class of nested / ordered lock issues | Write bytes, drop guard, then notify |
 | SSH `connect_blocking` (or any russh handshake) on the UI thread | Network RTT freezes UI | Keep pattern in `tab_manager`: worker thread + `flume` + `cx.spawn` await |
 | `persist_now()` / large JSON write on every keystroke on UI thread | Stutter under load | Debounce; or write on a background task (follow-up if it becomes hot) |
-| **`WillQuit` / `flush_persist` 里同步 `process_cwd`（sysinfo）** | 长寿命 Local shell 上 Windows 读 cwd 可一直不返回；`should_close` 已 `false` → **窗口不消失** | 退出路径只用缓存 cwd；flush 与关窗解耦 / 超时 — 见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md) |
+| **`WillQuit` / `flush_persist` 里同步 `process_cwd`（sysinfo）** | 长寿命 Local shell 上 Windows 读 cwd 可一直不返回；`should_close` 已 `false` → **窗口不消失** | 关窗用 `flush_persist_for_quit`（缓存 cwd）；点 X `prepare_window_close` 后 `return true` — 见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md) |
 | `ForwardHandle::start/stop/retry` 在 UI 上 `recv_timeout` | 每条规则可堵数秒；多 SSH tab 更明显 | `cx.spawn` + `recv_async`；UI 只跟 snapshot / `changes`（与关窗长会话事故独立） |
 | PTY spawn + waiting for first output synchronously in open handler | Shell startup blocks open | Spawn async; show tab in Connecting; attach terminal when ready |
 | Per-chunk `cx.notify()` on PTY flood (`yes` / huge `cat`) | UI drown in updates; soft freeze | Drain pending chunks, one `process_bytes` + one notify — see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md). **Never drop bytes** |
@@ -179,15 +179,16 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 
 ### 2026-09-05 — 多 Tab 长会话点 X 窗口不消失
 
-**现象：** Local+SSH 混开、连续使用近一天后点标题栏 X，**窗口不消失**。连开多个 tab 立刻关则秒关。复现版本尚无端口转发；有过 SFTP 传文件与查找框。
+**现象：** Local+SSH 混开、连续使用近一天后点标题栏 X，**窗口不消失** / 「未响应」、任务管理器 CPU≈0。连开多个 tab 立刻关则秒关。
 
-**原因归类（分析，未改代码）：** 方案 B 关窗先 `should_close → false`，依赖 `WillQuit` 同步 `flush_persist` 后再 `cx.quit()`。flush 经 `bound_local_cwds` → `process_cwd`（sysinfo）跑在 UI 线程；长寿命 Local shell 上该调用可阻塞 → 到不了 `quit` → 窗一直留下。方案 B + Windows `PostQuitMessage` 放大该问题。转发 `recv_timeout`、查找框已排除为本案主因。
+**原因归类：** 方案 B 先 `should_close → false`；`WillQuit` flush 在 UI 线程同步 `process_cwd`（sysinfo）可读长寿命 Local PEB 时卡住；Windows 上卡在 WM_CLOSE 回调里即表现为未响应。
+
+**有效做法：** 关窗用 `flush_persist_for_quit`（缓存 cwd）；点 X 同步 `prepare_window_close` 后 **`return true`**；Ctrl+Q 仍 `WillQuit` → flush_for_quit → `cx.quit()`。
 
 **完整说明：** [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)。  
-**协议：** [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)。  
-**排障日志：** [LOGGING.md](./LOGGING.md) Phase 0（`LOOM_QUIT_TRACE`）。
+**协议：** [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)。
 
-**代码：** `src/ui/workspace_view.rs`、`src/ui/persistence.rs`、`src/ui/tab_manager.rs` (`bound_local_cwds`)、`src/platform.rs` (`process_cwd`)。
+**代码：** `src/ui/workspace_view.rs`、`src/ui/persistence.rs`、`src/ui/tab_manager.rs` (`bound_local_cwds`)。
 
 ---
 

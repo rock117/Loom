@@ -86,15 +86,14 @@ impl WorkspaceView {
             Persistence::new(app_bus.clone(), store.clone(), workspace_weak, cx)
         });
 
-        // Scheme B: block close until Persistence flushes via WillQuit, then quit.
-        let bus_for_close = app_bus.clone();
+        // Close: flush without process_cwd, then allow DestroyWindow (avoid return-false limbo).
+        // Ctrl+Q still uses WillQuit → flush_for_quit + cx.quit().
         let persistence_for_close = persistence.clone();
         window.on_window_should_close(cx, move |_window, cx| {
-            if persistence_for_close.read(cx).allow_window_close() {
-                return true;
+            if !persistence_for_close.read(cx).allow_window_close() {
+                persistence_for_close.update(cx, |p, cx| p.prepare_window_close(cx));
             }
-            AppBus::emit(&bus_for_close, AppBusEvent::WillQuit, cx);
-            false
+            true
         });
 
         let mut view = Self {
@@ -574,14 +573,24 @@ impl WorkspaceView {
         self.persist_tabs(cx);
     }
 
-    /// Flush open tabs + Bound Local cwds to disk (also used on window release).
+    /// Flush open tabs + Bound Local cwds to disk (Ctrl+S / debounce).
+    /// Refreshes live cwd via sysinfo — do **not** use on the window-close path.
     pub fn flush_persist(&mut self, cx: &mut App) {
+        self.flush_persist_inner(true, cx);
+    }
+
+    /// Quit/close flush: use cached cwd only (no `process_cwd`) so WM_CLOSE cannot block.
+    pub fn flush_persist_for_quit(&mut self, cx: &mut App) {
+        self.flush_persist_inner(false, cx);
+    }
+
+    fn flush_persist_inner(&mut self, refresh_cwd: bool, cx: &mut App) {
         let sidebar_width = self.sidebar_width;
         let sidebar_visible = self.sidebar_visible;
         let context_panel_width = self.context_panel_width;
         let context_panel_visible = self.context_panel_visible;
         let (tabs, active, font_size, local_cwds) = self.tabs.update(cx, |m, cx| {
-            let cwds = m.bound_local_cwds(cx);
+            let cwds = m.bound_local_cwds(refresh_cwd, cx);
             let (tabs, active) = m.snapshot_for_persist();
             (tabs, active, m.font_size, cwds)
         });
