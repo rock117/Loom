@@ -4,6 +4,7 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
+use crate::model::ConnectionState;
 use crate::shared::theme;
 use crate::terminal::TerminalView;
 use crate::ui::pane_layout::{PaneLayout, SplitAxis};
@@ -18,6 +19,7 @@ struct SashDrag {
 struct PaneRender {
     terminal: Option<Entity<TerminalView>>,
     status_message: String,
+    state: ConnectionState,
 }
 
 pub struct TerminalPane {
@@ -59,6 +61,7 @@ impl Render for TerminalPane {
                             PaneRender {
                                 terminal: p.terminal.clone(),
                                 status_message: p.status_message.clone(),
+                                state: p.state,
                             },
                         )
                     })
@@ -322,12 +325,13 @@ fn render_pane(
             .when_some(focus_overlay, |d, overlay| d.child(overlay))
             .into_any_element(),
         None => {
-            // Empty / Failed: no full-bleed focus overlay — buttons must stay clickable.
-            let tabs_close = tabs.clone();
+            // Connecting: status text only. Failed/Disconnected: Close + Reconnect.
+            let show_actions = matches!(
+                pane.state,
+                ConnectionState::Failed | ConnectionState::Disconnected
+            );
             let tabs_focus = tabs.clone();
-            let tabs_re = tabs.clone();
-            let store_re = store.clone();
-            div()
+            let mut body = div()
                 .id(SharedString::from(format!("pane-{id}")))
                 .relative()
                 .flex_1()
@@ -353,8 +357,14 @@ fn render_pane(
                         .text_color(theme::TEXT_MUTED)
                         .text_center()
                         .child(msg),
-                )
-                .child(
+                );
+
+            if show_actions {
+                // No full-bleed focus overlay — buttons must stay clickable.
+                let tabs_close = tabs.clone();
+                let tabs_re = tabs.clone();
+                let store_re = store.clone();
+                body = body.child(
                     div()
                         .flex()
                         .flex_row()
@@ -398,8 +408,10 @@ fn render_pane(
                                     });
                                 })),
                         ),
-                )
-                .into_any_element()
+                );
+            }
+
+            body.into_any_element()
         }
     }
 }
