@@ -1176,6 +1176,98 @@ impl SshForm {
             )
     }
 
+    fn auth_mode_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let use_key = self.use_private_key;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::TEXT_MUTED)
+                    .child("Authentication"),
+            )
+            .child(
+                div()
+                    .id("ssh-auth-mode")
+                    .flex()
+                    .flex_row()
+                    .w_full()
+                    .rounded(px(theme::RADIUS_SM))
+                    .border_1()
+                    .border_color(theme::BORDER)
+                    .overflow_hidden()
+                    .child(Self::auth_mode_segment(
+                        "ssh-auth-password",
+                        "Password",
+                        !use_key,
+                        false,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .w(px(1.0))
+                            .h_full()
+                            .bg(theme::BORDER),
+                    )
+                    .child(Self::auth_mode_segment(
+                        "ssh-auth-key",
+                        "Private key",
+                        use_key,
+                        true,
+                        cx,
+                    )),
+            )
+    }
+
+    fn auth_mode_segment(
+        id: &'static str,
+        label: &'static str,
+        selected: bool,
+        private_key: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .flex_1()
+            .px(px(theme::SPACE_2))
+            .py(px(theme::SPACE_1))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .when(selected, |d| d.bg(theme::ACCENT))
+            .when(!selected, |d| d.bg(theme::ELEVATED).hover(|s| s.bg(theme::HOVER)))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(if selected {
+                        Hsla {
+                            h: 0.0,
+                            s: 0.0,
+                            l: 1.0,
+                            a: 1.0,
+                        }
+                    } else {
+                        theme::TEXT
+                    })
+                    .child(label),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                if this.use_private_key == private_key {
+                    return;
+                }
+                this.use_private_key = private_key;
+                let field = if private_key {
+                    Field::KeyPath
+                } else {
+                    Field::Password
+                };
+                this.focus_field(field, window, cx);
+            }))
+    }
+
     fn field_row(
         &self,
         id: &'static str,
@@ -1480,33 +1572,7 @@ impl Render for SshForm {
                                     )),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("ssh-auth-mode")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme::TEXT)
-                                    .child(if self.use_private_key {
-                                        "Auth: private key  (click to use password)"
-                                    } else {
-                                        "Auth: password  (click to use private key)"
-                                    }),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.use_private_key = !this.use_private_key;
-                                let field = if this.use_private_key {
-                                    Field::KeyPath
-                                } else {
-                                    Field::Password
-                                };
-                                this.focus_field(field, window, cx);
-                            })),
-                    )
+                    .child(self.auth_mode_section(cx))
                     .when(!self.use_private_key, |d| {
                         d.child(self.field_row(
                             "ssh-pass",
