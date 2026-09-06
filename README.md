@@ -1,109 +1,88 @@
 # Loom
 
-A desktop terminal client built with [GPUI](https://gpui.rs): local shell and SSH only, with a Postman-style layout.
+**Loom** is a desktop terminal client for local shells and SSH. Organize connections in a sidebar, work in tabs and splits in the center, and keep sessions tidy without scattering windows across the desktop.
 
-## Features
+Built with [GPUI](https://gpui.rs). **Windows** is the primary platform today.
 
-- **Left nav**: groups and named local shell profiles
-- **Right pane**: multi-tab sessions; each tab can be renamed
-- **Profiles**: create, rename, duplicate, move between groups, delete
-- **Groups**: create, rename, delete; workspace auto-saves to disk
-- **Sessions**: open from a profile, duplicate tab, reconnect when disconnected
-- **Local shell** (priority): via `portable-pty` + in-house alacritty/GPUI terminal (Windows: pwsh / PowerShell / cmd)
-- **SSH**: `russh` sessions; passwords stored in the OS keyring when “Remember” is enabled
-- **Find**: Ctrl+F searches terminal scrollback (literal match)
-- **Line numbers**: optional left gutter (Settings → Line numbers)
-- **Context menu**: right-click terminal for Copy / Paste / Copy Path / Reveal / Find / Close (replaces right-click paste)
-- **Splits**: Tab-bar columns icon → Split Right / Left / Up / Down (Zed-style popover)
+---
+
+## Who it’s for
+
+- People who juggle many **local terminals** and **SSH** hosts and want them managed in one place  
+- Anyone who prefers a dedicated connection list beside the terminal, instead of ad‑hoc windows  
+- Users who need split panes, reconnect, remote files, and light session tooling around the shell  
+
+---
+
+## What you get
+
+### Connections & workspace
+
+- **Local shell** and **SSH** profiles, organized in groups  
+- Open a session from the sidebar; create, rename, duplicate, and move profiles  
+- Workspace state is saved so your usual tabs can come back next time  
+
+### Tabs & splits
+
+- Multiple tabs, each with its own session(s)  
+- Split left / right / up / down within a tab—each pane is an independent session  
+- SSH splits can reuse the in‑memory session password so you aren’t prompted again unnecessarily  
+
+### SSH
+
+- Password or private‑key auth; optional **Remember** stores the password in the OS keyring  
+- Reconnect a whole tab or a single failed pane after disconnect  
+- **Port forwarding** on the same connection  
+- Optional right **context panel**: remote files (SFTP) and session info  
+
+### Terminal
+
+- Find in scrollback  
+- Context menu: copy / paste / path helpers / find / split / close, and more  
+- Font size, line numbers, and ANSI color presets in Settings  
+
+---
 
 ## Layout
 
 ```
-+-- Sidebar ------------------+-- Tabs --------------------+
-| Search / New Group|Shell|SSH | [pwsh] [bastion] [+]       |
-| v Local                     +----------------------------+
-|   PowerShell                | Terminal                   |
-| v Production                |                            |
-|   bastion                   |                            |
-+-----------------------------+----------------------------+
+┌─ Sidebar ────────────┬─ Tabs ──────────────────────┐
+│ Groups / profiles    │  [local] [bastion] [+]        │
+│                      ├──────────────────────────────┤
+│  Local / SSH …       │  Terminal (optional splits)  │
+│                      │                              │
+└──────────────────────┴────────────┬─────────────────┘
+                                    │ Context panel
+                                    │  Files / Info …
 ```
 
-## Requirements
+---
 
-- Rust stable with edition 2024 (see `rust-toolchain.toml`)
-- Windows 10+ (primary), or macOS / Linux
+## Run
 
-## Build & run
+Requires Rust (see `rust-toolchain.toml`).
 
 ```bash
 cargo run --release
 ```
 
-Debug:
+Data lives under the app data directory (on Windows: `%APPDATA%/Loom/`), including workspace, UI state, and settings. With Remember enabled, SSH passwords are kept in the OS credential store—not as plaintext in config files.
 
-```bash
-cargo run
-```
+---
 
-On Windows, the window/taskbar icon is embedded from `assets/icons/loom.ico` via `resources/windows/loom.rc` (resource ID 1, which GPUI loads).
-## Data locations
-
-On Windows (under `%APPDATA%/Loom/`):
-
-| File | Purpose |
-|------|---------|
-| `workspace.json` | Groups and profiles |
-| `ui_state.json` | Sidebar width, open tabs, window bounds |
-| `settings.json` | Default shell, font |
-| `known_hosts.json` | SSH host key fingerprints |
-
-Passwords and key passphrases are kept in memory only and are never written to disk.
-
-## Shortcuts
+## Shortcuts (selected)
 
 | Shortcut | Action |
 |----------|--------|
-| `Ctrl+T` | New local tab (default profile) |
-| `Ctrl+W` | Close current tab |
+| `Ctrl+T` | New ephemeral local tab |
+| `Ctrl+W` | Close focused pane / tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+Shift+D` | Duplicate current tab |
-| `F2` | Rename focused profile or tab |
+| `Ctrl+F` | Find in terminal |
+| `Ctrl+,` | Settings |
 | `Ctrl+S` | Save workspace now |
-| `Ctrl+,` | Open Settings |
-| `Ctrl+E` | Export workspace |
-| `Ctrl+Shift+I` | Import workspace |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Font size |
 
-## Project layout
-
-```
-src/
-  app.rs                 # Application entry / key bindings / quit
-  platform.rs + platform/# OS paths, default shell, fonts (Windows-first)
-  model.rs + model/       # Workspace, profiles, persistence
-  session.rs + session/  # Local PTY + teardown helpers
-  terminal.rs + terminal/# Scaffold toward in-house GPUI terminal
-  shared.rs + shared/    # Theme, actions, paths
-  ui.rs + ui/            # Sidebar, tabs, settings, widgets
-```
-
-GPUI code follows the skills under `~/.agents/skills` (entities observe, Stateful `.id()` + click handlers, no `mod.rs`, SharedString, explicit error logging).
-
-Target architecture (Zed-inspired ideas, Windows-first, MIT): see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.  
-Design trade-offs and accepted decisions: **[docs/DECISIONS.md](docs/DECISIONS.md)**.  
-Hard GPUI/platform pitfalls + UI freeze checklist: **[docs/HARD_PROBLEMS.md](docs/HARD_PROBLEMS.md)**.  
-Local shell (pwsh vs cmd, startup slowness): **[docs/LOCAL_SHELL.md](docs/LOCAL_SHELL.md)**.  
-Three-column context panel (snippets / files / info): **[docs/CONTEXT_PANEL.md](docs/CONTEXT_PANEL.md)**.  
-Low-priority icebox features (explicit order only): **[docs/BACKLOG.md](docs/BACKLOG.md)**.  
-Agent / contributor principles: **[AGENTS.md](AGENTS.md)**.
-
-## Roadmap
-
-Execution order: **scaffold → layout/local profiles → local PTY → local polish → SSH (deferred)**.
-
-Longer-term direction (custom GPUI terminal element, platform layer, Zed-like feel) is described in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-v1 also excludes serial/Telnet, SFTP UI, port forwarding, cloud sync, and plugins.
+---
 
 ## License
 
