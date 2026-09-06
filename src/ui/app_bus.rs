@@ -22,6 +22,8 @@ pub enum AppBusEvent {
         pane_id: Uuid,
         direction: SplitDirection,
     },
+    /// Reconnect a single pane (empty / Failed placeholder).
+    ReconnectPane { pane_id: Uuid },
     /// Duplicate the active tab (from terminal context menu).
     DuplicateActiveTab,
     /// Brief status-bar toast (e.g. invalid shell fallback).

@@ -13,13 +13,28 @@ use crate::ui::sidebar::{Sidebar, SidebarEvent};
 use crate::ui::ssh_form::{SshForm, SshFormEvent};
 use crate::ui::status_bar::{StatusBar, StatusBarEvent};
 use crate::ui::tab_bar::{TabBar, TabBarEvent};
-use crate::ui::tab_manager::TabManager;
+use crate::ui::pane_layout::SplitDirection;
+use crate::ui::tab_manager::{SessionOpResult, TabManager};
 use crate::ui::terminal_pane::TerminalPane;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
 
 struct ContextResizeDrag {
     start_x: f32,
     start_width: f32,
+}
+
+/// After password modal submit — what to run (keyring may also store the password).
+#[derive(Clone, Debug)]
+enum PendingPasswordAction {
+    /// Open a Bound SSH profile (default when unset historically).
+    Open,
+    ReconnectTab(uuid::Uuid),
+    ReconnectPane(uuid::Uuid),
+    DuplicateTab,
+    SplitPane {
+        pane_id: uuid::Uuid,
+        direction: SplitDirection,
+    },
 }
 
 pub struct WorkspaceView {
@@ -36,8 +51,7 @@ pub struct WorkspaceView {
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
-    /// When set, password submit reconnects this tab instead of opening a new one.
-    pending_reconnect_tab: Option<uuid::Uuid>,
+    pending_password: Option<PendingPasswordAction>,
     sidebar_width: f32,
     sidebar_visible: bool,
     resizing_sidebar: bool,
@@ -110,7 +124,7 @@ impl WorkspaceView {
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
             password_prompt: None,
-            pending_reconnect_tab: None,
+            pending_password: None,
             sidebar_width,
             sidebar_visible,
             resizing_sidebar: false,
@@ -130,17 +144,14 @@ impl WorkspaceView {
                 AppBusEvent::SplitPane { pane_id, direction } => {
                     let pane_id = *pane_id;
                     let direction = *direction;
-                    let store = this.store.clone();
-                    this.tabs.update(cx, |m, cx| {
-                        m.split_pane(pane_id, direction, &store, window, cx);
-                    });
+                    this.request_split_pane(pane_id, direction, window, cx);
+                }
+                AppBusEvent::ReconnectPane { pane_id } => {
+                    let pane_id = *pane_id;
+                    this.request_reconnect_pane(pane_id, window, cx);
                 }
                 AppBusEvent::DuplicateActiveTab => {
-                    let store = this.store.clone();
-                    this.tabs.update(cx, |m, cx| {
-                        m.duplicate_active_ephemeral(&store, window, cx);
-                    });
-                    this.persist_tabs(cx);
+                    this.request_duplicate_tab(window, cx);
                 }
                 AppBusEvent::Toast(msg) => {
                     this.set_toast(msg.clone(), cx);
@@ -217,18 +228,14 @@ impl WorkspaceView {
                 TabBarEvent::NewTab => this.new_local_tab(window, cx),
                 TabBarEvent::Changed => this.persist_tabs(cx),
                 TabBarEvent::Split(direction) => {
-                    let store = this.store.clone();
                     let direction = *direction;
-                    this.tabs.update(cx, |m, cx| {
-                        m.split_focused(direction, &store, window, cx);
-                    });
+                    let focused = this.tabs.read(cx).active_tab().map(|t| t.focused);
+                    if let Some(pane_id) = focused {
+                        this.request_split_pane(pane_id, direction, window, cx);
+                    }
                 }
-                TabBarEvent::DuplicateProfile(_profile_id) => {
-                    let store = this.store.clone();
-                    this.tabs.update(cx, |m, cx| {
-                        m.duplicate_active_ephemeral(&store, window, cx);
-                    });
-                    this.persist_tabs(cx);
+                TabBarEvent::DuplicateTab => {
+                    this.request_duplicate_tab(window, cx);
                 }
                 TabBarEvent::SaveTab { tab_id, group_id } => {
                     this.save_tab_to_group(*tab_id, *group_id, cx);
@@ -242,39 +249,7 @@ impl WorkspaceView {
             |this, _, event, window, cx| match event {
                 StatusBarEvent::Reconnect(id) => {
                     let tab_id = *id;
-                    let profile = {
-                        let tabs = this.tabs.read(cx);
-                        tabs.tabs
-                            .iter()
-                            .find(|t| t.id == tab_id)
-                            .and_then(|t| t.focused_pane())
-                            .and_then(|p| {
-                                p.profile_id.and_then(|pid| {
-                                    this.store
-                                        .read(cx)
-                                        .workspace
-                                        .find_profile(pid)
-                                        .cloned()
-                                })
-                            })
-                    };
-                    if let Some(profile) = profile {
-                        if TabManager::ssh_needs_password(&profile) {
-                            this.pending_reconnect_tab = Some(tab_id);
-                            this.show_password_prompt(
-                                profile.id,
-                                profile.name.clone(),
-                                window,
-                                cx,
-                            );
-                            return;
-                        }
-                    }
-                    this.pending_reconnect_tab = None;
-                    let store = this.store.clone();
-                    this.tabs.update(cx, |m, cx| {
-                        m.reconnect(tab_id, &store, window, cx);
-                    });
+                    this.request_reconnect_tab(tab_id, window, cx);
                 }
                 StatusBarEvent::OpenSettings => {
                     this.show_settings = true;
@@ -374,7 +349,13 @@ impl WorkspaceView {
         };
 
         if TabManager::ssh_needs_password(&profile) {
-            self.show_password_prompt(profile.id, profile.name.clone(), window, cx);
+            self.show_password_prompt(
+                profile.id,
+                profile.name.clone(),
+                PendingPasswordAction::Open,
+                window,
+                cx,
+            );
             return;
         }
 
@@ -419,7 +400,13 @@ impl WorkspaceView {
         }
 
         if TabManager::ssh_needs_password(&profile) {
-            self.show_password_prompt(profile.id, profile.name.clone(), window, cx);
+            self.show_password_prompt(
+                profile.id,
+                profile.name.clone(),
+                PendingPasswordAction::Open,
+                window,
+                cx,
+            );
             return;
         }
 
@@ -433,15 +420,17 @@ impl WorkspaceView {
         &mut self,
         profile_id: uuid::Uuid,
         title: String,
+        action: PendingPasswordAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pending_password.replace(action);
         let prompt = cx.new(|cx| PasswordPrompt::new(profile_id, title, cx));
-        self._subscriptions.push(cx.subscribe(&prompt, {
-            move |this, _, event: &PasswordPromptEvent, cx| match event {
+        self._subscriptions.push(cx.subscribe_in(&prompt, window, {
+            move |this, _, event: &PasswordPromptEvent, window, cx| match event {
                 PasswordPromptEvent::Cancel => {
                     this.password_prompt = None;
-                    this.pending_reconnect_tab = None;
+                    this.pending_password = None;
                     cx.notify();
                 }
                 PasswordPromptEvent::Submit {
@@ -449,33 +438,17 @@ impl WorkspaceView {
                     password,
                 } => {
                     this.password_prompt = None;
-                    let reconnect_tab = this.pending_reconnect_tab.take();
-                    let (profile, font_family) = {
-                        let s = this.store.read(cx);
-                        (
-                            s.workspace.find_profile(*profile_id).cloned(),
-                            s.settings.font_family.clone(),
-                        )
-                    };
-                    if let Some(profile) = profile {
-                        if let Some(tab_id) = reconnect_tab {
-                            let store = this.store.clone();
-                            let password = password.clone();
-                            this.tabs.update(cx, |m, cx| {
-                                m.reconnect_with_password(tab_id, password, &store, cx);
-                            });
-                        } else {
-                            this.tabs.update(cx, |m, cx| {
-                                m.open_ssh_with_password(
-                                    &profile,
-                                    password.clone(),
-                                    &font_family,
-                                    cx,
-                                );
-                            });
-                            this.persist_tabs(cx);
-                        }
-                    }
+                    let action = this
+                        .pending_password
+                        .take()
+                        .unwrap_or(PendingPasswordAction::Open);
+                    this.finish_password_action(
+                        *profile_id,
+                        password.clone(),
+                        action,
+                        window,
+                        cx,
+                    );
                     cx.notify();
                 }
             }
@@ -488,6 +461,182 @@ impl WorkspaceView {
             if let Some(prompt) = this.password_prompt.as_ref() {
                 prompt.read(cx).focus(window);
             }
+        });
+    }
+
+    fn finish_password_action(
+        &mut self,
+        profile_id: uuid::Uuid,
+        password: String,
+        action: PendingPasswordAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let font_family = self.store.read(cx).settings.font_family.clone();
+        let profile = self
+            .store
+            .read(cx)
+            .workspace
+            .find_profile(profile_id)
+            .cloned();
+
+        match action {
+            PendingPasswordAction::Open => {
+                if let Some(profile) = profile {
+                    self.tabs.update(cx, |m, cx| {
+                        m.open_ssh_with_password(&profile, password, &font_family, cx);
+                    });
+                    self.persist_tabs(cx);
+                }
+            }
+            PendingPasswordAction::ReconnectTab(tab_id) => {
+                self.tabs.update(cx, |m, cx| {
+                    m.reconnect_with_password(tab_id, password, &store, cx);
+                });
+            }
+            PendingPasswordAction::ReconnectPane(pane_id) => {
+                self.tabs.update(cx, |m, cx| {
+                    m.reconnect_pane_with_password(pane_id, password, &store, cx);
+                });
+            }
+            PendingPasswordAction::DuplicateTab => {
+                let result = self.tabs.update(cx, |m, cx| {
+                    m.duplicate_active_ephemeral(&store, Some(password), window, cx)
+                });
+                if matches!(result, SessionOpResult::Done) {
+                    self.persist_tabs(cx);
+                }
+            }
+            PendingPasswordAction::SplitPane { pane_id, direction } => {
+                let _ = self.tabs.update(cx, |m, cx| {
+                    m.split_pane_with_password(
+                        pane_id, direction, password, &store, window, cx,
+                    )
+                });
+            }
+        }
+    }
+
+    fn handle_session_op_result(
+        &mut self,
+        result: SessionOpResult,
+        action: PendingPasswordAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            SessionOpResult::Done => {
+                if matches!(
+                    action,
+                    PendingPasswordAction::DuplicateTab | PendingPasswordAction::Open
+                ) {
+                    self.persist_tabs(cx);
+                }
+            }
+            SessionOpResult::NeedsPassword { profile_id, title } => {
+                self.show_password_prompt(profile_id, title, action, window, cx);
+            }
+        }
+    }
+
+    fn request_split_pane(
+        &mut self,
+        pane_id: uuid::Uuid,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.clone();
+        let result = self.tabs.update(cx, |m, cx| {
+            m.split_pane(pane_id, direction, &store, window, cx)
+        });
+        self.handle_session_op_result(
+            result,
+            PendingPasswordAction::SplitPane { pane_id, direction },
+            window,
+            cx,
+        );
+    }
+
+    fn request_duplicate_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let store = self.store.clone();
+        let result = self.tabs.update(cx, |m, cx| {
+            m.duplicate_active_ephemeral(&store, None, window, cx)
+        });
+        self.handle_session_op_result(
+            result,
+            PendingPasswordAction::DuplicateTab,
+            window,
+            cx,
+        );
+    }
+
+    fn request_reconnect_tab(
+        &mut self,
+        tab_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let creds = {
+            let tabs = self.tabs.read(cx);
+            tabs.tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
+                t.focused_pane().and_then(|p| {
+                    p.credentials_profile_id().map(|pid| (pid, p.label.clone()))
+                })
+            })
+        };
+        if let Some((pid, label)) = creds {
+            if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
+                if TabManager::ssh_needs_password(&profile) {
+                    self.show_password_prompt(
+                        pid,
+                        label,
+                        PendingPasswordAction::ReconnectTab(tab_id),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        let store = self.store.clone();
+        self.tabs.update(cx, |m, cx| {
+            m.reconnect(tab_id, &store, window, cx);
+        });
+    }
+
+    fn request_reconnect_pane(
+        &mut self,
+        pane_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let creds = {
+            let tabs = self.tabs.read(cx);
+            tabs.tabs.iter().find_map(|t| {
+                t.panes.get(&pane_id).and_then(|p| {
+                    p.credentials_profile_id().map(|pid| (pid, p.label.clone()))
+                })
+            })
+        };
+        if let Some((pid, label)) = creds {
+            if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
+                if TabManager::ssh_needs_password(&profile) {
+                    self.show_password_prompt(
+                        pid,
+                        label,
+                        PendingPasswordAction::ReconnectPane(pane_id),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+            }
+        }
+        let store = self.store.clone();
+        self.tabs.update(cx, |m, cx| {
+            m.reconnect_pane(pane_id, &store, window, cx);
         });
     }
 
@@ -522,7 +671,7 @@ impl WorkspaceView {
         else {
             return;
         };
-        // Already bound — nothing to save.
+        // Focused pane already Bound — nothing to save (Save targets ephemeral focus).
         if self
             .tabs
             .read(cx)
@@ -568,7 +717,7 @@ impl WorkspaceView {
             s.place_profile(profile, target, cx);
         });
         self.tabs.update(cx, |m, cx| {
-            m.bind_focused_to_profile(tab_id, pid, name, cx);
+            m.bind_ephemeral_panes_in_tab(tab_id, pid, name, cx);
         });
         self.persist_tabs(cx);
     }
@@ -758,48 +907,44 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &SplitLeft, window, cx| {
-                let store = this.store.clone();
-                this.tabs.update(cx, |m, cx| {
-                    m.split_focused(
+                if let Some(pane_id) = this.tabs.read(cx).active_tab().map(|t| t.focused) {
+                    this.request_split_pane(
+                        pane_id,
                         crate::ui::pane_layout::SplitDirection::Left,
-                        &store,
                         window,
                         cx,
                     );
-                });
+                }
             }))
             .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
-                let store = this.store.clone();
-                this.tabs.update(cx, |m, cx| {
-                    m.split_focused(
+                if let Some(pane_id) = this.tabs.read(cx).active_tab().map(|t| t.focused) {
+                    this.request_split_pane(
+                        pane_id,
                         crate::ui::pane_layout::SplitDirection::Right,
-                        &store,
                         window,
                         cx,
                     );
-                });
+                }
             }))
             .on_action(cx.listener(|this, _: &SplitUp, window, cx| {
-                let store = this.store.clone();
-                this.tabs.update(cx, |m, cx| {
-                    m.split_focused(
+                if let Some(pane_id) = this.tabs.read(cx).active_tab().map(|t| t.focused) {
+                    this.request_split_pane(
+                        pane_id,
                         crate::ui::pane_layout::SplitDirection::Up,
-                        &store,
                         window,
                         cx,
                     );
-                });
+                }
             }))
             .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
-                let store = this.store.clone();
-                this.tabs.update(cx, |m, cx| {
-                    m.split_focused(
+                if let Some(pane_id) = this.tabs.read(cx).active_tab().map(|t| t.focused) {
+                    this.request_split_pane(
+                        pane_id,
                         crate::ui::pane_layout::SplitDirection::Down,
-                        &store,
                         window,
                         cx,
                     );
-                });
+                }
             }))
             .on_action(cx.listener(|this, _: &ActivatePaneLeft, window, cx| {
                 this.tabs.update(cx, |m, cx| {
@@ -846,11 +991,7 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &DuplicateTab, window, cx| {
-                let store = this.store.clone();
-                this.tabs.update(cx, |m, cx| {
-                    m.duplicate_active_ephemeral(&store, window, cx);
-                });
-                this.persist_tabs(cx);
+                this.request_duplicate_tab(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SaveWorkspace, _, cx| {
                 this.persistence.update(cx, |p, cx| p.flush_now(cx));

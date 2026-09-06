@@ -363,7 +363,6 @@ fn render_pane(
                 // No full-bleed focus overlay — buttons must stay clickable.
                 let tabs_close = tabs.clone();
                 let tabs_re = tabs.clone();
-                let store_re = store.clone();
                 body = body.child(
                     div()
                         .flex()
@@ -402,9 +401,9 @@ fn render_pane(
                                 .hover(|s| s.opacity(0.9))
                                 .child("Reconnect")
                                 .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                                .on_click(cx.listener(move |_, _, window, cx| {
+                                .on_click(cx.listener(move |_, _, _, cx| {
                                     tabs_re.update(cx, |m, cx| {
-                                        m.reconnect_pane(id, &store_re, window, cx);
+                                        m.emit_reconnect_pane(id, cx);
                                     });
                                 })),
                         ),

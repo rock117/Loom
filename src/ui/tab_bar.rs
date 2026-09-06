@@ -221,6 +221,12 @@ impl TabBar {
             None => (false, false, false),
         };
         let profile_id = manager.profile_id_for_tab(tab_id);
+        let focused_ephemeral = manager
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.focused_pane())
+            .is_some_and(|p| p.profile_id.is_none());
         let current_group = profile_id.and_then(|pid| {
             self.store
                 .read(cx)
@@ -322,11 +328,11 @@ impl TabBar {
                 true,
                 cx,
                 move |_, _, cx| {
-                    cx.emit(TabBarEvent::DuplicateProfile(Uuid::nil()));
+                    cx.emit(TabBarEvent::DuplicateTab);
                 },
             ));
 
-        if profile_id.is_none() {
+        if focused_ephemeral {
             menu = menu.child(self.menu_divider()).child(self.menu_item(
                 "tab-ctx-save-root",
                 "Save to / (root)",
@@ -680,8 +686,8 @@ pub enum TabBarEvent {
     NewTab,
     Changed,
     Split(SplitDirection),
-    /// Duplicate focused tab as ephemeral session (id unused).
-    DuplicateProfile(Uuid),
+    /// Duplicate focused tab as ephemeral session.
+    DuplicateTab,
     /// Save ephemeral tab to workspace root (`group_id: None`) or a group.
     SaveTab {
         tab_id: Uuid,
