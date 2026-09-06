@@ -76,7 +76,7 @@ impl WorkspaceView {
         });
         let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
         let tab_bar = cx.new(|cx| TabBar::new(tabs.clone(), store.clone(), cx));
-        let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), cx));
+        let terminal_pane = cx.new(|cx| TerminalPane::new(tabs.clone(), store.clone(), cx));
         let context_panel = cx.new(|cx| ContextPanel::new(store.clone(), tabs.clone(), cx));
         let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));

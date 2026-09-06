@@ -673,7 +673,7 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.reconnect_inner(tab_id, store, None, Some(window), cx);
+        self.reconnect_inner(tab_id, None, store, None, Some(window), cx);
     }
 
     /// SSH password reconnect (no Window required — used after modal submit).
@@ -684,12 +684,57 @@ impl TabManager {
         store: &Entity<WorkspaceStore>,
         cx: &mut Context<Self>,
     ) {
-        self.reconnect_inner(tab_id, store, Some(password), None, cx);
+        self.reconnect_inner(tab_id, None, store, Some(password), None, cx);
+    }
+
+    /// Reconnect a single pane (empty / Failed split placeholder).
+    pub fn reconnect_pane(
+        &mut self,
+        pane_id: Uuid,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self
+            .tabs
+            .iter()
+            .find(|t| t.panes.contains_key(&pane_id))
+            .map(|t| t.id)
+        else {
+            return;
+        };
+        self.reconnect_inner(tab_id, Some(pane_id), store, None, Some(window), cx);
+    }
+
+    pub fn reconnect_pane_with_password(
+        &mut self,
+        pane_id: Uuid,
+        password: String,
+        store: &Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_id) = self
+            .tabs
+            .iter()
+            .find(|t| t.panes.contains_key(&pane_id))
+            .map(|t| t.id)
+        else {
+            return;
+        };
+        self.reconnect_inner(tab_id, Some(pane_id), store, Some(password), None, cx);
+    }
+
+    /// Profile for a pane (Bound), used by password reconnect UI.
+    pub fn profile_id_for_pane(&self, pane_id: Uuid) -> Option<Uuid> {
+        self.tabs
+            .iter()
+            .find_map(|t| t.panes.get(&pane_id).and_then(|p| p.profile_id))
     }
 
     fn reconnect_inner(
         &mut self,
         tab_id: Uuid,
+        only_pane: Option<Uuid>,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
         mut window: Option<&mut Window>,
@@ -698,8 +743,11 @@ impl TabManager {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
-        // Status-bar Reconnect rebuilds every pane in the tab (all splits), not only focused.
-        let pane_ids: Vec<Uuid> = self.tabs[idx].panes.keys().copied().collect();
+        let pane_ids: Vec<Uuid> = match only_pane {
+            Some(pid) if self.tabs[idx].panes.contains_key(&pid) => vec![pid],
+            Some(_) => return,
+            None => self.tabs[idx].panes.keys().copied().collect(),
+        };
         if pane_ids.is_empty() {
             return;
         }

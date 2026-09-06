@@ -8,6 +8,7 @@ use crate::shared::theme;
 use crate::terminal::TerminalView;
 use crate::ui::pane_layout::{PaneLayout, SplitAxis};
 use crate::ui::tab_manager::TabManager;
+use crate::ui::workspace_store::WorkspaceStore;
 
 struct SashDrag {
     split_id: Uuid,
@@ -21,16 +22,22 @@ struct PaneRender {
 
 pub struct TerminalPane {
     pub tabs: Entity<TabManager>,
+    pub store: Entity<WorkspaceStore>,
     sash_drag: Option<SashDrag>,
     split_bounds: HashMap<Uuid, Bounds<Pixels>>,
     _observe_tabs: Subscription,
 }
 
 impl TerminalPane {
-    pub fn new(tabs: Entity<TabManager>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        tabs: Entity<TabManager>,
+        store: Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let _observe_tabs = cx.observe(&tabs, |_this, _tabs, cx| cx.notify());
         Self {
             tabs,
+            store,
             sash_drag: None,
             split_bounds: HashMap::new(),
             _observe_tabs,
@@ -110,10 +117,19 @@ impl Render for TerminalPane {
                     // Zoom: show one leaf full-bleed; keep split tree for restore.
                     if let Some(z) = zoomed.filter(|z| panes.contains_key(z)) {
                         // Full-bleed like Zed zoom — no multi-pane chrome.
-                        render_pane(z, panes.get(&z), true, false, &tabs, cx)
+                        render_pane(z, panes.get(&z), true, false, &tabs, &self.store, cx)
                     } else {
                         let multi_pane = layout.leaf_count() > 1;
-                        render_layout(&layout, &panes, focused, multi_pane, &view, &tabs, cx)
+                        render_layout(
+                            &layout,
+                            &panes,
+                            focused,
+                            multi_pane,
+                            &view,
+                            &tabs,
+                            &self.store,
+                            cx,
+                        )
                     }
                 }
             })
@@ -149,11 +165,12 @@ fn render_layout(
     multi_pane: bool,
     view: &Entity<TerminalPane>,
     tabs: &Entity<TabManager>,
+    store: &Entity<WorkspaceStore>,
     cx: &mut Context<TerminalPane>,
 ) -> AnyElement {
     match layout {
         PaneLayout::Leaf(id) => {
-            render_pane(*id, panes.get(id), *id == focused, multi_pane, tabs, cx)
+            render_pane(*id, panes.get(id), *id == focused, multi_pane, tabs, store, cx)
         }
         PaneLayout::Split {
             id: split_id,
@@ -234,7 +251,7 @@ fn render_layout(
                     .min_w_0()
                     .overflow_hidden()
                     .child(render_layout(
-                        first, panes, focused, multi_pane, view, tabs, cx,
+                        first, panes, focused, multi_pane, view, tabs, store, cx,
                     )),
             )
             .child(sash)
@@ -245,7 +262,7 @@ fn render_layout(
                     .min_w_0()
                     .overflow_hidden()
                     .child(render_layout(
-                        second, panes, focused, multi_pane, view, tabs, cx,
+                        second, panes, focused, multi_pane, view, tabs, store, cx,
                     )),
             )
             .into_any_element()
@@ -259,6 +276,7 @@ fn render_pane(
     is_focused: bool,
     multi_pane: bool,
     tabs: &Entity<TabManager>,
+    store: &Entity<WorkspaceStore>,
     cx: &mut Context<TerminalPane>,
 ) -> AnyElement {
     let Some(pane) = pane else {
@@ -303,20 +321,85 @@ fn render_pane(
             .child(entity.clone())
             .when_some(focus_overlay, |d, overlay| d.child(overlay))
             .into_any_element(),
-        None => div()
-            .id(SharedString::from(format!("pane-{id}")))
-            .relative()
-            .flex_1()
-            .flex()
-            .size_full()
-            .items_center()
-            .justify_center()
-            .p(px(theme::SPACE_4))
-            .when(show_border, |d| d.border_1().border_color(border))
-            .text_sm()
-            .text_color(theme::TEXT_MUTED)
-            .child(msg)
-            .when_some(focus_overlay, |d, overlay| d.child(overlay))
-            .into_any_element(),
+        None => {
+            // Empty / Failed: no full-bleed focus overlay — buttons must stay clickable.
+            let tabs_close = tabs.clone();
+            let tabs_focus = tabs.clone();
+            let tabs_re = tabs.clone();
+            let store_re = store.clone();
+            div()
+                .id(SharedString::from(format!("pane-{id}")))
+                .relative()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap(px(theme::SPACE_3))
+                .p(px(theme::SPACE_4))
+                .when(show_border, |d| d.border_1().border_color(border))
+                .when(multi_pane && !is_focused, |d| {
+                    d.cursor_pointer().on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |_, _, window, cx| {
+                            tabs_focus.update(cx, |m, cx| m.focus_pane(id, window, cx));
+                        }),
+                    )
+                })
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::TEXT_MUTED)
+                        .text_center()
+                        .child(msg),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(theme::SPACE_2))
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("pane-close-{id}")))
+                                .px(px(theme::SPACE_3))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .border_1()
+                                .border_color(theme::BORDER)
+                                .text_sm()
+                                .text_color(theme::TEXT)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER))
+                                .child("Close")
+                                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    tabs_close.update(cx, |m, cx| {
+                                        m.close_pane(id, Some(window), cx);
+                                    });
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("pane-reconnect-{id}")))
+                                .px(px(theme::SPACE_3))
+                                .py(px(theme::SPACE_1))
+                                .rounded(px(theme::RADIUS_SM))
+                                .bg(theme::ACCENT)
+                                .text_sm()
+                                .text_color(rgb(0xffffff))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.9))
+                                .child("Reconnect")
+                                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    tabs_re.update(cx, |m, cx| {
+                                        m.reconnect_pane(id, &store_re, window, cx);
+                                    });
+                                })),
+                        ),
+                )
+                .into_any_element()
+        }
     }
 }
