@@ -578,17 +578,30 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let creds = {
+        use crate::model::SshAuth;
+        let candidates: Vec<(uuid::Uuid, String)> = {
             let tabs = self.tabs.read(cx);
-            tabs.tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
-                t.focused_pane().and_then(|p| {
+            let Some(tab) = tabs.tabs.iter().find(|t| t.id == tab_id) else {
+                return;
+            };
+            tab.panes
+                .values()
+                .filter(|p| p.session_password.is_none())
+                .filter_map(|p| {
+                    let ProfileKind::Ssh {
+                        auth: SshAuth::Password { .. },
+                        ..
+                    } = &p.kind
+                    else {
+                        return None;
+                    };
                     p.credentials_profile_id().map(|pid| (pid, p.label.clone()))
                 })
-            })
+                .collect()
         };
-        if let Some((pid, label)) = creds {
-            if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
-                if TabManager::ssh_needs_password(&profile) {
+        for (pid, label) in candidates {
+            if let Some(profile) = self.store.read(cx).workspace.find_profile(pid) {
+                if TabManager::ssh_needs_password(profile) {
                     self.show_password_prompt(
                         pid,
                         label,
@@ -612,15 +625,26 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let creds = {
+        use crate::model::SshAuth;
+        let prompt = {
             let tabs = self.tabs.read(cx);
             tabs.tabs.iter().find_map(|t| {
-                t.panes.get(&pane_id).and_then(|p| {
-                    p.credentials_profile_id().map(|pid| (pid, p.label.clone()))
-                })
+                let p = t.panes.get(&pane_id)?;
+                if p.session_password.is_some() {
+                    return None;
+                }
+                let ProfileKind::Ssh {
+                    auth: SshAuth::Password { .. },
+                    ..
+                } = &p.kind
+                else {
+                    return None;
+                };
+                p.credentials_profile_id()
+                    .map(|pid| (pid, p.label.clone()))
             })
         };
-        if let Some((pid, label)) = creds {
+        if let Some((pid, label)) = prompt {
             if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
                 if TabManager::ssh_needs_password(&profile) {
                     self.show_password_prompt(

@@ -26,6 +26,9 @@ pub struct PaneSession {
     /// Keyring / Bound-profile lookups for ephemeral SSH clones (duplicate / split).
     /// Bound panes leave this `None` and use [`Self::profile_id`].
     pub auth_profile_id: Option<Uuid>,
+    /// In-memory SSH password for this pane only (never persisted).
+    /// Set on successful resolve; cloned on Split / Duplicate so siblings need not re-prompt.
+    pub session_password: Option<String>,
     /// Connection snapshot for spawn / reconnect / Save to….
     pub kind: ProfileKind,
     /// Display name (profile name or ephemeral label).
@@ -47,6 +50,13 @@ impl PaneSession {
     /// Profile id for keyring / workspace lookups (Bound id, or inherited for ephemeral SSH).
     pub fn credentials_profile_id(&self) -> Option<Uuid> {
         self.profile_id.or(self.auth_profile_id)
+    }
+}
+
+fn session_password_from_auth(auth: &SshAuthMaterial) -> Option<String> {
+    match auth {
+        SshAuthMaterial::Password(p) => Some(p.clone()),
+        SshAuthMaterial::PrivateKey { .. } => None,
     }
 }
 
@@ -216,6 +226,7 @@ impl TabManager {
             id: Uuid::new_v4(),
             profile_id: Some(profile.id),
             auth_profile_id: None,
+            session_password: None,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Failed,
@@ -250,10 +261,12 @@ impl TabManager {
         };
 
         let pane_id = Uuid::new_v4();
+        let session_password = session_password_from_auth(&auth);
         let pane = PaneSession {
             id: pane_id,
             profile_id: Some(profile.id),
             auth_profile_id: None,
+            session_password,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Connecting,
@@ -495,6 +508,7 @@ impl TabManager {
             id: Uuid::new_v4(),
             profile_id,
             auth_profile_id: None,
+            session_password: None,
             kind,
             label: label.to_string(),
             state: ConnectionState::Connected,
@@ -569,6 +583,7 @@ impl TabManager {
                 p.kind.clone(),
                 p.label.clone(),
                 p.credentials_profile_id(),
+                p.session_password.clone(),
                 p.ssh_forwards.clone(),
                 p.terminal
                     .as_ref()
@@ -577,7 +592,7 @@ impl TabManager {
         }) else {
             return SessionOpResult::Done;
         };
-        let (kind, label, auth_profile_id, source_forwards, live_cwd) = source;
+        let (kind, label, auth_profile_id, source_password, source_forwards, live_cwd) = source;
 
         let (default_shell, font_family) = {
             let s = store.read(cx);
@@ -628,7 +643,9 @@ impl TabManager {
                     kind: kind.clone(),
                     forwards: Vec::new(),
                 };
-                match resolve_ssh_auth(&pseudo, password) {
+                // override → source session_password → keyring
+                let effective_password = password.or(source_password);
+                match resolve_ssh_auth(&pseudo, effective_password) {
                     Ok(Some(auth)) => {
                         let new_id = Uuid::new_v4();
                         let pane = PaneSession {
@@ -636,6 +653,7 @@ impl TabManager {
                             profile_id: None,
                             // Keep Bound credentials so password SSH split/reconnect still works.
                             auth_profile_id,
+                            session_password: session_password_from_auth(&auth),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
@@ -840,11 +858,12 @@ impl TabManager {
         };
 
         for pane_id in pane_ids {
-            let Some((profile_id, auth_profile_id, kind_snap, label_snap)) =
+            let Some((profile_id, auth_profile_id, session_password, kind_snap, label_snap)) =
                 self.tabs[idx].panes.get(&pane_id).map(|p| {
                     (
                         p.profile_id,
                         p.credentials_profile_id(),
+                        p.session_password.clone(),
                         p.kind.clone(),
                         p.label.clone(),
                     )
@@ -934,11 +953,14 @@ impl TabManager {
                         kind: kind.clone(),
                         forwards: Vec::new(),
                     };
-                    match resolve_ssh_auth(&pseudo, password.clone()) {
+                    let effective_password = password.clone().or(session_password);
+                    match resolve_ssh_auth(&pseudo, effective_password) {
                         Ok(Some(auth)) => {
                             if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                                 pane.profile_id = profile_id;
-                                pane.auth_profile_id = auth_profile_id.filter(|_| profile_id.is_none());
+                                pane.auth_profile_id =
+                                    auth_profile_id.filter(|_| profile_id.is_none());
+                                pane.session_password = session_password_from_auth(&auth);
                                 pane.state = ConnectionState::Connecting;
                                 pane.status_message =
                                     format!("connecting to {user}@{host}:{port}…");
@@ -1476,6 +1498,7 @@ impl TabManager {
         let kind = source.kind.clone();
         let label = source.label.clone();
         let auth_pid = source.credentials_profile_id();
+        let source_password = source.session_password.clone();
         let live_cwd = source
             .terminal
             .as_ref()
@@ -1521,13 +1544,14 @@ impl TabManager {
                     kind: kind.clone(),
                     forwards: Vec::new(),
                 };
-                match resolve_ssh_auth(&pseudo, password) {
+                match resolve_ssh_auth(&pseudo, password.or(source_password)) {
                     Ok(Some(auth)) => {
                         let pane_id = Uuid::new_v4();
                         let pane = PaneSession {
                             id: pane_id,
                             profile_id: None,
                             auth_profile_id: auth_pid,
+                            session_password: session_password_from_auth(&auth),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
@@ -1716,6 +1740,7 @@ fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
 }
 
 fn teardown_pane_io(pane: &mut PaneSession) {
+    // Keep `session_password` — reconnect of the same pane still needs it.
     // Drop forward + SFTP handles first so workers shut down before SSH disconnect.
     drop(pane.ssh_forwards.take());
     drop(pane.ssh_sftp.take());
@@ -1734,6 +1759,10 @@ fn teardown_tab_io(tab: &mut TabSession) {
     }
 }
 
+/// Resolve SSH auth material.
+///
+/// Password priority (via `password_override`, already merged by callers):
+/// explicit prompt / `*_with_password` → pane `session_password` → OS keyring.
 fn resolve_ssh_auth(
     profile: &Profile,
     password_override: Option<String>,
