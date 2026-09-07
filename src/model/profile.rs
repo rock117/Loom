@@ -91,6 +91,15 @@ impl ProfileKind {
             _ => false,
         }
     }
+
+    /// WSL profiles are Windows-only in the UI (still persist in workspace.json).
+    pub fn visible_in_sidebar(&self) -> bool {
+        if self.is_wsl_local() {
+            cfg!(windows)
+        } else {
+            true
+        }
+    }
 }
 
 fn is_wsl_shell(shell: &str) -> bool {
