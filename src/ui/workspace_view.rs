@@ -82,7 +82,15 @@ impl WorkspaceView {
             .ui_state
             .open_tabs
             .iter()
-            .map(|t| t.profile_id)
+            .filter_map(|t| {
+                let id = t.profile_id;
+                store
+                    .read(cx)
+                    .workspace
+                    .find_profile(id)
+                    .filter(|p| p.kind.visible_in_sidebar())
+                    .map(|p| p.id)
+            })
             .collect();
 
         let show_line_numbers = store.read(cx).settings.show_line_numbers;
@@ -390,6 +398,11 @@ impl WorkspaceView {
         let Some(profile) = profile else {
             return;
         };
+
+        if !profile.kind.visible_in_sidebar() {
+            // WSL profiles are Windows-only; ignore open / restore on other OSes.
+            return;
+        }
 
         if TabManager::ssh_needs_password(&profile) {
             self.show_password_prompt(

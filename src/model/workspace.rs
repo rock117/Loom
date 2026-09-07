@@ -205,6 +205,9 @@ impl WorkspaceFile {
             match key {
                 OrderKey::Profile(id) => {
                     if let Some(p) = profiles.iter().find(|p| p.id == *id) {
+                        if !p.kind.visible_in_sidebar() {
+                            continue;
+                        }
                         out.push(SidebarEntry::Profile {
                             id: p.id,
                             name: p.name.clone(),
@@ -441,6 +444,9 @@ impl Group {
             match key {
                 OrderKey::Profile(id) => {
                     if let Some(p) = self.profiles.iter().find(|p| p.id == *id) {
+                        if !p.kind.visible_in_sidebar() {
+                            continue;
+                        }
                         out.push(SidebarEntry::Profile {
                             id: p.id,
                             name: p.name.clone(),

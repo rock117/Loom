@@ -89,7 +89,7 @@ PaneSession {
 11. **Reconnect 粒度**：状态栏 = 该 Tab **全部** Pane；Failed 占位按钮 = **单** Pane；两者密码路径对称（优先各 pane 的 `session_password`）。
 12. **Connecting ≠ Failed**：`terminal == None` 时两者都有；Close/Reconnect 按钮只给 Failed/Disconnected。
 13. **Split / Duplicate** 必须从源 pane **clone `session_password` 与 `auth_profile_id`**，使同 Tab 分屏无需再问已认证过的密码。
-14. **WSL**：侧栏 New WSL → 扫描本机 distro → 建成带 `args: ["-d", name]` 的 Local Profile。打开/重连在后台线程 preflight（`wsl --list` + 短探针 `wsl -d … -- true`）；发行版已卸载或 **vhdx 丢失**（仍出现在列表里）时该 Pane 进 Failed，**不得**拖垮整个应用。有 `args` 时禁止 shell 回退到默认 pwsh/cmd。
+14. **WSL（仅 Windows）**：侧栏 New WSL 按钮、WSL Profile 行、启动恢复均只在 Windows 显示/生效；Linux/macOS 不展示、不自动打开（配置仍可留在 `workspace.json`）。打开/重连在后台 preflight（`wsl --list` + 短探针）；vhdx 丢失时该 Pane Failed，不影响其它会话。有 `args` 时禁止 shell 回退到默认 pwsh/cmd。
 
 ## 操作对照
 
