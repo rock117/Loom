@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::profile::Profile;
+use super::profile::{Profile, ProfileKind};
 use crate::session::local_proxy::LocalProxyMode;
 
 /// Sibling slot in a workspace or group folder (profile and group share one order).
@@ -209,7 +209,7 @@ impl WorkspaceFile {
                             id: p.id,
                             name: p.name.clone(),
                             depth,
-                            is_local: p.kind.is_local(),
+                            kind: SidebarProfileKind::from_profile_kind(&p.kind),
                         });
                     }
                 }
@@ -391,8 +391,28 @@ pub enum SidebarEntry {
         id: Uuid,
         name: String,
         depth: u32,
-        is_local: bool,
+        kind: SidebarProfileKind,
     },
+}
+
+/// Sidebar icon class for a profile row (not the full [`ProfileKind`] payload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarProfileKind {
+    Local,
+    Wsl,
+    Ssh,
+}
+
+impl SidebarProfileKind {
+    pub fn from_profile_kind(kind: &ProfileKind) -> Self {
+        if kind.is_wsl_local() {
+            Self::Wsl
+        } else if kind.is_local() {
+            Self::Local
+        } else {
+            Self::Ssh
+        }
+    }
 }
 
 impl Group {
@@ -425,7 +445,7 @@ impl Group {
                             id: p.id,
                             name: p.name.clone(),
                             depth: depth + 1,
-                            is_local: p.kind.is_local(),
+                            kind: SidebarProfileKind::from_profile_kind(&p.kind),
                         });
                     }
                 }

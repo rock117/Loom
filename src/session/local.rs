@@ -25,6 +25,7 @@ pub struct LocalPty {
 impl LocalPty {
     pub fn spawn(
         shell: &str,
+        args: &[String],
         cwd: Option<&Path>,
         proxy_mode: LocalProxyMode,
         proxy_url: Option<&str>,
@@ -41,10 +42,17 @@ impl LocalPty {
             .context("open pty")?;
 
         let mut cmd = CommandBuilder::new(shell);
+        for arg in args {
+            cmd.arg(arg);
+        }
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
         cmd.env("TERM_PROGRAM", "Loom");
-        configure_cwd_reporting(&mut cmd, shell);
+        // OSC cwd hooks inject shell-specific argv (e.g. pwsh -NoExit); skip when
+        // the profile already supplies args (WSL `-d`, etc.).
+        if args.is_empty() {
+            configure_cwd_reporting(&mut cmd, shell);
+        }
         for (k, v) in local_proxy::proxy_env_vars(proxy_mode, proxy_url, proxy_no_proxy) {
             cmd.env(&k, &v);
         }
@@ -59,7 +67,13 @@ impl LocalPty {
         let child = pair
             .slave
             .spawn_command(cmd)
-            .with_context(|| format!("spawn shell `{shell}`"))?;
+            .with_context(|| {
+                if args.is_empty() {
+                    format!("spawn shell `{shell}`")
+                } else {
+                    format!("spawn `{shell} {}`", args.join(" "))
+                }
+            })?;
         drop(pair.slave);
 
         let shell_pid = child.process_id();

@@ -72,7 +72,7 @@ pub fn resolve_shell(configured: Option<&str>) -> ResolvedShell {
     }
 }
 
-fn shell_is_runnable(shell: &str) -> bool {
+pub fn shell_is_runnable(shell: &str) -> bool {
     let path = PathBuf::from(shell);
     if path.is_file() {
         return true;

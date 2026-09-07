@@ -17,5 +17,6 @@ pub use persist::{
 pub use profile::{ConnectionState, Profile, ProfileKind, SshAuth};
 pub use snippets::{Snippet, SnippetsFile};
 pub use workspace::{
-    AnsiPalette, Group, OpenTabRef, OrderKey, SettingsFile, SidebarEntry, UiStateFile, WorkspaceFile,
+    AnsiPalette, Group, OpenTabRef, OrderKey, SettingsFile, SidebarEntry, SidebarProfileKind,
+    UiStateFile, WorkspaceFile,
 };
