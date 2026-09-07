@@ -19,3 +19,4 @@ pub mod transfer_settings;
 pub mod widgets;
 pub mod workspace_store;
 pub mod workspace_view;
+pub mod wsl_form;

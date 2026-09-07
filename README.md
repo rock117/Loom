@@ -18,7 +18,7 @@ Built with [GPUI](https://gpui.rs). **Windows** is the primary platform today.
 
 ### Connections & workspace
 
-- **Local shell** and **SSH** profiles, organized in groups  
+- **Local shell**, **WSL** (`wsl.exe -d …` profiles), and **SSH** profiles, organized in groups  
 - Open a session from the sidebar; create, rename, duplicate, and move profiles  
 - Workspace state is saved so your usual tabs can come back next time  
 
@@ -49,7 +49,7 @@ Built with [GPUI](https://gpui.rs). **Windows** is the primary platform today.
 ┌─ Sidebar ────────────┬─ Tabs ──────────────────────┐
 │ Groups / profiles    │  [local] [bastion] [+]        │
 │                      ├──────────────────────────────┤
-│  Local / SSH …       │  Terminal (optional splits)  │
+│  Local / WSL / SSH … │  Terminal (optional splits)  │
 │                      │                              │
 └──────────────────────┴────────────┬─────────────────┘
                                     │ Context panel

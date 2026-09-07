@@ -29,6 +29,9 @@ pub enum ProfileKind {
         cwd: Option<PathBuf>,
         #[serde(default)]
         env: Vec<(String, String)>,
+        /// Extra argv after `shell` (e.g. WSL: `["-d", "Ubuntu"]`).
+        #[serde(default)]
+        args: Vec<String>,
     },
     Ssh {
         host: String,
@@ -44,16 +47,24 @@ impl ProfileKind {
             shell: None,
             cwd: None,
             env: Vec::new(),
+            args: Vec::new(),
         }
     }
 
     pub fn summary(&self) -> String {
         match self {
-            Self::Local { shell, cwd, .. } => {
+            Self::Local {
+                shell, cwd, args, ..
+            } => {
                 let shell = shell.as_deref().unwrap_or("default shell");
+                let argv = if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args.join(" "))
+                };
                 match cwd {
-                    Some(c) => format!("local · {shell} · {}", c.display()),
-                    None => format!("local · {shell}"),
+                    Some(c) => format!("local · {shell}{argv} · {}", c.display()),
+                    None => format!("local · {shell}{argv}"),
                 }
             }
             Self::Ssh {
@@ -65,6 +76,28 @@ impl ProfileKind {
     pub fn is_local(&self) -> bool {
         matches!(self, Self::Local { .. })
     }
+
+    /// Profiles with argv (e.g. WSL) spawn off the UI thread and preflight checks.
+    pub fn local_has_args(&self) -> bool {
+        matches!(self, Self::Local { args, .. } if !args.is_empty())
+    }
+
+    pub fn is_wsl_local(&self) -> bool {
+        match self {
+            Self::Local { shell, args, .. } => {
+                is_wsl_shell(shell.as_deref().unwrap_or(""))
+                    || args.iter().any(|a| a == "-d" || a.starts_with("--distribution"))
+            }
+            _ => false,
+        }
+    }
+}
+
+fn is_wsl_shell(shell: &str) -> bool {
+    PathBuf::from(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("wsl"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -83,6 +116,21 @@ impl Profile {
             id: Uuid::new_v4(),
             name: name.into(),
             kind: ProfileKind::local_default(),
+            forwards: Vec::new(),
+        }
+    }
+
+    /// Local profile that launches `wsl.exe -d <distro>`.
+    pub fn new_wsl(name: impl Into<String>, distro: &str) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            kind: ProfileKind::Local {
+                shell: Some("wsl.exe".into()),
+                cwd: None,
+                env: Vec::new(),
+                args: vec!["-d".into(), distro.to_string()],
+            },
             forwards: Vec::new(),
         }
     }

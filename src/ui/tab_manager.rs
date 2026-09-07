@@ -13,6 +13,7 @@ use crate::session::credentials;
 use crate::session::forward::ForwardHandle;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
+use crate::session::wsl;
 use crate::shared::theme;
 use crate::terminal::{ColorPalette, TerminalConfig, TerminalSplitDirection, TerminalView, TerminalViewEvent};
 use crate::ui::app_bus::{AppBus, AppBusEvent};
@@ -152,6 +153,18 @@ impl TabManager {
         cx: &mut Context<Self>,
     ) {
         match &profile.kind {
+            ProfileKind::Local { .. } if profile.kind.local_has_args() => {
+                self.begin_local_async(
+                    Some(profile.id),
+                    &profile.kind,
+                    &profile.name,
+                    default_shell,
+                    font_family,
+                    store,
+                    None,
+                    cx,
+                );
+            }
             ProfileKind::Local { .. } => {
                 match self.spawn_local(
                     Some(profile.id),
@@ -430,13 +443,19 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<PaneSession> {
-        let ProfileKind::Local { shell, cwd, .. } = kind else {
+        let ProfileKind::Local {
+            shell,
+            cwd,
+            args,
+            ..
+        } = kind
+        else {
             anyhow::bail!("not a local profile");
         };
-        let configured = shell.as_deref().or(default_shell);
-        let resolved = resolve_shell(configured);
-        let shell = resolved.path;
-        if let Some(bad) = resolved.invalid_configured.as_ref() {
+
+        let (shell_path, spawn_args, invalid_configured) =
+            resolve_local_spawn(shell.as_deref(), args, default_shell)?;
+        if let Some(bad) = invalid_configured.as_ref() {
             AppBus::emit(
                 &self.app_bus,
                 AppBusEvent::Toast(
@@ -445,6 +464,7 @@ impl TabManager {
                 cx,
             );
         }
+
         let (proxy_mode, proxy_url, proxy_no) = {
             let s = store.read(cx);
             (
@@ -455,16 +475,209 @@ impl TabManager {
         };
         let spawn_cwd = cwd_override.as_deref().or(cwd.as_deref());
         let pty = LocalPty::spawn(
-            &shell,
+            &shell_path,
+            &spawn_args,
             spawn_cwd,
             proxy_mode,
             proxy_url.as_deref(),
             proxy_no.as_deref(),
         )?;
+        Ok(self.pane_from_local_pty(
+            profile_id,
+            kind,
+            label,
+            font_family,
+            &shell_path,
+            pty,
+            spawn_cwd.map(std::path::Path::to_path_buf),
+            &spawn_args,
+            window,
+            cx,
+        ))
+    }
+
+    /// Open a Local profile with argv (WSL, etc.): Connecting tab → background preflight+spawn.
+    fn begin_local_async(
+        &mut self,
+        profile_id: Option<Uuid>,
+        kind: &ProfileKind,
+        label: &str,
+        default_shell: Option<&str>,
+        font_family: &str,
+        store: &Entity<WorkspaceStore>,
+        cwd_override: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_id = Uuid::new_v4();
+        let status = if kind.is_wsl_local() {
+            "starting WSL…".to_string()
+        } else {
+            "starting…".to_string()
+        };
+        let pane = PaneSession {
+            id: pane_id,
+            profile_id,
+            auth_profile_id: None,
+            session_password: None,
+            kind: kind.clone(),
+            label: label.to_string(),
+            state: ConnectionState::Connecting,
+            status_message: status,
+            terminal: None,
+            pty_master: None,
+            pty_killer: None,
+            ssh_shutdown: None,
+            ssh_sftp: None,
+            ssh_forwards: None,
+            _term_subscriptions: Vec::new(),
+        };
+        let tab = wrap_pane_as_tab(self.unique_tab_title(label), pane);
+        let tab_id = tab.id;
+        self.tabs.push(tab);
+        self.active = Some(tab_id);
+        cx.notify();
+
+        self.spawn_local_async_attach(
+            tab_id,
+            pane_id,
+            kind.clone(),
+            default_shell.map(str::to_string),
+            font_family.to_string(),
+            store,
+            cwd_override,
+            cx,
+        );
+    }
+
+    fn spawn_local_async_attach(
+        &mut self,
+        tab_id: Uuid,
+        pane_id: Uuid,
+        kind: ProfileKind,
+        default_shell: Option<String>,
+        font_family: String,
+        store: &Entity<WorkspaceStore>,
+        cwd_override: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let ProfileKind::Local {
+            shell,
+            cwd,
+            args,
+            ..
+        } = kind.clone()
+        else {
+            return;
+        };
+
+        let (proxy_mode, proxy_url, proxy_no) = {
+            let s = store.read(cx);
+            (
+                s.settings.local_proxy_mode,
+                s.settings.local_proxy_url.clone(),
+                s.settings.local_proxy_no_proxy.clone(),
+            )
+        };
+        let spawn_cwd = cwd_override.or(cwd);
+        let font_size = self.font_size;
+        let show_line_numbers = self.show_line_numbers;
+        let ansi_palette = self.ansi_palette;
+        let label_for_status = kind.summary();
+        let cwd_for_ui = spawn_cwd.clone();
+
+        let (tx, rx) = flume::bounded(1);
+        let _ = thread::Builder::new()
+            .name("loom-local-spawn".into())
+            .spawn(move || {
+                let result = (|| -> anyhow::Result<LocalPty> {
+                    let (shell_path, spawn_args, _) =
+                        resolve_local_spawn(shell.as_deref(), &args, default_shell.as_deref())?;
+                    wsl::preflight_local_spawn(&shell_path, &spawn_args)?;
+                    LocalPty::spawn(
+                        &shell_path,
+                        &spawn_args,
+                        spawn_cwd.as_deref(),
+                        proxy_mode,
+                        proxy_url.as_deref(),
+                        proxy_no.as_deref(),
+                    )
+                })();
+                let _ = tx.send(result);
+            });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id) else {
+                    return;
+                };
+                let Some(pane) = tab.panes.get_mut(&pane_id) else {
+                    return;
+                };
+                match result {
+                    Ok(Ok(pty)) => {
+                        let family = if font_family.trim().is_empty() {
+                            platform::monospace_font_family().to_string()
+                        } else {
+                            font_family
+                        };
+                        let config =
+                            terminal_config(font_size, &family, show_line_numbers, ansi_palette);
+                        let master = pty.master.clone();
+                        let killer = pty.killer;
+                        let resize = LocalPty::resize_callback(master.clone());
+                        let working_dir = cwd_for_ui.or_else(LocalPty::default_cwd);
+                        let terminal = cx.new(|cx| {
+                            TerminalView::new(pty.writer, pty.reader, config, cx)
+                                .with_resize_callback(resize)
+                                .with_shell_pid(pty.shell_pid)
+                        });
+                        let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
+                        if let ProfileKind::Local {
+                            cwd: ref mut c, ..
+                        } = pane.kind
+                        {
+                            *c = working_dir;
+                        }
+                        pane.terminal = Some(terminal);
+                        pane.pty_master = Some(master);
+                        pane.pty_killer = Some(killer);
+                        pane._term_subscriptions = term_subs;
+                        pane.state = ConnectionState::Connected;
+                        pane.status_message = label_for_status;
+                    }
+                    Ok(Err(err)) => {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = format!("{err:#}");
+                    }
+                    Err(_) => {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message = "Local spawn cancelled".into();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn pane_from_local_pty(
+        &self,
+        profile_id: Option<Uuid>,
+        kind: &ProfileKind,
+        label: &str,
+        font_family: &str,
+        shell_path: &str,
+        pty: LocalPty,
+        spawn_cwd: Option<std::path::PathBuf>,
+        spawn_args: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneSession {
         let master = pty.master.clone();
         let killer = pty.killer;
         let resize = LocalPty::resize_callback(master.clone());
-
         let family = if font_family.trim().is_empty() {
             platform::monospace_font_family()
         } else {
@@ -476,9 +689,7 @@ impl TabManager {
             self.show_line_numbers,
             self.ansi_palette,
         );
-        let working_dir = spawn_cwd
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| LocalPty::default_cwd());
+        let working_dir = spawn_cwd.or_else(LocalPty::default_cwd);
         let terminal = cx.new(|cx| {
             TerminalView::new(pty.writer, pty.reader, config, cx)
                 .with_resize_callback(resize)
@@ -491,20 +702,25 @@ impl TabManager {
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| ".".into());
-        let shell_short = std::path::Path::new(&shell)
+        let shell_short = std::path::Path::new(shell_path)
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(&shell);
+            .unwrap_or(shell_path);
+        let status = if spawn_args.is_empty() {
+            format!("{shell_short} · {cwd_label}")
+        } else {
+            format!("{shell_short} {} · {cwd_label}", spawn_args.join(" "))
+        };
 
         let mut kind = kind.clone();
         if let ProfileKind::Local {
             cwd: ref mut c, ..
         } = kind
         {
-            *c = working_dir.clone();
+            *c = working_dir;
         }
 
-        Ok(PaneSession {
+        PaneSession {
             id: Uuid::new_v4(),
             profile_id,
             auth_profile_id: None,
@@ -512,7 +728,7 @@ impl TabManager {
             kind,
             label: label.to_string(),
             state: ConnectionState::Connected,
-            status_message: format!("{shell_short} · {cwd_label}"),
+            status_message: status,
             terminal: Some(terminal),
             pty_master: Some(master),
             pty_killer: Some(killer),
@@ -520,7 +736,7 @@ impl TabManager {
             ssh_sftp: None,
             ssh_forwards: None,
             _term_subscriptions: term_subs,
-        })
+        }
     }
 
     pub fn split_focused(
@@ -900,6 +1116,26 @@ impl TabManager {
             }
 
             match &kind {
+                ProfileKind::Local { .. } if kind.local_has_args() => {
+                    if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                        pane.state = ConnectionState::Connecting;
+                        pane.status_message = if kind.is_wsl_local() {
+                            "reconnecting WSL…".into()
+                        } else {
+                            "reconnecting…".into()
+                        };
+                    }
+                    self.spawn_local_async_attach(
+                        tab_id,
+                        pane_id,
+                        kind.clone(),
+                        default_shell.clone(),
+                        font_family.clone(),
+                        store,
+                        None,
+                        cx,
+                    );
+                }
                 ProfileKind::Local { .. } => {
                     let Some(window) = window.as_deref_mut() else {
                         if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
@@ -1454,6 +1690,7 @@ impl TabManager {
             shell: default_shell.clone(),
             cwd: None,
             env: Vec::new(),
+            args: Vec::new(),
         };
         let label = "Shell";
         match self.spawn_local(
@@ -1880,6 +2117,33 @@ pub fn state_color(state: ConnectionState) -> Hsla {
         ConnectionState::Failed => theme::DANGER,
         ConnectionState::Disconnected | ConnectionState::Idle => theme::TEXT_MUTED,
     }
+}
+
+/// Resolve shell path + args for Local spawn.
+///
+/// With non-empty `args`, never fall back to the platform default shell (would
+/// run e.g. pwsh with `-d Ubuntu`). Missing shell → error.
+fn resolve_local_spawn(
+    configured: Option<&str>,
+    args: &[String],
+    default_shell: Option<&str>,
+) -> anyhow::Result<(String, Vec<String>, Option<String>)> {
+    if args.is_empty() {
+        let resolved = resolve_shell(configured.or(default_shell));
+        return Ok((
+            resolved.path,
+            Vec::new(),
+            resolved.invalid_configured,
+        ));
+    }
+    let shell = configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Profile has arguments but no shell executable"))?;
+    if !platform::shell_is_runnable(shell) {
+        anyhow::bail!("{}", wsl::missing_shell_message(shell, args));
+    }
+    Ok((shell.to_string(), args.to_vec(), None))
 }
 
 /// Enabled Profile forwards, or a copy of the source pane's non-temporary rules.

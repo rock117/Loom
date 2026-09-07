@@ -17,6 +17,7 @@ use crate::ui::pane_layout::SplitDirection;
 use crate::ui::tab_manager::{SessionOpResult, TabManager};
 use crate::ui::terminal_pane::TerminalPane;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
+use crate::ui::wsl_form::{WslForm, WslFormEvent};
 
 struct ContextResizeDrag {
     start_x: f32,
@@ -50,6 +51,7 @@ pub struct WorkspaceView {
     status_bar: Entity<StatusBar>,
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
+    wsl_form: Entity<WslForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
     pending_password: Option<PendingPasswordAction>,
     sidebar_width: f32,
@@ -60,6 +62,7 @@ pub struct WorkspaceView {
     context_resize: Option<ContextResizeDrag>,
     show_settings: bool,
     show_ssh_form: bool,
+    show_wsl_form: bool,
     restore_profiles: Vec<uuid::Uuid>,
     _subscriptions: Vec<Subscription>,
 }
@@ -95,6 +98,7 @@ impl WorkspaceView {
         let status_bar = cx.new(|cx| StatusBar::new(store.clone(), tabs.clone(), cx));
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
+        let wsl_form = cx.new(|cx| WslForm::new(store.clone(), cx));
         let workspace_weak = cx.weak_entity();
         let persistence = cx.new(|cx| {
             Persistence::new(app_bus.clone(), store.clone(), workspace_weak, cx)
@@ -123,6 +127,7 @@ impl WorkspaceView {
             status_bar: status_bar.clone(),
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
+            wsl_form: wsl_form.clone(),
             password_prompt: None,
             pending_password: None,
             sidebar_width,
@@ -133,6 +138,7 @@ impl WorkspaceView {
             context_resize: None,
             show_settings: false,
             show_ssh_form: false,
+            show_wsl_form: false,
             restore_profiles,
             _subscriptions: Vec::new(),
         };
@@ -169,12 +175,14 @@ impl WorkspaceView {
                 SidebarEvent::OpenSettings => {
                     this.show_settings = true;
                     this.show_ssh_form = false;
+                    this.show_wsl_form = false;
                     this.password_prompt = None;
                     cx.notify();
                 }
                 SidebarEvent::OpenSshForm => {
                     this.ssh_form.update(cx, |f, cx| f.reset(cx));
                     this.show_ssh_form = true;
+                    this.show_wsl_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -182,10 +190,22 @@ impl WorkspaceView {
                         this.ssh_form.read(cx).focus(window);
                     });
                 }
+                SidebarEvent::OpenWslForm => {
+                    this.wsl_form.update(cx, |f, cx| f.reset(cx));
+                    this.show_wsl_form = true;
+                    this.show_ssh_form = false;
+                    this.show_settings = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                    cx.defer_in(window, |this, window, cx| {
+                        this.wsl_form.read(cx).focus(window);
+                    });
+                }
                 SidebarEvent::EditSshProfile(id) => {
                     let id = *id;
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
+                    this.show_wsl_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -217,6 +237,27 @@ impl WorkspaceView {
                 }
                 SshFormEvent::Toast(msg) => {
                     this.set_toast(msg.clone(), cx);
+                }
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
+            &wsl_form,
+            window,
+            move |this, _, event: &WslFormEvent, window, cx| match event {
+                WslFormEvent::Close => {
+                    this.show_wsl_form = false;
+                    cx.notify();
+                }
+                WslFormEvent::Saved {
+                    profile_id,
+                    connect,
+                } => {
+                    this.show_wsl_form = false;
+                    if *connect {
+                        this.open_profile_id(*profile_id, window, cx);
+                    }
+                    cx.notify();
                 }
             },
         ));
@@ -254,6 +295,7 @@ impl WorkspaceView {
                 StatusBarEvent::OpenSettings => {
                     this.show_settings = true;
                     this.show_ssh_form = false;
+                    this.show_wsl_form = false;
                     this.password_prompt = None;
                     cx.notify();
                 }
@@ -261,6 +303,7 @@ impl WorkspaceView {
                     let id = *id;
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
+                    this.show_wsl_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -456,6 +499,7 @@ impl WorkspaceView {
         self.password_prompt = Some(prompt);
         self.show_settings = false;
         self.show_ssh_form = false;
+        self.show_wsl_form = false;
         cx.notify();
         cx.defer_in(window, |this, window, cx| {
             if let Some(prompt) = this.password_prompt.as_ref() {
@@ -1169,6 +1213,7 @@ impl Render for WorkspaceView {
             .child(self.status_bar.clone())
             .when(self.show_settings, |d| d.child(self.settings.clone()))
             .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
+            .when(self.show_wsl_form, |d| d.child(self.wsl_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
             // Full-window backdrop under TabBar menus (priority 0); menu uses priority 1.
             .when(tab_menus_open, |d| {

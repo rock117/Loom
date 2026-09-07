@@ -121,6 +121,13 @@ pub const ICON_REMOTE: Hsla = Hsla {
     l: 0.58,
     a: 1.0,
 };
+/// WSL / Linux local distro glyph (warm amber — distinct from Local teal & SSH blue).
+pub const ICON_WSL: Hsla = Hsla {
+    h: 0.10,
+    s: 0.55,
+    l: 0.55,
+    a: 1.0,
+};
 /// Group / folder glyph.
 pub const ICON_GROUP: Hsla = Hsla {
     h: 0.12,

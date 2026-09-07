@@ -4,7 +4,7 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::ProfileKind;
+use crate::model::{ProfileKind, SidebarProfileKind};
 use crate::shared::theme;
 use crate::ui::rename_edit::typed_text_from_keystroke;
 use crate::ui::workspace_store::{Selection, WorkspaceStore};
@@ -155,10 +155,11 @@ impl Sidebar {
             }))
     }
 
-    fn profile_icon(kind: &ProfileKind) -> (&'static str, Hsla) {
+    fn profile_icon(kind: SidebarProfileKind) -> (&'static str, Hsla) {
         match kind {
-            ProfileKind::Local { .. } => ("icons/ui/terminal.svg", theme::ICON_LOCAL),
-            ProfileKind::Ssh { .. } => ("icons/ui/remote.svg", theme::ICON_REMOTE),
+            SidebarProfileKind::Wsl => ("icons/ui/wsl.svg", theme::ICON_WSL),
+            SidebarProfileKind::Local => ("icons/ui/terminal.svg", theme::ICON_LOCAL),
+            SidebarProfileKind::Ssh => ("icons/ui/remote.svg", theme::ICON_REMOTE),
         }
     }
 
@@ -570,6 +571,18 @@ impl Render for Sidebar {
                                     });
                                 },
                             ))
+                            .when(cfg!(windows), |d| {
+                                d.child(self.ghost_svg(
+                                    "btn-wsl",
+                                    "icons/ui/wsl.svg",
+                                    "New WSL Profile",
+                                    false,
+                                    cx,
+                                    |_, _, cx| {
+                                        cx.emit(SidebarEvent::OpenWslForm);
+                                    },
+                                ))
+                            })
                             .child(self.ghost_svg(
                                 "btn-ssh",
                                 "icons/ui/remote.svg",
@@ -748,7 +761,7 @@ impl Render for Sidebar {
                                 id: pid,
                                 name: pname,
                                 depth,
-                                is_local,
+                                kind: profile_kind,
                             } => {
                                 let selected = selection == Selection::Profile(pid);
                                 let renaming_this = renaming.is_some() && selected;
@@ -756,11 +769,7 @@ impl Render for Sidebar {
                                     profile_can.get(&pid).copied().unwrap_or((false, false));
                                 let row_group: SharedString =
                                     SharedString::from(format!("sb-p-{pid}"));
-                                let (icon_path, icon_color) = if is_local {
-                                    ("icons/ui/terminal.svg", theme::ICON_LOCAL)
-                                } else {
-                                    ("icons/ui/remote.svg", theme::ICON_REMOTE)
-                                };
+                                let (icon_path, icon_color) = Self::profile_icon(profile_kind);
                                 let drag_name: SharedString = pname.clone().into();
                                 let indent = theme::SPACE_1 + depth as f32 * 12.0;
                                 let name_el: AnyElement =
@@ -1098,6 +1107,7 @@ pub enum SidebarEvent {
     ShowProfileMenu(Uuid),
     OpenSettings,
     OpenSshForm,
+    OpenWslForm,
     EditSshProfile(Uuid),
 }
 

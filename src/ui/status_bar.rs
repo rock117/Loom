@@ -186,7 +186,7 @@ impl Render for StatusBar {
                     format!("{user}@{host}:{port}"),
                     true,
                 ),
-                Some(ProfileKind::Local { shell, .. }) => {
+                Some(kind @ ProfileKind::Local { shell, args, .. }) => {
                     let shell_label = shell
                         .as_deref()
                         .map(|s| {
@@ -197,12 +197,16 @@ impl Render for StatusBar {
                                 .to_string()
                         })
                         .unwrap_or_else(|| "Local".into());
-                    (
-                        "icons/ui/terminal.svg",
-                        theme::ICON_LOCAL,
-                        shell_label,
-                        false,
-                    )
+                    let label = if args.is_empty() {
+                        shell_label
+                    } else {
+                        format!("{shell_label} {}", args.join(" "))
+                    };
+                    if kind.is_wsl_local() {
+                        ("icons/ui/wsl.svg", theme::ICON_WSL, label, false)
+                    } else {
+                        ("icons/ui/terminal.svg", theme::ICON_LOCAL, label, false)
+                    }
                 }
                 None => (
                     "icons/ui/terminal.svg",
