@@ -3,7 +3,6 @@
 //! Listing / validation must not run on the UI thread (see `docs/HARD_PROBLEMS.md`).
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -44,7 +43,7 @@ pub fn list_distros() -> Result<Vec<String>> {
 
 #[cfg(windows)]
 fn list_distros_windows() -> Result<Vec<String>> {
-    let output = Command::new("wsl.exe")
+    let output = crate::platform::new_command("wsl.exe")
         .args(["--list", "--quiet"])
         .output()
         .context(
@@ -125,7 +124,7 @@ fn probe_distro(distro: &str) -> Result<()> {
 
 #[cfg(windows)]
 fn probe_distro_windows(distro: &str) -> Result<()> {
-    let output = Command::new("wsl.exe")
+    let output = crate::platform::new_command("wsl.exe")
         .args(["-d", distro, "--", "true"])
         .output()
         .with_context(|| format!("Could not probe WSL distro `{distro}`"))?;

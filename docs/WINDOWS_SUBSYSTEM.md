@@ -77,7 +77,7 @@ Loom 当前采用 **无条件** `"windows"`：Debug / Release 启动都不弹 CM
 | 机制 | 管谁 | Loom 里的例子 |
 |------|------|----------------|
 | `windows_subsystem` | **本进程** `loom.exe` 启动时要不要控制台 | `src/main.rs` |
-| `CREATE_NO_WINDOW`（`Command` creation flags） | **子进程** 会不会闪黑窗 | `platform::new_command`；Info 面板 `nvidia-smi` / PowerShell 等 |
+| `CREATE_NO_WINDOW`（`Command` creation flags） | **子进程** 会不会闪黑窗 | `platform::new_command`；Info 面板 `nvidia-smi` / PowerShell；WSL `wsl --list` / distro probe |
 
 Shell 探测与子进程规范见 [PLATFORM_SHELL.md](./PLATFORM_SHELL.md)（Windows 已不用 `where.exe`）。
 

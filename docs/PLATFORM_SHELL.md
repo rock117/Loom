@@ -65,7 +65,7 @@ platform::new_command("powershell")  // Windows: creation_flags(CREATE_NO_WINDOW
 - 集成终端里的 shell（ConPTY spawn，由 `portable-pty` 负责）
 - `explorer` 打开文件夹（GUI 程序）
 
-当前已使用：`src/session/host_info.rs` 的 `run_capture`。
+当前已使用：`src/session/host_info.rs` 的 `run_capture`、`src/session/wsl.rs` 的 `wsl --list` / distro probe（裸 `Command::new("wsl.exe")` 会弹出可见控制台）。
 
 ---
 
