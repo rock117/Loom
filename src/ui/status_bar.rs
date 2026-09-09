@@ -224,7 +224,9 @@ impl Render for StatusBar {
             let state_label = match state {
                 ConnectionState::Connected => "Connected",
                 ConnectionState::Connecting => "Connecting",
+                ConnectionState::Disconnected if !is_ssh => "Exited",
                 ConnectionState::Disconnected => "Disconnected",
+                ConnectionState::Failed if !is_ssh => "Exited",
                 ConnectionState::Failed => "Failed",
                 ConnectionState::Idle => "Idle",
             };

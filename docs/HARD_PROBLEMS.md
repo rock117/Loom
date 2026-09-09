@@ -6,6 +6,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 - Keep the standing **UI freeze checklist** (below) up to date whenever a new freeze class appears — include **GPUI framework** patterns, not only Loom bugs.
 - Text-field UX (selection / clipboard / IME): [TEXT_FIELDS.md](./TEXT_FIELDS.md).
 - Logging design (Zed-aligned, phased): [LOGGING.md](./LOGGING.md).
+- Local shell mistaken for “Disconnected” (esp. split panes): [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md).
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---
@@ -204,5 +205,19 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **完整说明：** [SESSION_RECONNECT.md](./SESSION_RECONNECT.md)。
 
 **代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/ui/tab_manager.rs`、`src/ui/workspace_view.rs`、`src/ui/context_panel.rs`。
+
+---
+
+### 2026-09-09 — 本地 shell（尤其 split）被当成 Disconnected
+
+**现象：** 本地 pane 顶部 SSH 风味断线横幅；仍可见最后一屏 prompt；同 tab 原 pane（常跑长任务）往往正常，**split 侧**更易中招。
+
+**原因归类：** Local 与 SSH 共用 `session_alive` / 横幅 / Reconnect UX；split 为独立 PTY，误判或真退出后 teardown 会杀掉进程并留下迷惑性缓冲。根因（假 EOF vs 写失败 vs 真退出）待日志。
+
+**有效做法：** 本地文案改为 Shell exited；Local/WSL 有限次静默同 pane 重启；SSH 仍手动 Reconnect。
+
+**完整说明：** [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md)。
+
+**代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/ui/tab_manager.rs`、`src/ui/status_bar.rs`、`src/session/local.rs`。
 
 ---

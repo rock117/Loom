@@ -472,6 +472,9 @@ pub struct TerminalView {
 
     /// False after PTY/SSH EOF or a broken stdin write — keys must not pretend to work.
     session_alive: bool,
+
+    /// Local / WSL PTY (vs SSH). Affects end-of-session banner copy.
+    is_local_session: bool,
 }
 
 struct ScrollbarDrag {
@@ -645,12 +648,19 @@ impl TerminalView {
             shell_pid: None,
             ime_marked: None,
             session_alive: true,
+            is_local_session: false,
         }
     }
 
     /// Attach the local shell PID so Copy Path / Reveal can refresh cwd from the process.
     pub fn with_shell_pid(mut self, pid: Option<u32>) -> Self {
         self.shell_pid = pid;
+        self
+    }
+
+    /// Mark this view as a local/WSL PTY (banner says "Shell exited", not "Disconnected").
+    pub fn with_local_session(mut self) -> Self {
+        self.is_local_session = true;
         self
     }
 
@@ -2184,9 +2194,11 @@ impl Render for TerminalView {
                             div()
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
-                                .child(
-                                    "Disconnected — click Reconnect in the status bar to restore this session.",
-                                ),
+                                .child(if self.is_local_session {
+                                    "Shell exited — click Reconnect in the status bar to start again."
+                                } else {
+                                    "Disconnected — click Reconnect in the status bar to restore this session."
+                                }),
                         ),
                 )
             })

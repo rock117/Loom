@@ -1,9 +1,9 @@
 # SSH / PTY 断线检测与手动重连
 
 知识笔记 + 已落地行为说明：SSH（及本地 PTY）断开后「假活输入」、只能重新开 tab 的问题，以及当前 **手动重连** 方案。  
-**不是自动重连**；自动退避重连若以后要做，见文末「未做」。
+SSH **不是**自动重连；**Local/WSL** 退出后有限次静默重启见 [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md)。SSH 自动退避若以后要做，见文末「未做」。
 
-相关：[ARCHITECTURE.md](./ARCHITECTURE.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[LOOM_CLI.md](./LOOM_CLI.md)（`loom reconnect` 规划）。
+相关：[ARCHITECTURE.md](./ARCHITECTURE.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md)、[LOOM_CLI.md](./LOOM_CLI.md)（`loom reconnect` 规划）。
 
 > **状态**：核心路径 **已实现**（检测 → Failed → 状态栏 Reconnect → 同 tab 重建会话）。  
 > **文档约定**：新增规格 / 知识笔记默认中文。
@@ -59,10 +59,8 @@
 ### 3. TabManager
 
 - 订阅 `SessionEnded` → `on_pane_session_ended`：  
-  - `state = Failed`  
-  - 文案提示用状态栏重连  
-  - 回收 SFTP / SSH shutdown / 本地 PTY  
-  - **保留** `terminal` 实体（最后输出 + 横幅）  
+  - **Local / WSL**：静默 `ReconnectPane` 同 pane 拉起新 PTY（有限次预算，防崩循环）；成功后继续可用，不挂 “Disconnected” 横幅。  
+  - **SSH**：`state = Failed`，文案提示用状态栏重连；回收 SFTP / SSH shutdown；**保留** `terminal`（最后输出 + 横幅）  
 - `reconnect` / `reconnect_with_password`：遍历该 **tab 内全部 pane**（含 split），各自 teardown 旧 IO，保留 pane id 拉起 Local 或 SSH（布局不变）。
 
 ### 4. WorkspaceView
@@ -102,12 +100,12 @@ SSH/PTY 死
 
 ## 验收要点
 
+- [ ] Local shell 退出：**自动重启**同 pane（预算内）；耗尽后 Failed + 可手动 Reconnect。  
 - [ ] 远端断 SSH / 杀会话后：横幅出现，状态 Failed，Reconnect 可见。  
 - [ ] 断线后按键不产生「假输入」；重连成功后可正常输入。  
 - [ ] 密码 profile（无钥匙串）走 Reconnect → 输密码 → **同一 tab** 恢复，不另开一个。  
 - [ ] **Split 多 pane**：断线后点 Reconnect，该 tab 内所有分屏都进入 Connecting 并恢复（不只焦点 pane）。  
 - [ ] Files：断线 unavailable；重连后可再列目录。  
-- [ ] Local shell 退出同样 Failed + 可 Reconnect。
 
 ---
 
@@ -115,7 +113,7 @@ SSH/PTY 死
 
 | 项 | 说明 |
 |----|------|
-| 自动重连（退避、次数上限） | 需处理密码、误重连、抢焦点；产品上另议 |
+| SSH 自动重连（退避、次数上限） | 需处理密码、误重连、抢焦点；产品上另议。Local 已做有限次静默重启 |
 | SFTP 单独 Retry（不断 shell） | 半开连接时有价值；当前整会话 Reconnect 已覆盖主痛点 |
 | 终端内横幅上的 Reconnect 按钮 | 现依赖状态栏；可后续加事件 |
 | `loom reconnect` 壳内指令 | 见 [LOOM_CLI.md](./LOOM_CLI.md) |

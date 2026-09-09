@@ -1,6 +1,6 @@
 # Local shell（pwsh / cmd / 启动性能）
 
-相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[LOCAL_PROXY.md](./LOCAL_PROXY.md)、[SESSION_RECONNECT.md](./SESSION_RECONNECT.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)。
+相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[LOCAL_PROXY.md](./LOCAL_PROXY.md)、[SESSION_RECONNECT.md](./SESSION_RECONNECT.md)、[LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md)、[HARD_PROBLEMS.md](./HARD_PROBLEMS.md)。
 
 > **状态**：Local PTY **已实现**；本文说明 shell 选型与「新开 Tab 慢」的常见原因与对策。  
 > **范围**：仅 **Local** 会话；SSH 建连路径见 [SESSION_RECONNECT.md](./SESSION_RECONNECT.md)。  

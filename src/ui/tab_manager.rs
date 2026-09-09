@@ -44,8 +44,13 @@ pub struct PaneSession {
     pub ssh_sftp: Option<crate::session::sftp::SftpHandle>,
     /// Same-session Local port forwards (SSH panes only).
     pub ssh_forwards: Option<crate::session::forward::ForwardHandle>,
+    /// Silent local/WSL auto-restarts left before we surface Failed (refills on Connected).
+    local_auto_restarts_left: u8,
     _term_subscriptions: Vec<Subscription>,
 }
+
+/// How many times a local/WSL pane may silently respawn after PTY exit.
+const LOCAL_AUTO_RESTART_BUDGET: u8 = 3;
 
 impl PaneSession {
     /// Profile id for keyring / workspace lookups (Bound id, or inherited for ephemeral SSH).
@@ -250,6 +255,7 @@ impl TabManager {
             ssh_shutdown: None,
             ssh_sftp: None,
             ssh_forwards: None,
+            local_auto_restarts_left: 0,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
@@ -290,6 +296,7 @@ impl TabManager {
             ssh_shutdown: None,
             ssh_sftp: None,
             ssh_forwards: None,
+            local_auto_restarts_left: 0,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(self.unique_tab_title(&profile.name), pane);
@@ -529,6 +536,7 @@ impl TabManager {
             ssh_shutdown: None,
             ssh_sftp: None,
             ssh_forwards: None,
+            local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
             _term_subscriptions: Vec::new(),
         };
         let tab = wrap_pane_as_tab(self.unique_tab_title(label), pane);
@@ -631,6 +639,7 @@ impl TabManager {
                             TerminalView::new(pty.writer, pty.reader, config, cx)
                                 .with_resize_callback(resize)
                                 .with_shell_pid(pty.shell_pid)
+                                .with_local_session()
                         });
                         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
                         if let ProfileKind::Local {
@@ -694,6 +703,7 @@ impl TabManager {
             TerminalView::new(pty.writer, pty.reader, config, cx)
                 .with_resize_callback(resize)
                 .with_shell_pid(pty.shell_pid)
+                .with_local_session()
         });
         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
         terminal.read(cx).focus_handle().focus(window);
@@ -735,6 +745,7 @@ impl TabManager {
             ssh_shutdown: None,
             ssh_sftp: None,
             ssh_forwards: None,
+            local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
             _term_subscriptions: term_subs,
         }
     }
@@ -880,6 +891,7 @@ impl TabManager {
                             ssh_shutdown: None,
                             ssh_sftp: None,
                             ssh_forwards: None,
+                            local_auto_restarts_left: 0,
                             _term_subscriptions: Vec::new(),
                         };
                         let tab = &mut self.tabs[tab_idx];
@@ -1053,9 +1065,10 @@ impl TabManager {
         only_pane: Option<Uuid>,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
-        mut window: Option<&mut Window>,
+        window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        let _ = window; // retained for call-site symmetry / future focus restore
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
@@ -1109,6 +1122,16 @@ impl TabManager {
                 .unwrap_or(label_snap);
 
             if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                // Manual reconnect after Failed restores auto-restart budget; silent
+                // SessionEnded restart leaves Connecting and keeps the decremented count.
+                if pane.kind.is_local()
+                    && matches!(
+                        pane.state,
+                        ConnectionState::Failed | ConnectionState::Disconnected
+                    )
+                {
+                    pane.local_auto_restarts_left = LOCAL_AUTO_RESTART_BUDGET;
+                }
                 teardown_pane_io(pane);
                 drop(pane.terminal.take());
                 pane.kind = kind.clone();
@@ -1116,7 +1139,7 @@ impl TabManager {
             }
 
             match &kind {
-                ProfileKind::Local { .. } if kind.local_has_args() => {
+                ProfileKind::Local { .. } => {
                     if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                         pane.state = ConnectionState::Connecting;
                         pane.status_message = if kind.is_wsl_local() {
@@ -1125,6 +1148,8 @@ impl TabManager {
                             "reconnecting…".into()
                         };
                     }
+                    // Always async so SessionEnded auto-restart works without a Window,
+                    // and so we keep the same PaneSession (auto-restart budget intact).
                     self.spawn_local_async_attach(
                         tab_id,
                         pane_id,
@@ -1135,41 +1160,6 @@ impl TabManager {
                         None,
                         cx,
                     );
-                }
-                ProfileKind::Local { .. } => {
-                    let Some(window) = window.as_deref_mut() else {
-                        if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
-                            pane.state = ConnectionState::Failed;
-                            pane.status_message = "reconnect requires window focus".into();
-                        }
-                        continue;
-                    };
-                    if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
-                        pane.state = ConnectionState::Connecting;
-                        pane.status_message = "reconnecting…".into();
-                    }
-                    match self.spawn_local(
-                        profile_id,
-                        &kind,
-                        &label,
-                        default_shell.as_deref(),
-                        &font_family,
-                        store,
-                        None,
-                        window,
-                        cx,
-                    ) {
-                        Ok(mut fresh) => {
-                            fresh.id = pane_id;
-                            self.tabs[idx].panes.insert(pane_id, fresh);
-                        }
-                        Err(err) => {
-                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
-                                pane.state = ConnectionState::Failed;
-                                pane.status_message = format!("{err:#}");
-                            }
-                        }
-                    }
                 }
                 ProfileKind::Ssh { host, port, user, .. } => {
                     let auto_forwards: Vec<_> = auth_profile_id
@@ -1261,8 +1251,13 @@ impl TabManager {
             cx.notify();
             return;
         }
-        pane.state = ConnectionState::Failed;
-        pane.status_message = "disconnected — use Reconnect in the status bar".into();
+
+        let is_local = pane.kind.is_local();
+        let can_auto = is_local && pane.local_auto_restarts_left > 0;
+        if can_auto {
+            pane.local_auto_restarts_left -= 1;
+        }
+
         let master = pane.pty_master.take();
         let killer = pane.pty_killer.take();
         drop(pane.ssh_forwards.take());
@@ -1271,7 +1266,32 @@ impl TabManager {
             let _ = tx.send(());
         }
         teardown_pty(killer, master);
-        // Keep `terminal` so the last output and disconnect banner remain visible.
+
+        if can_auto {
+            // Match Windows Terminal / VS Code "restart on exit": respawn silently.
+            drop(pane.terminal.take());
+            pane.state = ConnectionState::Connecting;
+            pane.status_message = if pane.kind.is_wsl_local() {
+                "restarting WSL…".into()
+            } else {
+                "restarting shell…".into()
+            };
+            AppBus::emit(
+                &self.app_bus,
+                AppBusEvent::ReconnectPane { pane_id },
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        pane.state = ConnectionState::Failed;
+        pane.status_message = if is_local {
+            "shell exited — use Reconnect in the status bar".into()
+        } else {
+            "disconnected — use Reconnect in the status bar".into()
+        };
+        // Keep `terminal` so the last output and end-of-session banner remain visible.
         cx.notify();
     }
 
@@ -1814,6 +1834,7 @@ impl TabManager {
                             ssh_shutdown: None,
                             ssh_sftp: None,
                             ssh_forwards: None,
+                            local_auto_restarts_left: 0,
                             _term_subscriptions: Vec::new(),
                         };
                         let title = self.unique_tab_title(&label);
