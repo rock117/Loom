@@ -35,12 +35,12 @@ Windows-style navigation:
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
-| Toolbar Upload (SSH) | Pick local **file** → **settings** (remote dir / include·exclude / compress) → upload |
-| Toolbar Upload folder (SSH) | Pick local **folder** → same settings dialog → recursive upload |
-| Drag-drop (SSH) | Drop files/folders → settings dialog → upload into chosen remote dir |
-| ↓ button (SSH) | Download selected → **settings** (local folder / include·exclude / compress) → transfer |
+| Toolbar Upload (SSH) | Pick local **file** → upload to current remote cwd (**no settings**). |
+| Toolbar Upload folder (SSH) | Pick local **folder** → **settings** (remote dir / include·exclude / compress) → recursive upload |
+| Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → settings dialog |
+| ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → settings → transfer |
 
-Settings dialog defaults: local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH double-click open** still skips settings (confirm → temp download → open).
+Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH double-click open** still skips settings (confirm → temp download → open).
 
 Compress: upload zips locally then sends `.zip`; download tries remote `zip` → `tar.gz` → `tar` → `7z` → `gzip`, then saves the archive file into the chosen local folder (does not auto-extract).
 
@@ -60,7 +60,7 @@ Right-click an entry (or use prompts from the menu):
 | Permissions… | Octal mode (e.g. `755`). Local on Windows approximates via readonly bit |
 | Delete… | Confirm; directories removed recursively |
 | Reveal (Local) | File Explorer |
-| Download (SSH file) | Save dialog (does not auto-open) |
+| Download (SSH file) | Straight to last/Downloads folder (no settings). Folders still open settings |
 
 ### Transfers footer
 

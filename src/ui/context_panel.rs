@@ -666,6 +666,17 @@ impl ContextPanel {
             .last_download_dir
             .clone()
             .unwrap_or_else(default_download_dir);
+        // Single remote file: no include/exclude/compress UI — go straight to Downloads.
+        if !entry.is_dir {
+            self.download_entry(
+                entry,
+                false,
+                TransferOptions::default(),
+                Some(PathBuf::from(dest)),
+                cx,
+            );
+            return;
+        }
         let form =
             TransferSettingsForm::for_download(entry, dest, self.last_compress);
         self.prompt = Some(FilesPrompt::TransferSettings(form));
@@ -680,6 +691,17 @@ impl ContextPanel {
         cx: &mut Context<Self>,
     ) {
         let dest = self.cwd.clone().unwrap_or_else(|| ".".into());
+        // File-only payloads skip settings (folders / mixed still need filters).
+        let all_files = !locals.is_empty() && locals.iter().all(|p| p.is_file());
+        if all_files {
+            let Some((_, sftp)) = self.focused_sftp(cx) else {
+                self.error = Some("No SSH session".into());
+                cx.notify();
+                return;
+            };
+            self.start_uploads(pane_id, sftp, dest, locals, TransferOptions::default(), cx);
+            return;
+        }
         let form =
             TransferSettingsForm::for_upload(pane_id, locals, dest, self.last_compress);
         self.prompt = Some(FilesPrompt::TransferSettings(form));
@@ -3178,7 +3200,7 @@ impl ContextPanel {
                                 if locals.is_empty() {
                                     return;
                                 }
-                                let _ = cwd; // dest defaults to cwd inside the settings form
+                                let _ = cwd; // file-only uploads use cwd; folders open settings
                                 this.begin_transfer_upload(pane_id, locals, cx);
                             },
                         ))
