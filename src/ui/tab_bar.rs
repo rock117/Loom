@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::model::ConnectionState;
 use crate::shared::theme;
 use crate::ui::pane_layout::SplitDirection;
+use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::tab_manager::{TabManager, state_color};
 use crate::ui::tooltip::Tooltip;
 use crate::ui::workspace_store::WorkspaceStore;
@@ -17,14 +18,22 @@ struct TabContextMenu {
     position: Point<Pixels>,
 }
 
+struct TabRename {
+    tab_id: Uuid,
+    edit: RenameEdit,
+}
+
 pub struct TabBar {
     pub tabs: Entity<TabManager>,
     store: Entity<WorkspaceStore>,
+    focus_handle: FocusHandle,
     /// Zed-style split popover (open under the columns control).
     split_menu_open: bool,
     /// Window-space point for the menu's top-right corner (same pattern as sidebar).
     split_menu_anchor: Option<Point<Pixels>>,
     context_menu: Option<TabContextMenu>,
+    rename: Option<TabRename>,
+    _caret_blink: Option<Task<()>>,
     _observe_tabs: Subscription,
     _observe_store: Subscription,
 }
@@ -40,9 +49,12 @@ impl TabBar {
         Self {
             tabs,
             store,
+            focus_handle: cx.focus_handle(),
             split_menu_open: false,
             split_menu_anchor: None,
             context_menu: None,
+            rename: None,
+            _caret_blink: None,
             _observe_tabs,
             _observe_store,
         }
@@ -83,6 +95,70 @@ impl TabBar {
     /// True when the split popover or tab context menu is open.
     pub fn has_open_menu(&self) -> bool {
         self.context_menu.is_some() || self.split_menu_open
+    }
+
+    fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
+        self._caret_blink = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if let Some(r) = this.rename.as_mut() {
+                            r.edit.caret_visible = !r.edit.caret_visible;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub fn begin_rename(&mut self, tab_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.close_split_menu(cx);
+        let Some(title) = self.tabs.read(cx).tab_title(tab_id) else {
+            return;
+        };
+        self.tabs.update(cx, |m, cx| m.select_tab(tab_id, window, cx));
+        self.rename = Some(TabRename {
+            tab_id,
+            edit: RenameEdit::new(title),
+        });
+        self.focus_handle.focus(window);
+        self.start_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(TabRename { tab_id, edit }) = self.rename.take() else {
+            return;
+        };
+        self._caret_blink = None;
+        let name = edit.text.trim().to_string();
+        if !name.is_empty() {
+            self.tabs
+                .update(cx, |m, cx| m.rename_tab(tab_id, name, cx));
+            cx.emit(TabBarEvent::Changed);
+        }
+        cx.notify();
+    }
+
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        self.rename = None;
+        self._caret_blink = None;
+        cx.notify();
+    }
+
+    fn with_rename_edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut RenameEdit)) {
+        if let Some(r) = self.rename.as_mut() {
+            f(&mut r.edit);
+            cx.notify();
+        }
     }
 
     fn svg_icon(path: &'static str, size: f32, color: Hsla) -> impl IntoElement {
@@ -245,6 +321,10 @@ impl TabBar {
 
         let mut menu = self
             .menu_shell()
+            .child(self.menu_item("tab-ctx-rename", "Rename", true, cx, move |this, window, cx| {
+                this.begin_rename(tab_id, window, cx);
+            }))
+            .child(self.menu_divider())
             .child(self.menu_item("tab-ctx-close", "Close", true, cx, move |this, _, cx| {
                 this.tabs.update(cx, |m, cx| m.close_tab(tab_id, cx));
                 cx.emit(TabBarEvent::Changed);
@@ -415,6 +495,12 @@ impl TabBar {
     }
 }
 
+impl Focusable for TabBar {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for TabBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let manager = self.tabs.read(cx);
@@ -430,8 +516,13 @@ impl Render for TabBar {
         let menu_open = self.split_menu_open;
         let menu_anchor = self.split_menu_anchor;
         let context_menu = self.context_menu.as_ref().map(|m| (m.tab_id, m.position));
+        let renaming_id = self.rename.as_ref().map(|r| r.tab_id);
+        let rename_edit = self.rename.as_ref().map(|r| r.edit.clone());
+        let key_ctx = "TabBar";
 
         div()
+            .key_context(key_ctx)
+            .track_focus(&self.focus_handle)
             .relative()
             .flex()
             .items_center()
@@ -446,17 +537,153 @@ impl Render for TabBar {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    if this.rename.is_some() {
+                        this.commit_rename(cx);
+                    }
                     this.close_context_menu(cx);
                 }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if event.keystroke.key.as_str() == "escape" {
+                let key = event.keystroke.key.as_str();
+                let mods = &event.keystroke.modifiers;
+
+                if this.rename.is_some() {
+                    let shift = mods.shift;
+                    let chord = mods.control || mods.platform;
+
+                    if key == "enter" {
+                        this.commit_rename(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "escape" {
+                        this.cancel_rename(cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("a") {
+                        this.with_rename_edit(cx, |e| e.select_all());
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("c") {
+                        if let Some(r) = this.rename.as_ref() {
+                            let text = if r.edit.has_selection() {
+                                r.edit.selected_text()
+                            } else {
+                                r.edit.text.clone()
+                            };
+                            if !text.is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if chord && key.eq_ignore_ascii_case("x") {
+                        let text = this.rename.as_ref().map(|r| {
+                            if r.edit.has_selection() {
+                                r.edit.selected_text()
+                            } else {
+                                r.edit.text.clone()
+                            }
+                        });
+                        if let Some(text) = text.filter(|t| !t.is_empty()) {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                        this.with_rename_edit(cx, |e| {
+                            if e.has_selection() {
+                                e.delete_selection();
+                            } else {
+                                e.text.clear();
+                                e.cursor = 0;
+                                e.anchor = 0;
+                            }
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if (chord && key.eq_ignore_ascii_case("v"))
+                        || (mods.shift && key.eq_ignore_ascii_case("insert"))
+                    {
+                        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                            let cleaned = text.replace('\r', "").replace('\n', "");
+                            if !cleaned.is_empty() {
+                                this.with_rename_edit(cx, |e| e.insert(&cleaned));
+                            }
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "backspace" {
+                        this.with_rename_edit(cx, |e| {
+                            e.backspace();
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "delete" {
+                        this.with_rename_edit(cx, |e| {
+                            e.delete_forward();
+                        });
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "left" {
+                        this.with_rename_edit(cx, |e| e.move_left(shift));
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "right" {
+                        this.with_rename_edit(cx, |e| e.move_right(shift));
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "home" {
+                        this.with_rename_edit(cx, |e| e.move_home(shift));
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if key == "end" {
+                        this.with_rename_edit(cx, |e| e.move_end(shift));
+                        cx.stop_propagation();
+                        return;
+                    }
+                    if !chord {
+                        if let Some(cleaned) = typed_text_from_keystroke(&event.keystroke) {
+                            this.with_rename_edit(cx, |e| e.insert(&cleaned));
+                            cx.stop_propagation();
+                            return;
+                        }
+                    }
+                    return;
+                }
+
+                if key == "escape" {
                     this.close_split_menu(cx);
                     this.close_context_menu(cx);
                     cx.stop_propagation();
                 }
             }))
             .children(items.into_iter().map(|(id, title, state, is_active)| {
+                let is_renaming = renaming_id == Some(id);
+                let title_el: AnyElement = if is_renaming {
+                    if let Some(edit) = rename_edit.as_ref() {
+                        edit.clone().into_element()
+                    } else {
+                        div()
+                            .text_sm()
+                            .text_color(theme::TEXT)
+                            .child(title)
+                            .into_any_element()
+                    }
+                } else {
+                    div()
+                        .text_sm()
+                        .text_color(theme::TEXT)
+                        .child(title)
+                        .into_any_element()
+                };
                 div()
                     .id(SharedString::from(format!("tab-{id}")))
                     .flex()
@@ -470,6 +697,9 @@ impl Render for TabBar {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if this.rename.is_some() {
+                                this.commit_rename(cx);
+                            }
                             this.close_split_menu(cx);
                             this.context_menu = Some(TabContextMenu {
                                 tab_id: id,
@@ -487,10 +717,25 @@ impl Render for TabBar {
                             .gap(px(theme::SPACE_1))
                             .cursor_pointer()
                             .child(div().size(px(8.0)).rounded_full().bg(state_color(state)))
-                            .child(div().text_sm().text_color(theme::TEXT).child(title))
+                            .child(title_el)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    if this.rename.as_ref().is_some_and(|r| r.tab_id == id) {
+                                        cx.stop_propagation();
+                                    } else if this.rename.is_some() {
+                                        this.commit_rename(cx);
+                                    }
+                                }),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.rename.as_ref().is_some_and(|r| r.tab_id == id) {
+                                    cx.stop_propagation();
+                                    return;
+                                }
                                 this.close_split_menu(cx);
                                 this.close_context_menu(cx);
+                                this.focus_handle.focus(window);
                                 this.tabs.update(cx, |m, cx| m.select_tab(id, window, cx));
                                 cx.emit(TabBarEvent::Changed);
                             })),
@@ -509,6 +754,9 @@ impl Render for TabBar {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
+                                    if this.rename.is_some() {
+                                        this.commit_rename(cx);
+                                    }
                                     this.close_split_menu(cx);
                                     this.close_context_menu(cx);
                                     this.tabs.update(cx, |m, cx| m.close_tab(id, cx));
@@ -535,6 +783,9 @@ impl Render for TabBar {
                     .tooltip(|_, cx| Tooltip::with_key("New Tab", "Ctrl+T", cx))
                     .child(Self::svg_icon("icons/ui/plus.svg", ICON, theme::TEXT_MUTED))
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if this.rename.is_some() {
+                            this.commit_rename(cx);
+                        }
                         this.close_split_menu(cx);
                         this.close_context_menu(cx);
                         cx.emit(TabBarEvent::NewTab);
@@ -573,6 +824,9 @@ impl Render for TabBar {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            if this.rename.is_some() {
+                                this.commit_rename(cx);
+                            }
                             this.close_context_menu(cx);
                             if this.tabs.read(cx).active.is_none() {
                                 return;
@@ -636,6 +890,9 @@ impl Render for TabBar {
                     .on_click(cx.listener(|this, _, _, cx| {
                         if !this.tabs.read(cx).can_zoom_active() {
                             return;
+                        }
+                        if this.rename.is_some() {
+                            this.commit_rename(cx);
                         }
                         this.close_split_menu(cx);
                         this.close_context_menu(cx);

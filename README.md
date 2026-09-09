@@ -78,6 +78,7 @@ Data lives under the app data directory (on Windows: `%APPDATA%/Loom/`), includi
 | `Ctrl+W` | Close focused pane / tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl+Shift+D` | Duplicate current tab |
+| `F2` | Rename selected sidebar profile/group |
 | `Ctrl+F` | Find in terminal |
 | `Ctrl+,` | Settings |
 | `Ctrl+S` | Save workspace now |

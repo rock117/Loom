@@ -1563,10 +1563,25 @@ impl TabManager {
         let Some(active) = self.active else {
             return;
         };
-        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == active) {
-            tab.title = title;
+        self.rename_tab(active, title, cx);
+    }
+
+    pub fn rename_tab(&mut self, tab_id: Uuid, title: String, cx: &mut Context<Self>) {
+        let name = title.trim();
+        if name.is_empty() {
+            return;
+        }
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.title = name.to_string();
             cx.notify();
         }
+    }
+
+    pub fn tab_title(&self, tab_id: Uuid) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .map(|t| t.title.clone())
     }
 
     pub fn set_font_size(&mut self, size: f32, cx: &mut Context<Self>) {

@@ -63,7 +63,7 @@ pub struct WorkspaceView {
     show_settings: bool,
     show_ssh_form: bool,
     show_wsl_form: bool,
-    restore_profiles: Vec<uuid::Uuid>,
+    restore_tabs: Vec<(uuid::Uuid, Option<String>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -77,19 +77,20 @@ impl WorkspaceView {
         let sidebar_visible = store.read(cx).ui_state.sidebar_visible;
         let context_panel_width = store.read(cx).ui_state.context_panel_width.max(0.0);
         let context_panel_visible = store.read(cx).ui_state.context_panel_visible;
-        let restore_profiles: Vec<uuid::Uuid> = store
+        let restore_tabs: Vec<(uuid::Uuid, Option<String>)> = store
             .read(cx)
             .ui_state
             .open_tabs
             .iter()
             .filter_map(|t| {
                 let id = t.profile_id;
+                let title = t.title.clone();
                 store
                     .read(cx)
                     .workspace
                     .find_profile(id)
                     .filter(|p| p.kind.visible_in_sidebar())
-                    .map(|p| p.id)
+                    .map(|p| (p.id, title))
             })
             .collect();
 
@@ -147,7 +148,7 @@ impl WorkspaceView {
             show_settings: false,
             show_ssh_form: false,
             show_wsl_form: false,
-            restore_profiles,
+            restore_tabs,
             _subscriptions: Vec::new(),
         };
 
@@ -375,11 +376,19 @@ impl WorkspaceView {
             },
         ));
 
-        let to_restore = view.restore_profiles.clone();
-        view.restore_profiles.clear();
+        let to_restore = view.restore_tabs.clone();
+        view.restore_tabs.clear();
         cx.defer_in(window, move |this, window, cx| {
-            for pid in to_restore {
+            for (pid, custom_title) in to_restore {
                 this.open_profile_id(pid, window, cx);
+                if let Some(title) = custom_title.filter(|t| !t.trim().is_empty()) {
+                    this.tabs.update(cx, |m, cx| {
+                        if let Some(tab_id) = m.active {
+                            // Prefer persisted tab title over profile name.
+                            m.rename_tab(tab_id, title, cx);
+                        }
+                    });
+                }
             }
         });
 
@@ -1112,7 +1121,7 @@ impl Render for WorkspaceView {
                 this.persist_tabs(cx);
             }))
             .on_action(cx.listener(|this, _: &RenameFocused, window, cx| {
-                // Binding is `Renamable` (profile/group selected + sidebar focused).
+                // F2 only renames sidebar profile/group — tab titles are context-menu only.
                 match this.store.read(cx).selection {
                     Selection::Profile(_) | Selection::Group(_) => {
                         this.sidebar.update(cx, |s, cx| {
