@@ -47,6 +47,8 @@ pub struct SshForm {
     use_private_key: bool,
     /// Keyring already has a password for this profile (edit mode).
     has_stored_password: bool,
+    /// When true, password field shows plaintext instead of bullets.
+    password_visible: bool,
     remember: bool,
     /// Persistent Local forward rules for this SSH profile.
     forwards: Vec<PortForwardRule>,
@@ -110,6 +112,7 @@ impl SshForm {
             key_path: field_edit(""),
             use_private_key: false,
             has_stored_password: false,
+            password_visible: false,
             remember: true,
             forwards: Vec::new(),
             forwards_open: false,
@@ -137,6 +140,7 @@ impl SshForm {
         self.key_path = field_edit("");
         self.use_private_key = false;
         self.has_stored_password = false;
+        self.password_visible = false;
         self.remember = true;
         self.forwards.clear();
         self.forwards_open = false;
@@ -183,6 +187,7 @@ impl SshForm {
         self.forwards = profile.forwards.clone();
         self.forwards_open = !self.forwards.is_empty();
         self.forward_edit = None;
+        self.password_visible = false;
         self.error = None;
         match auth {
             SshAuth::Password { remember } => {
@@ -1279,9 +1284,47 @@ impl SshForm {
         empty_hint: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        self.field_row_inner(id, label, field, edit, active, secret, empty_hint, false, cx)
+    }
+
+    fn password_field_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        edit: &RenameEdit,
+        active: bool,
+        empty_hint: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        self.field_row_inner(
+            id,
+            label,
+            Field::Password,
+            edit,
+            active,
+            !self.password_visible,
+            empty_hint,
+            true,
+            cx,
+        )
+    }
+
+    fn field_row_inner(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        field: Field,
+        edit: &RenameEdit,
+        active: bool,
+        secret: bool,
+        empty_hint: &str,
+        with_reveal: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let show_hint = edit.text.is_empty() && !active;
         let view = cx.entity();
         let fi = field_idx(field);
+        let reveal_on = with_reveal && self.password_visible;
         div()
             .id(id)
             .flex()
@@ -1295,59 +1338,137 @@ impl SshForm {
             )
             .child(
                 div()
-                    .id(SharedString::from(format!("{id}-input")))
-                    .relative()
-                    .w_full()
-                    .px(px(theme::SPACE_2))
-                    .py(px(theme::SPACE_1))
-                    .rounded(px(theme::RADIUS_SM))
-                    .bg(theme::ELEVATED)
-                    .border_1()
-                    .border_color(if active {
-                        theme::ACCENT
-                    } else {
-                        theme::BORDER
-                    })
-                    .text_sm()
-                    .overflow_hidden()
-                    .cursor_text()
+                    .flex()
+                    .items_center()
+                    .gap(px(theme::SPACE_1))
                     .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                view.update(cx, |this, _| {
-                                    this.field_bounds[fi] = Some(bounds);
-                                });
-                                bounds
-                            },
-                            |_bounds, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                        div()
+                            .id(SharedString::from(format!("{id}-input")))
+                            .relative()
+                            .flex_1()
+                            .min_w_0()
+                            .px(px(theme::SPACE_2))
+                            .py(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS_SM))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(if active {
+                                theme::ACCENT
+                            } else {
+                                theme::BORDER
+                            })
+                            .text_sm()
+                            .overflow_hidden()
+                            .cursor_text()
+                            .child(
+                                canvas(
+                                    move |bounds, _, cx| {
+                                        view.update(cx, |this, _| {
+                                            this.field_bounds[fi] = Some(bounds);
+                                        });
+                                        bounds
+                                    },
+                                    |_bounds, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .when(active && !secret, |d| d.child(edit.into_element_bare()))
+                            .when(active && secret, |d| {
+                                d.child(edit.into_element_bare_masked())
+                            })
+                            .when(!active, |d| {
+                                d.text_color(if show_hint {
+                                    theme::TEXT_DISABLED
+                                } else {
+                                    theme::TEXT
+                                })
+                                .child(if show_hint {
+                                    empty_hint.to_string()
+                                } else if secret {
+                                    "•".repeat(edit.char_len().min(24))
+                                } else {
+                                    edit.text.clone()
+                                })
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.begin_mouse_select(field, event, window, cx);
+                                    cx.stop_propagation();
+                                }),
+                            ),
                     )
-                    .when(active && !secret, |d| d.child(edit.into_element_bare()))
-                    .when(active && secret, |d| d.child(edit.into_element_bare_masked()))
-                    .when(!active, |d| {
-                        d.text_color(if show_hint {
-                            theme::TEXT_DISABLED
+                    .when(with_reveal, |d| {
+                        let icon = if reveal_on {
+                            "icons/ui/eye-off.svg"
                         } else {
-                            theme::TEXT
-                        })
-                        .child(if show_hint {
-                            empty_hint.to_string()
-                        } else if secret {
-                            "•".repeat(edit.char_len().min(24))
+                            "icons/ui/eye.svg"
+                        };
+                        let tip = if reveal_on {
+                            "Hide password"
                         } else {
-                            edit.text.clone()
-                        })
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            this.begin_mouse_select(field, event, window, cx);
-                            cx.stop_propagation();
-                        }),
-                    ),
+                            "Show password"
+                        };
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("{id}-reveal")))
+                                .occlude()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(28.0))
+                                .rounded(px(theme::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme::HOVER))
+                                .tooltip(move |_, cx| {
+                                    crate::ui::tooltip::Tooltip::text(tip, cx)
+                                })
+                                .child(
+                                    svg()
+                                        .path(icon)
+                                        .size(px(14.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::TEXT_MUTED),
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, window, cx| {
+                                        this.toggle_password_visible(window, cx);
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.stop_propagation();
+                                })),
+                        )
+                    }),
             )
+    }
+
+    fn toggle_password_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.selecting = false;
+        self.password_visible = !self.password_visible;
+
+        if self.password_visible {
+            // Edit mode keeps the field empty ("blank = keep saved") and only shows a
+            // bullet hint — load the keyring value so reveal actually shows plaintext.
+            if self.password.text.is_empty() {
+                if let Some(pid) = self.editing {
+                    if let Ok(Some(pw)) = credentials::get_password(pid) {
+                        self.password = field_edit(pw);
+                        self.has_stored_password = true;
+                    }
+                }
+            }
+            self.field = Field::Password;
+            self.password.move_end(false);
+            self.password.caret_visible = true;
+        }
+
+        self.focus_handle.focus(window);
+        self.start_caret_blink(cx);
+        cx.notify();
     }
 }
 
@@ -1405,8 +1526,10 @@ impl Render for SshForm {
         } else {
             "Password"
         };
-        let pass_hint = if editing && self.has_stored_password {
+        let pass_hint = if editing && self.has_stored_password && !self.password_visible {
             "••••••••"
+        } else if editing && self.has_stored_password && self.password_visible {
+            "…"
         } else {
             "…"
         };
@@ -1574,13 +1697,11 @@ impl Render for SshForm {
                     )
                     .child(self.auth_mode_section(cx))
                     .when(!self.use_private_key, |d| {
-                        d.child(self.field_row(
+                        d.child(self.password_field_row(
                             "ssh-pass",
                             pass_label,
-                            Field::Password,
                             &self.password,
                             self.field == Field::Password,
-                            true,
                             pass_hint,
                             cx,
                         ))
