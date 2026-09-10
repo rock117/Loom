@@ -4265,6 +4265,54 @@ impl ContextPanel {
                                 .child(footer),
                         ),
                 )
+                .when(!s.listening.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .pt(px(theme::SPACE_2))
+                            .border_t_1()
+                            .border_color(theme::BORDER_SUBTLE)
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child("Listening"),
+                            )
+                            .children(s.listening.into_iter().map(|row| {
+                                let label = if row.proto == "udp" {
+                                    format!("{} · udp", row.port)
+                                } else {
+                                    row.port.to_string()
+                                };
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT)
+                                            .child(label),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(row.process),
+                                    )
+                            })),
+                    )
+                })
             })
             .child(self.render_port_forwards(cx))
             .into_any_element()

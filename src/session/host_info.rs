@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 const MAX_DISKS: usize = 5;
 /// Max GPUs shown in Info.
 const MAX_GPUS: usize = 2;
+/// Max listening sockets shown in Info.
+const MAX_LISTEN: usize = 24;
 
 /// One filesystem / mount usage row.
 #[derive(Debug, Clone, Default)]
@@ -44,6 +46,15 @@ impl GpuInfo {
     }
 }
 
+/// One listening TCP/UDP socket (port + process).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListeningPort {
+    pub port: u16,
+    /// `tcp` / `udp` (lowercase).
+    pub proto: String,
+    pub process: String,
+}
+
 /// One-shot host metrics for display (manual refresh only).
 #[derive(Debug, Clone, Default)]
 pub struct HostSnapshot {
@@ -60,6 +71,8 @@ pub struct HostSnapshot {
     pub disks: Vec<DiskUsage>,
     /// Present only when detection succeeds (hidden in UI otherwise).
     pub gpus: Vec<GpuInfo>,
+    /// Listening sockets; common ports ranked first (capped).
+    pub listening: Vec<ListeningPort>,
     pub load: Option<String>,
     pub uptime_secs: u64,
 }
@@ -102,6 +115,7 @@ pub fn collect_local() -> Result<HostSnapshot> {
     let disks_sys = Disks::new_with_refreshed_list();
     let disks = collect_local_disks(&disks_sys);
     let gpus = collect_local_gpus();
+    let listening = collect_local_listening();
 
     let load = {
         let la = System::load_average();
@@ -129,6 +143,7 @@ pub fn collect_local() -> Result<HostSnapshot> {
         mem_total: sys.total_memory(),
         disks,
         gpus,
+        listening,
         load,
         uptime_secs: System::uptime(),
     })
@@ -265,6 +280,244 @@ fn cap_gpus(mut gpus: Vec<GpuInfo>) -> Vec<GpuInfo> {
     gpus.retain(|g| !g.name.trim().is_empty());
     gpus.truncate(MAX_GPUS);
     gpus
+}
+
+/// Well-known / frequently useful ports — lower index = higher priority in Info.
+fn common_port_rank(port: u16) -> Option<u8> {
+    const COMMON: &[u16] = &[
+        22, 80, 443, 8080, 8443, 3000, 5173, 8000, 5000, 4000, 9000, 3306, 5432, 6379,
+        27017, 9200, 5601, 11211, 5672, 15672, 1883, 3389, 445, 139, 53, 25, 587, 993,
+        143, 21, 2049, 2375, 2376, 6443, 10250, 9090, 9418,
+    ];
+    COMMON
+        .iter()
+        .position(|&p| p == port)
+        .map(|i| i as u8)
+}
+
+fn rank_listening(mut rows: Vec<ListeningPort>) -> Vec<ListeningPort> {
+    // Dedupe by (proto, port, process).
+    rows.sort_by(|a, b| {
+        a.proto
+            .cmp(&b.proto)
+            .then(a.port.cmp(&b.port))
+            .then(a.process.cmp(&b.process))
+    });
+    rows.dedup();
+    rows.sort_by(|a, b| {
+        let ra = common_port_rank(a.port);
+        let rb = common_port_rank(b.port);
+        match (ra, rb) {
+            (Some(x), Some(y)) => x
+                .cmp(&y)
+                .then(a.port.cmp(&b.port))
+                .then(a.proto.cmp(&b.proto)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a
+                .port
+                .cmp(&b.port)
+                .then(a.proto.cmp(&b.proto))
+                .then(a.process.cmp(&b.process)),
+        }
+    });
+    rows.truncate(MAX_LISTEN);
+    rows
+}
+
+fn collect_local_listening() -> Vec<ListeningPort> {
+    #[cfg(windows)]
+    {
+        return collect_windows_listening();
+    }
+    #[cfg(not(windows))]
+    {
+        return collect_unix_listening();
+    }
+}
+
+#[cfg(windows)]
+fn collect_windows_listening() -> Vec<ListeningPort> {
+    // One PowerShell round-trip; CREATE_NO_WINDOW via new_command.
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+Get-NetTCPConnection -State Listen |
+  ForEach-Object {
+    $n = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+    if (-not $n) { $n = '?' }
+    '{0}|tcp|{1}' -f $_.LocalPort, $n
+  }
+Get-NetUDPEndpoint |
+  ForEach-Object {
+    $n = (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName
+    if (-not $n) { $n = '?' }
+    '{0}|udp|{1}' -f $_.LocalPort, $n
+  }
+"#;
+    let Some(output) = run_capture(
+        "powershell",
+        &["-NoProfile", "-NonInteractive", "-Command", script],
+    ) else {
+        return Vec::new();
+    };
+    parse_listen_lines(&output)
+}
+
+#[cfg(not(windows))]
+fn collect_unix_listening() -> Vec<ListeningPort> {
+    if let Some(output) = run_capture("ss", &["-H", "-tulnp"]) {
+        let rows = parse_ss_listen(&output);
+        if !rows.is_empty() {
+            return rank_listening(rows);
+        }
+    }
+    if let Some(output) = run_capture("netstat", &["-lntup"]) {
+        return rank_listening(parse_netstat_listen(&output));
+    }
+    Vec::new()
+}
+
+fn parse_listen_lines(output: &str) -> Vec<ListeningPort> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '|');
+        let port = parts
+            .next()
+            .and_then(|s| s.trim().parse::<u16>().ok());
+        let proto = parts
+            .next()
+            .unwrap_or("tcp")
+            .trim()
+            .to_ascii_lowercase();
+        let process = parts
+            .next()
+            .unwrap_or("?")
+            .trim()
+            .to_string();
+        let Some(port) = port else {
+            continue;
+        };
+        if port == 0 {
+            continue;
+        }
+        let process = if process.is_empty() {
+            "?".into()
+        } else {
+            process
+        };
+        rows.push(ListeningPort {
+            port,
+            proto: if proto == "udp" { "udp".into() } else { "tcp".into() },
+            process,
+        });
+    }
+    rank_listening(rows)
+}
+
+#[cfg(not(windows))]
+fn parse_ss_listen(output: &str) -> Vec<ListeningPort> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let proto = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("tcp")
+            .to_ascii_lowercase();
+        let proto = if proto.starts_with("udp") {
+            "udp"
+        } else {
+            "tcp"
+        };
+        // Local address is usually field 5 for `ss -tulnp` (Netid State Recv-Q Send-Q Local Peer).
+        let local = line
+            .split_whitespace()
+            .nth(4)
+            .unwrap_or("");
+        let port = local
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .or_else(|| {
+                // IPv6 [::]:port
+                local
+                    .rsplit_once(']')
+                    .and_then(|(_, rest)| rest.strip_prefix(':'))
+                    .and_then(|p| p.parse().ok())
+            });
+        let Some(port) = port.filter(|&p| p > 0) else {
+            continue;
+        };
+        let process = extract_ss_process(line).unwrap_or_else(|| "?".into());
+        rows.push(ListeningPort {
+            port,
+            proto: proto.into(),
+            process,
+        });
+    }
+    rows
+}
+
+#[cfg(not(windows))]
+fn extract_ss_process(line: &str) -> Option<String> {
+    // users:(("nginx",pid=123,fd=4))
+    let start = line.find("users:((\"")?;
+    let rest = &line[start + "users:((\"".len()..];
+    let end = rest.find('"')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+fn parse_netstat_listen(output: &str) -> Vec<ListeningPort> {
+    let mut rows = Vec::new();
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("listen") && !lower.contains("udp") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let proto = parts[0].to_ascii_lowercase();
+        let proto = if proto.starts_with("udp") {
+            "udp"
+        } else if proto.starts_with("tcp") {
+            "tcp"
+        } else {
+            continue;
+        };
+        let local = parts[3];
+        let Some(port) = local
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .filter(|&p| p > 0)
+        else {
+            continue;
+        };
+        let process = parts
+            .last()
+            .and_then(|s| s.split('/').nth(1))
+            .unwrap_or("?")
+            .to_string();
+        rows.push(ListeningPort {
+            port,
+            proto: proto.into(),
+            process,
+        });
+    }
+    rows
 }
 
 fn probe_nvidia_smi() -> Option<Vec<GpuInfo>> {
@@ -493,6 +746,42 @@ elif command -v sysctl >/dev/null 2>&1; then
   now=$(date +%s)
   if [ -n "$boot" ] && [ -n "$now" ]; then printf 'UPTIME=%s\n' "$((now-boot))"; fi
 fi
+# Listening sockets: LISTEN=port|proto|process
+if command -v ss >/dev/null 2>&1; then
+  ss -H -tulnp 2>/dev/null | while IFS= read -r line; do
+    proto=$(printf '%s' "$line" | awk '{print tolower($1)}')
+    case "$proto" in
+      udp*) proto=udp ;;
+      *) proto=tcp ;;
+    esac
+    local=$(printf '%s' "$line" | awk '{print $5}')
+    port=${local##*:}
+    case "$port" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    proc=$(printf '%s' "$line" | sed -n 's/.*users:((\"\([^\"]*\)\".*/\1/p')
+    [ -z "$proc" ] && proc='?'
+    printf 'LISTEN=%s|%s|%s\n' "$port" "$proto" "$proc"
+  done
+elif command -v netstat >/dev/null 2>&1; then
+  netstat -lntup 2>/dev/null | while IFS= read -r line; do
+    printf '%s' "$line" | grep -qiE 'listen|udp' || continue
+    proto=$(printf '%s' "$line" | awk '{print tolower($1)}')
+    case "$proto" in
+      udp*) proto=udp ;;
+      tcp*) proto=tcp ;;
+      *) continue ;;
+    esac
+    local=$(printf '%s' "$line" | awk '{print $4}')
+    port=${local##*:}
+    case "$port" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    proc=$(printf '%s' "$line" | awk '{print $NF}' | cut -d/ -f2)
+    [ -z "$proc" ] && proc='?'
+    printf 'LISTEN=%s|%s|%s\n' "$port" "$proto" "$proc"
+  done
+fi
 "#
 }
 
@@ -586,6 +875,40 @@ pub fn parse_remote_probe(stdout: &str) -> Result<HostSnapshot> {
                 }
                 snap.gpus.push(gpu);
             }
+            "LISTEN" => {
+                let mut parts = v.splitn(3, '|');
+                let port = parts
+                    .next()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+                    .unwrap_or(0);
+                let proto = parts
+                    .next()
+                    .unwrap_or("tcp")
+                    .trim()
+                    .to_ascii_lowercase();
+                let process = parts
+                    .next()
+                    .unwrap_or("?")
+                    .trim()
+                    .to_string();
+                if port == 0 {
+                    continue;
+                }
+                let process = if process.is_empty() {
+                    "?".into()
+                } else {
+                    process
+                };
+                snap.listening.push(ListeningPort {
+                    port,
+                    proto: if proto == "udp" {
+                        "udp".into()
+                    } else {
+                        "tcp".into()
+                    },
+                    process,
+                });
+            }
             _ => {}
         }
     }
@@ -603,6 +926,7 @@ pub fn parse_remote_probe(stdout: &str) -> Result<HostSnapshot> {
     }
     snap.disks = rank_disks(std::mem::take(&mut snap.disks));
     snap.gpus = cap_gpus(std::mem::take(&mut snap.gpus));
+    snap.listening = rank_listening(std::mem::take(&mut snap.listening));
     Ok(snap)
 }
 
@@ -730,5 +1054,40 @@ mod tests {
         assert_eq!(snap.disks.len(), 3);
         assert_eq!(snap.disks[0].mount, "/");
         assert_eq!(snap.disks[1].mount, "/data");
+    }
+
+    #[test]
+    fn ranks_common_ports_first() {
+        let ranked = rank_listening(vec![
+            ListeningPort {
+                port: 49152,
+                proto: "tcp".into(),
+                process: "app".into(),
+            },
+            ListeningPort {
+                port: 22,
+                proto: "tcp".into(),
+                process: "sshd".into(),
+            },
+            ListeningPort {
+                port: 3000,
+                proto: "tcp".into(),
+                process: "node".into(),
+            },
+        ]);
+        assert_eq!(ranked[0].port, 22);
+        assert_eq!(ranked[1].port, 3000);
+        assert_eq!(ranked[2].port, 49152);
+    }
+
+    #[test]
+    fn parses_listen_probe_lines() {
+        let snap = parse_remote_probe(
+            "HOSTNAME=box\nOS=Linux\nLISTEN=22|tcp|sshd\nLISTEN=80|tcp|nginx\nLISTEN=54321|tcp|app\n",
+        )
+        .unwrap();
+        assert_eq!(snap.listening[0].port, 22);
+        assert_eq!(snap.listening[1].port, 80);
+        assert_eq!(snap.listening[2].port, 54321);
     }
 }

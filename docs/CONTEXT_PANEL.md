@@ -90,10 +90,11 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 |-------|---------|
 | Identity | Hostname as title; OS/kernel and CPU as muted lines |
 | Resources | Memory + up to 5 disks + up to 2 GPUs (hidden if undetected). Continuous bars; fill danger at ≥90% |
+| Listening | Open ports + process names (up to 24). Common ports (22/80/443/DB/dev…) ranked first |
 | Footer | `Load … · Up …` on one line |
 
-- **Local:** `sysinfo` disks/memory; GPU via `nvidia-smi` then Windows CIM / `lspci`
-- **SSH:** probe + `df`; GPU via `nvidia-smi` then `lspci` (best-effort)
+- **Local:** `sysinfo` disks/memory; GPU via `nvidia-smi` then Windows CIM / `lspci`; listening via PowerShell `Get-NetTCPConnection` (Windows) or `ss`/`netstat` (Unix) — all on a **background** thread
+- **SSH:** probe + `df`; GPU via `nvidia-smi` then `lspci`; listening via remote `ss`/`netstat` (best-effort) — never blocks the UI thread
 
 
 ## Non-goals (for now)
