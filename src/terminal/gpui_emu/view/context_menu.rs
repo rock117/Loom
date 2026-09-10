@@ -47,10 +47,15 @@ impl TerminalView {
     }
 
     /// Prefer live process cwd (local), else keep OSC / spawn cwd.
-    pub fn refresh_working_directory(&mut self) {
+    /// Emits [`TerminalViewEvent::WorkingDirectoryChanged`] when the path changes.
+    pub fn refresh_working_directory(&mut self, cx: &mut Context<Self>) {
         if let Some(pid) = self.shell_pid {
             if let Some(cwd) = platform::process_cwd(pid) {
-                self.working_directory = Some(cwd);
+                if self.working_directory.as_ref() != Some(&cwd) {
+                    self.working_directory = Some(cwd.clone());
+                    cx.emit(TerminalViewEvent::WorkingDirectoryChanged(cwd));
+                    cx.notify();
+                }
             }
         }
     }
@@ -63,7 +68,7 @@ impl TerminalView {
     }
 
     pub(super) fn open_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        self.refresh_working_directory();
+        self.refresh_working_directory(cx);
         self.context_menu = Some(position);
         cx.notify();
     }
@@ -94,7 +99,7 @@ impl TerminalView {
     }
 
     fn copy_working_directory(&mut self, cx: &mut Context<Self>) {
-        self.refresh_working_directory();
+        self.refresh_working_directory(cx);
         let Some(path) = self.working_directory.as_ref() else {
             return;
         };
@@ -103,8 +108,8 @@ impl TerminalView {
         ));
     }
 
-    fn reveal_working_directory(&mut self) {
-        self.refresh_working_directory();
+    fn reveal_working_directory(&mut self, cx: &mut Context<Self>) {
+        self.refresh_working_directory(cx);
         let Some(path) = self.working_directory.as_ref() else {
             return;
         };
@@ -238,8 +243,8 @@ impl TerminalView {
                                 "Reveal in File Explorer",
                                 can_reveal,
                                 cx,
-                                |this, _, _| {
-                                    this.reveal_working_directory();
+                                |this, _, cx| {
+                                    this.reveal_working_directory(cx);
                                 },
                             ))
                             .child(self.menu_divider())

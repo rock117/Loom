@@ -1667,8 +1667,8 @@ impl TabManager {
             return None;
         }
         let from_term = pane.terminal.as_ref().and_then(|term| {
-            term.update(cx, |view, _| {
-                view.refresh_working_directory();
+            term.update(cx, |view, cx| {
+                view.refresh_working_directory(cx);
                 view.working_directory()
             })
         });

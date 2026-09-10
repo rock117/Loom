@@ -1,5 +1,7 @@
 //! Window-bottom status bar (Zed / VS Code style).
 
+use std::path::PathBuf;
+
 use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
@@ -7,9 +9,12 @@ use uuid::Uuid;
 use crate::model::{ConnectionState, ProfileKind};
 use crate::shared::theme;
 use crate::ui::tab_manager::TabManager;
+use crate::ui::tooltip::Tooltip;
 use crate::ui::workspace_store::WorkspaceStore;
 
 const ICON: f32 = 12.0;
+/// Soft cap for the cwd segment label; full path stays in the tooltip.
+const CWD_LABEL_MAX_CHARS: usize = 56;
 
 pub struct StatusBar {
     pub store: Entity<WorkspaceStore>,
@@ -19,6 +24,9 @@ pub struct StatusBar {
     _observe_store: Subscription,
     _observe_tabs: Subscription,
     _observe_terminal: Option<Subscription>,
+    /// Polls `process_cwd` for the focused Local pane so the cwd label tracks `cd`
+    /// even when OSC hooks are missing (not used on quit — see WINDOW_CLOSE_HANG).
+    _cwd_poll: Option<Task<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -55,9 +63,49 @@ impl StatusBar {
             _observe_store,
             _observe_tabs,
             _observe_terminal: None,
+            _cwd_poll: None,
         };
         bar.resync_terminal_observe(cx);
+        bar.start_cwd_poll(cx);
         bar
+    }
+
+    fn start_cwd_poll(&mut self, cx: &mut Context<Self>) {
+        self._cwd_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(800))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.poll_focused_local_cwd(cx);
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    /// Refresh live cwd for focused Local/WSL only (SSH remote cwd stays OSC-only).
+    fn poll_focused_local_cwd(&mut self, cx: &mut Context<Self>) {
+        let term = self.tabs.read(cx).active.and_then(|id| {
+            self.tabs
+                .read(cx)
+                .tabs
+                .iter()
+                .find(|t| t.id == id)
+                .and_then(|t| t.focused_pane())
+                .filter(|p| p.kind.is_local() && p.terminal.is_some())
+                .and_then(|p| p.terminal.clone())
+        });
+        let Some(term) = term else {
+            return;
+        };
+        term.update(cx, |view, cx| {
+            view.refresh_working_directory(cx);
+        });
     }
 
     fn resync_terminal_observe(&mut self, cx: &mut Context<Self>) {
@@ -126,8 +174,6 @@ impl StatusBar {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         child: impl IntoElement,
     ) -> impl IntoElement {
-        use crate::ui::tooltip::Tooltip;
-
         div()
             .id(id)
             .flex()
@@ -147,6 +193,59 @@ impl StatusBar {
             })
             .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
             .child(child)
+    }
+
+    /// Cached session cwd (OSC / pane kind) — no `process_cwd` on the paint path.
+    fn cached_cwd(pane: Option<&crate::ui::tab_manager::PaneSession>, cx: &App) -> Option<PathBuf> {
+        let pane = pane?;
+        let from_term = pane
+            .terminal
+            .as_ref()
+            .and_then(|t| t.read(cx).working_directory());
+        if from_term.is_some() {
+            return from_term;
+        }
+        match &pane.kind {
+            ProfileKind::Local { cwd, .. } => cwd.clone(),
+            ProfileKind::Ssh { .. } => None,
+        }
+    }
+
+    fn cwd_segment(
+        cx: &mut Context<Self>,
+        full: PathBuf,
+    ) -> impl IntoElement {
+        let full_str = full.display().to_string();
+        let label = truncate_path_end(&full_str, CWD_LABEL_MAX_CHARS);
+        let tip = format!("{full_str}\nClick to copy");
+        let copy_path = full_str.clone();
+
+        div()
+            .id("sb-cwd")
+            .flex()
+            .items_center()
+            .gap(px(theme::SPACE_1))
+            .px(px(theme::SPACE_2))
+            .h_full()
+            .max_w(px(420.0))
+            .rounded(px(theme::RADIUS_SM))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::HOVER))
+            .tooltip(move |_, cx| Tooltip::text(tip.clone(), cx))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+                this.set_toast("Copied path", cx);
+            }))
+            .child(Self::svg("icons/ui/folder.svg", theme::TEXT_MUTED))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::TEXT_MUTED)
+                    .font_family(theme_font_mono())
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .child(label),
+            )
     }
 }
 
@@ -276,6 +375,8 @@ impl Render for StatusBar {
                 .map(|t| t.read(cx).dimensions())
                 .unwrap_or((0, 0));
 
+            let cwd = Self::cached_cwd(pane, cx);
+
             let left = div()
                 .flex()
                 .items_center()
@@ -322,6 +423,7 @@ impl Render for StatusBar {
                                 .child(format!("·  {profile_name}")),
                         ),
                 ))
+                .when_some(cwd, |d, path| d.child(Self::cwd_segment(cx, path)))
                 .when_some(fwd_error_label.clone(), |d, err_label| {
                     d.child(Self::segment(
                         "sb-fwd-err",
@@ -551,6 +653,20 @@ fn theme_font_mono() -> SharedString {
     } else {
         "Menlo".into()
     }
+}
+
+/// Prefer the full path; if over `max_chars`, keep the prefix and ellipsize the tail.
+fn truncate_path_end(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".into();
+    }
+    let keep = max_chars - 1;
+    let head: String = path.chars().take(keep).collect();
+    format!("{head}…")
 }
 
 impl EventEmitter<StatusBarEvent> for StatusBar {}

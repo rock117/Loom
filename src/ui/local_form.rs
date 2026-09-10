@@ -23,10 +23,18 @@ enum Field {
     Cwd,
 }
 
+/// Edit existing profile, or Save As… (create from a live session template).
+#[derive(Clone)]
+enum FormMode {
+    Edit,
+    SaveAs { template: ProfileKind },
+}
+
 pub struct LocalForm {
     pub store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
     editing: Option<Uuid>,
+    mode: FormMode,
     name: RenameEdit,
     cwd: RenameEdit,
     /// True when profile is WSL (`wsl.exe` + args) — footnote for cwd semantics.
@@ -44,6 +52,7 @@ impl LocalForm {
             store,
             focus_handle: cx.focus_handle(),
             editing: None,
+            mode: FormMode::Edit,
             name: field_edit(""),
             cwd: field_edit(""),
             is_wsl: false,
@@ -75,6 +84,7 @@ impl LocalForm {
             return;
         };
 
+        self.mode = FormMode::Edit;
         self.editing = Some(profile_id);
         self.name = field_edit(profile.name);
         self.cwd = field_edit(
@@ -83,6 +93,41 @@ impl LocalForm {
                 .unwrap_or_default(),
         );
         self.is_wsl = profile.kind.is_wsl_local();
+        self.error = None;
+        self.field = Field::Name;
+        self.selecting = false;
+        self.start_caret_blink(cx);
+        cx.notify();
+    }
+
+    /// Prefill from a live Local/WSL session for Tab **Save As…**.
+    pub fn load_for_save_as(
+        &mut self,
+        suggested_name: impl Into<String>,
+        kind: ProfileKind,
+        live_cwd: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let ProfileKind::Local { cwd: kind_cwd, .. } = &kind else {
+            self.error = Some("Not a Local session".into());
+            cx.notify();
+            return;
+        };
+        let cwd = live_cwd.or_else(|| kind_cwd.clone());
+        let base = suggested_name.into();
+        let name = unique_profile_name(&base, &self.store.read(cx).workspace.all_profile_names());
+
+        self.mode = FormMode::SaveAs {
+            template: kind.clone(),
+        };
+        self.editing = None;
+        self.name = field_edit(name);
+        self.cwd = field_edit(
+            cwd.as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        self.is_wsl = kind.is_wsl_local();
         self.error = None;
         self.field = Field::Name;
         self.selecting = false;
@@ -129,11 +174,6 @@ impl LocalForm {
     }
 
     fn submit(&mut self, cx: &mut Context<Self>) {
-        let Some(pid) = self.editing else {
-            self.error = Some("Nothing to save".into());
-            cx.notify();
-            return;
-        };
         let name = self.name.text.trim().to_string();
         if name.is_empty() {
             self.error = Some("Name is required".into());
@@ -146,15 +186,44 @@ impl LocalForm {
         } else {
             Some(PathBuf::from(cwd_raw))
         };
-        let ok = self.store.update(cx, |s, cx| {
-            s.update_local_profile(pid, name, cwd, cx)
-        });
-        if !ok {
-            self.error = Some("Could not update profile".into());
-            cx.notify();
-            return;
+
+        match &self.mode {
+            FormMode::Edit => {
+                let Some(pid) = self.editing else {
+                    self.error = Some("Nothing to save".into());
+                    cx.notify();
+                    return;
+                };
+                let ok = self.store.update(cx, |s, cx| {
+                    s.update_local_profile(pid, name, cwd, cx)
+                });
+                if !ok {
+                    self.error = Some("Could not update profile".into());
+                    cx.notify();
+                    return;
+                }
+                cx.emit(LocalFormEvent::Saved { profile_id: pid });
+            }
+            FormMode::SaveAs { template } => {
+                use crate::model::Profile;
+
+                let mut kind = template.clone();
+                if let ProfileKind::Local { cwd: stored, .. } = &mut kind {
+                    *stored = cwd;
+                }
+                let profile = Profile {
+                    id: Uuid::new_v4(),
+                    name,
+                    kind,
+                    forwards: Vec::new(),
+                };
+                let pid = self.store.update(cx, |s, cx| {
+                    let target = s.insert_target();
+                    s.place_profile(profile, target, cx)
+                });
+                cx.emit(LocalFormEvent::Saved { profile_id: pid });
+            }
         }
-        cx.emit(LocalFormEvent::Saved { profile_id: pid });
     }
 
     fn pick_cwd_folder(&mut self, cx: &mut Context<Self>) {
@@ -396,6 +465,23 @@ fn field_edit(s: impl Into<String>) -> RenameEdit {
     e
 }
 
+fn unique_profile_name(base: &str, existing: &[String]) -> String {
+    if !existing.iter().any(|n| n == base) {
+        return base.to_string();
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base} ({n})");
+        if !existing.iter().any(|e| e == &candidate) {
+            return candidate;
+        }
+        n = n.saturating_add(1);
+        if n > 10_000 {
+            return format!("{base} ({})", Uuid::new_v4());
+        }
+    }
+}
+
 fn char_to_utf16(text: &str, char_idx: usize) -> usize {
     text.chars().take(char_idx).map(|c| c.len_utf16()).sum()
 }
@@ -420,6 +506,21 @@ impl Render for LocalForm {
         let cwd_edit = self.cwd.clone();
         let is_wsl = self.is_wsl;
         let error = self.error.clone();
+        let is_save_as = matches!(self.mode, FormMode::SaveAs { .. });
+        let title = if is_save_as {
+            "Save As"
+        } else if is_wsl {
+            "WSL profile"
+        } else {
+            "Local profile"
+        };
+        let save_label = if is_save_as { "Save As" } else { "Save" };
+        let blurb = if is_save_as {
+            "Creates a new profile from this session. The original profile (if any) is left unchanged."
+        } else {
+            "Start directory is used each time you open this profile. \
+             cd in a session does not change it until you Save."
+        };
 
         div()
             .id("local-form-backdrop")
@@ -486,16 +587,13 @@ impl Render for LocalForm {
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::TEXT)
-                            .child("Local profile"),
+                            .child(title),
                     )
                     .child(
                         div()
                             .text_xs()
                             .text_color(theme::TEXT_MUTED)
-                            .child(
-                                "Start directory is used each time you open this profile. \
-                                 cd in a session does not change it until you Save cwd to profile.",
-                            ),
+                            .child(blurb),
                     )
                     .child(Self::field_row(
                         "local-name",
@@ -674,7 +772,7 @@ impl Render for LocalForm {
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .cursor_pointer()
-                                    .child("Save")
+                                    .child(save_label)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, _, _, cx| {
