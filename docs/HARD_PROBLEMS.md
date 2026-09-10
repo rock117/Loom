@@ -60,6 +60,7 @@ GPUI runs layout → prepaint → paint and input dispatch on the **window / UI 
 1. **`term_arc` / `with_term*`:** at most one owner on a call stack. Paint already locking ⇒ no `with_term*`.
 2. **SSH / PTY / disk:** never on the frame or click stack without an async boundary (existing SSH connect path is the template).
 3. New terminal chrome (gutter, find, minimap): compute layout from **cached metrics**, draw from **already-locked** `&Term` or a snapshot.
+4. **Live Local cwd:** OSC/cache is best-effort (many shells never report `cd`). User actions that need the **true** current directory (**Save**, Copy Path, Reveal) must call `refresh_working_directory()` first. Quit/flush must **not** — that path hangs (row above / [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)).
 
 ### C. How to diagnose quickly
 
@@ -190,7 +191,8 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **完整说明：** [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)。  
 **协议：** [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md)。
 
-**代码：** `src/ui/workspace_view.rs`、`src/ui/persistence.rs`、`src/ui/tab_manager.rs` (`bound_local_cwds`)。
+**代码：** `src/ui/workspace_view.rs`、`src/ui/persistence.rs`、`src/ui/tab_manager.rs`。  
+**后续：** Profile start dir 已不再在 flush 时从 live cwd 写回（见 [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md) 规则 9），进一步消除关窗路径上的 `process_cwd`。
 
 ---
 

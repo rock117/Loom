@@ -282,13 +282,18 @@ impl Sidebar {
         moves: Vec<(Uuid, String)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_ssh = self
+        let (is_ssh, is_local) = self
             .store
             .read(cx)
             .workspace
             .find_profile(pid)
-            .map(|p| matches!(p.kind, ProfileKind::Ssh { .. }))
-            .unwrap_or(false);
+            .map(|p| {
+                (
+                    matches!(p.kind, ProfileKind::Ssh { .. }),
+                    matches!(p.kind, ProfileKind::Local { .. }),
+                )
+            })
+            .unwrap_or((false, false));
         let in_group = self
             .store
             .read(cx)
@@ -320,6 +325,17 @@ impl Sidebar {
                     cx,
                     move |_, _, cx| {
                         cx.emit(SidebarEvent::EditSshProfile(pid));
+                    },
+                ))
+            })
+            .when(is_local, |d| {
+                d.child(self.menu_item(
+                    "ctx-edit-local",
+                    "Edit Local…",
+                    false,
+                    cx,
+                    move |_, _, cx| {
+                        cx.emit(SidebarEvent::EditLocalProfile(pid));
                     },
                 ))
             })
@@ -426,10 +442,13 @@ impl Sidebar {
                 false,
                 cx,
                 move |this, _, cx| {
-                    this.store.update(cx, |s, cx| {
+                    let id = this.store.update(cx, |s, cx| {
                         s.select_group(gid, cx);
-                        s.add_local_profile(cx);
+                        s.add_local_profile(cx)
                     });
+                    if let Some(id) = id {
+                        cx.emit(SidebarEvent::EditLocalProfile(id));
+                    }
                 },
             ))
             .child(self.menu_item(
@@ -566,9 +585,12 @@ impl Render for Sidebar {
                                 false,
                                 cx,
                                 |this, _, cx| {
-                                    this.store.update(cx, |s, cx| {
-                                        s.add_local_profile(cx);
-                                    });
+                                    let id = this
+                                        .store
+                                        .update(cx, |s, cx| s.add_local_profile(cx));
+                                    if let Some(id) = id {
+                                        cx.emit(SidebarEvent::EditLocalProfile(id));
+                                    }
                                 },
                             ))
                             .when(cfg!(windows), |d| {
@@ -1109,6 +1131,7 @@ pub enum SidebarEvent {
     OpenSshForm,
     OpenWslForm,
     EditSshProfile(Uuid),
+    EditLocalProfile(Uuid),
 }
 
 impl EventEmitter<SidebarEvent> for Sidebar {}

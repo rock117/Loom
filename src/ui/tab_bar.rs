@@ -303,6 +303,18 @@ impl TabBar {
             .find(|t| t.id == tab_id)
             .and_then(|t| t.focused_pane())
             .is_some_and(|p| p.profile_id.is_none());
+        let focused_bound = manager
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.focused_pane())
+            .is_some_and(|p| p.profile_id.is_some());
+        let focused_bound_local = manager
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.focused_pane())
+            .is_some_and(|p| p.profile_id.is_some() && p.kind.is_local());
         let current_group = profile_id.and_then(|pid| {
             self.store
                 .read(cx)
@@ -412,42 +424,29 @@ impl TabBar {
                 },
             ));
 
-        if focused_ephemeral {
+        if focused_bound_local {
             menu = menu.child(self.menu_divider()).child(self.menu_item(
-                "tab-ctx-save-root",
-                "Save to / (root)",
+                "tab-ctx-save",
+                "Save",
                 true,
                 cx,
                 move |_, _, cx| {
-                    cx.emit(TabBarEvent::SaveTab {
-                        tab_id,
-                        group_id: None,
-                    });
+                    cx.emit(TabBarEvent::SaveCwdToProfile { tab_id });
                 },
             ));
-            for (gid, name, depth, _) in self.store.read(cx).workspace.walk_groups_all() {
-                let indent = "  ".repeat(depth as usize);
-                let label: SharedString = format!("{indent}Save to {name}").into();
-                menu = menu.child(
-                    div()
-                        .id(SharedString::from(format!("tab-ctx-save-{gid}")))
-                        .w_full()
-                        .px(px(theme::SPACE_2))
-                        .py(px(theme::SPACE_1))
-                        .rounded(px(theme::RADIUS_SM))
-                        .text_color(theme::TEXT)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme::HOVER))
-                        .child(label)
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.emit(TabBarEvent::SaveTab {
-                                tab_id,
-                                group_id: Some(gid),
-                            });
-                            cx.stop_propagation();
-                        })),
-                );
-            }
+        }
+
+        // Save As… — single item; opens create dialog (same as New).
+        if focused_ephemeral || focused_bound {
+            menu = menu.child(self.menu_divider()).child(self.menu_item(
+                "tab-ctx-save-as",
+                "Save As…",
+                true,
+                cx,
+                move |_, _, cx| {
+                    cx.emit(TabBarEvent::SaveAs { tab_id });
+                },
+            ));
         }
 
         if let Some(pid) = profile_id {
@@ -945,11 +944,10 @@ pub enum TabBarEvent {
     Split(SplitDirection),
     /// Duplicate focused tab as ephemeral session.
     DuplicateTab,
-    /// Save ephemeral tab to workspace root (`group_id: None`) or a group.
-    SaveTab {
-        tab_id: Uuid,
-        group_id: Option<Uuid>,
-    },
+    /// Save As… — open New-style profile dialog for the focused pane.
+    SaveAs { tab_id: Uuid },
+    /// Save — write focused Bound Local cwd into the existing profile start directory.
+    SaveCwdToProfile { tab_id: Uuid },
 }
 
 impl EventEmitter<TabBarEvent> for TabBar {}

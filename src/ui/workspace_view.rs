@@ -6,6 +6,7 @@ use crate::shared::actions::*;
 use crate::shared::theme;
 use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
+use crate::ui::local_form::{LocalForm, LocalFormEvent};
 use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
 use crate::ui::persistence::Persistence;
 use crate::ui::settings::{SettingsEvent, SettingsPanel};
@@ -52,6 +53,7 @@ pub struct WorkspaceView {
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
     wsl_form: Entity<WslForm>,
+    local_form: Entity<LocalForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
     pending_password: Option<PendingPasswordAction>,
     sidebar_width: f32,
@@ -63,6 +65,9 @@ pub struct WorkspaceView {
     show_settings: bool,
     show_ssh_form: bool,
     show_wsl_form: bool,
+    show_local_form: bool,
+    /// Tab waiting for Save As… dialog to create a profile, then bind.
+    pending_save_as_tab: Option<uuid::Uuid>,
     restore_tabs: Vec<(uuid::Uuid, Option<String>)>,
     _subscriptions: Vec<Subscription>,
 }
@@ -108,6 +113,7 @@ impl WorkspaceView {
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
         let wsl_form = cx.new(|cx| WslForm::new(store.clone(), cx));
+        let local_form = cx.new(|cx| LocalForm::new(store.clone(), cx));
         let workspace_weak = cx.weak_entity();
         let persistence = cx.new(|cx| {
             Persistence::new(app_bus.clone(), store.clone(), workspace_weak, cx)
@@ -137,6 +143,7 @@ impl WorkspaceView {
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
             wsl_form: wsl_form.clone(),
+            local_form: local_form.clone(),
             password_prompt: None,
             pending_password: None,
             sidebar_width,
@@ -148,6 +155,8 @@ impl WorkspaceView {
             show_settings: false,
             show_ssh_form: false,
             show_wsl_form: false,
+            show_local_form: false,
+            pending_save_as_tab: None,
             restore_tabs,
             _subscriptions: Vec::new(),
         };
@@ -185,6 +194,7 @@ impl WorkspaceView {
                     this.show_settings = true;
                     this.show_ssh_form = false;
                     this.show_wsl_form = false;
+                    this.show_local_form = false;
                     this.password_prompt = None;
                     cx.notify();
                 }
@@ -192,6 +202,7 @@ impl WorkspaceView {
                     this.ssh_form.update(cx, |f, cx| f.reset(cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -203,6 +214,7 @@ impl WorkspaceView {
                     this.wsl_form.update(cx, |f, cx| f.reset(cx));
                     this.show_wsl_form = true;
                     this.show_ssh_form = false;
+                    this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -215,12 +227,16 @@ impl WorkspaceView {
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
                     cx.defer_in(window, |this, window, cx| {
                         this.ssh_form.read(cx).focus(window);
                     });
+                }
+                SidebarEvent::EditLocalProfile(id) => {
+                    this.open_local_form(*id, window, cx);
                 }
             },
         ));
@@ -231,6 +247,7 @@ impl WorkspaceView {
             move |this, _, event: &SshFormEvent, window, cx| match event {
                 SshFormEvent::Close => {
                     this.show_ssh_form = false;
+                    this.pending_save_as_tab = None;
                     cx.notify();
                 }
                 SshFormEvent::Saved {
@@ -239,8 +256,12 @@ impl WorkspaceView {
                     oneshot_password,
                 } => {
                     this.show_ssh_form = false;
-                    if *connect {
+                    if this.finish_pending_save_as(*profile_id, cx) {
+                        // Bound current session; do not open a second tab.
+                    } else if *connect {
                         this.connect_ssh(*profile_id, oneshot_password.clone(), window, cx);
+                    } else {
+                        this.set_toast("Saved successfully", cx);
                     }
                     cx.notify();
                 }
@@ -265,6 +286,27 @@ impl WorkspaceView {
                     this.show_wsl_form = false;
                     if *connect {
                         this.open_profile_id(*profile_id, window, cx);
+                    } else {
+                        this.set_toast("Saved successfully", cx);
+                    }
+                    cx.notify();
+                }
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
+            &local_form,
+            window,
+            move |this, _, event: &LocalFormEvent, _window, cx| match event {
+                LocalFormEvent::Close => {
+                    this.show_local_form = false;
+                    this.pending_save_as_tab = None;
+                    cx.notify();
+                }
+                LocalFormEvent::Saved { profile_id } => {
+                    this.show_local_form = false;
+                    if !this.finish_pending_save_as(*profile_id, cx) {
+                        this.set_toast("Saved successfully", cx);
                     }
                     cx.notify();
                 }
@@ -287,8 +329,11 @@ impl WorkspaceView {
                 TabBarEvent::DuplicateTab => {
                     this.request_duplicate_tab(window, cx);
                 }
-                TabBarEvent::SaveTab { tab_id, group_id } => {
-                    this.save_tab_to_group(*tab_id, *group_id, cx);
+                TabBarEvent::SaveAs { tab_id } => {
+                    this.begin_save_as(*tab_id, window, cx);
+                }
+                TabBarEvent::SaveCwdToProfile { tab_id } => {
+                    this.save_cwd_to_profile(*tab_id, cx);
                 }
             },
         ));
@@ -305,6 +350,7 @@ impl WorkspaceView {
                     this.show_settings = true;
                     this.show_ssh_form = false;
                     this.show_wsl_form = false;
+                    this.show_local_form = false;
                     this.password_prompt = None;
                     cx.notify();
                 }
@@ -313,12 +359,16 @@ impl WorkspaceView {
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
                     cx.notify();
                     cx.defer_in(window, |this, window, cx| {
                         this.ssh_form.read(cx).focus(window);
                     });
+                }
+                StatusBarEvent::EditLocalProfile(id) => {
+                    this.open_local_form(*id, window, cx);
                 }
                 StatusBarEvent::ToggleSidebar => {
                     this.toggle_sidebar(window, cx);
@@ -522,6 +572,7 @@ impl WorkspaceView {
         self.show_settings = false;
         self.show_ssh_form = false;
         self.show_wsl_form = false;
+        self.show_local_form = false;
         cx.notify();
         cx.defer_in(window, |this, window, cx| {
             if let Some(prompt) = this.password_prompt.as_ref() {
@@ -738,105 +789,157 @@ impl WorkspaceView {
         self.persist_tabs(cx);
     }
 
-    /// Persist an ephemeral tab as a Profile under root or a group.
-    fn save_tab_to_group(
+    fn open_local_form(
         &mut self,
-        tab_id: uuid::Uuid,
-        group_id: Option<uuid::Uuid>,
+        profile_id: uuid::Uuid,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use crate::model::Profile;
-        use crate::ui::workspace_store::InsertTarget;
+        self.pending_save_as_tab = None;
+        self.local_form
+            .update(cx, |f, cx| f.load_for_edit(profile_id, cx));
+        self.show_local_form = true;
+        self.show_ssh_form = false;
+        self.show_wsl_form = false;
+        self.show_settings = false;
+        self.password_prompt = None;
+        cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            this.local_form.read(cx).focus(window);
+        });
+    }
 
-        let Some((mut kind, label, live_cwd)) =
-            self.tabs.read(cx).tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
-                t.panes.get(&t.focused).map(|p| {
-                    let cwd = p
-                        .terminal
-                        .as_ref()
-                        .and_then(|term| term.read(cx).working_directory());
-                    (p.kind.clone(), p.label.clone(), cwd)
-                })
-            })
-        else {
+    /// Explicitly write focused Bound Local pane cwd into the profile start directory.
+    fn save_cwd_to_profile(&mut self, tab_id: uuid::Uuid, cx: &mut Context<Self>) {
+        let Some((pid, cwd)) = self.tabs.update(cx, |m, cx| {
+            m.capture_focused_bound_local_cwd_for_save(tab_id, cx)
+        }) else {
+            self.set_toast("No Bound Local cwd to save", cx);
             return;
         };
-        // Focused pane already Bound — nothing to save (Save targets ephemeral focus).
-        if self
+        let path_label = cwd.display().to_string();
+        self.store.update(cx, |s, cx| {
+            s.update_local_profile_cwd(pid, cwd, cx);
+            s.persist_now();
+        });
+        self.set_toast(format!("Saved successfully · {path_label}"), cx);
+    }
+
+    /// Open New-style dialog for Save As… (Local form or SSH form).
+    fn begin_save_as(
+        &mut self,
+        tab_id: uuid::Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snap = self.tabs.read(cx).tabs.iter().find(|t| t.id == tab_id).and_then(|t| {
+            t.panes.get(&t.focused).map(|p| {
+                let cwd = p
+                    .terminal
+                    .as_ref()
+                    .and_then(|term| term.read(cx).working_directory());
+                (
+                    p.kind.clone(),
+                    p.label.clone(),
+                    cwd,
+                    p.session_password.clone(),
+                )
+            })
+        });
+        let Some((kind, label, cwd, session_password)) = snap else {
+            self.set_toast("Nothing to save", cx);
+            return;
+        };
+
+        self.pending_save_as_tab = Some(tab_id);
+        self.show_settings = false;
+        self.password_prompt = None;
+
+        match kind {
+            ProfileKind::Local { .. } => {
+                self.local_form.update(cx, |f, cx| {
+                    f.load_for_save_as(label, kind, cwd, cx);
+                });
+                self.show_local_form = true;
+                self.show_ssh_form = false;
+                self.show_wsl_form = false;
+                cx.notify();
+                cx.defer_in(window, |this, window, cx| {
+                    this.local_form.read(cx).focus(window);
+                });
+            }
+            ProfileKind::Ssh { .. } => {
+                self.ssh_form.update(cx, |f, cx| {
+                    f.load_for_save_as(label, kind, session_password, cx);
+                });
+                self.show_ssh_form = true;
+                self.show_local_form = false;
+                self.show_wsl_form = false;
+                cx.notify();
+                cx.defer_in(window, |this, window, cx| {
+                    this.ssh_form.read(cx).focus(window);
+                });
+            }
+        }
+    }
+
+    /// After Save As dialog creates a profile: bind the pending tab. Returns true if handled.
+    fn finish_pending_save_as(
+        &mut self,
+        profile_id: uuid::Uuid,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab_id) = self.pending_save_as_tab.take() else {
+            return false;
+        };
+        let was_bound = self
             .tabs
             .read(cx)
             .tabs
             .iter()
             .find(|t| t.id == tab_id)
             .and_then(|t| t.panes.get(&t.focused))
-            .and_then(|p| p.profile_id)
-            .is_some()
-        {
-            return;
-        }
-
-        if let (ProfileKind::Local { cwd: c, .. }, Some(path)) = (&mut kind, live_cwd) {
-            *c = Some(path);
-        }
-
-        let names = self.store.read(cx).workspace.all_profile_names();
-        let mut name = label;
-        if names.iter().any(|n| n == &name) {
-            let mut n = 2u32;
-            loop {
-                let candidate = format!("{name} ({n})");
-                if !names.iter().any(|e| e == &candidate) {
-                    name = candidate;
-                    break;
-                }
-                n += 1;
-            }
-        }
-        let profile = Profile {
-            id: uuid::Uuid::new_v4(),
-            name: name.clone(),
-            kind,
-            forwards: Vec::new(),
-        };
-        let pid = profile.id;
-        let target = match group_id {
-            Some(gid) => InsertTarget::Group(gid),
-            None => InsertTarget::Root,
-        };
-        self.store.update(cx, |s, cx| {
-            s.place_profile(profile, target, cx);
-        });
+            .is_some_and(|p| p.profile_id.is_some());
+        let name = self
+            .store
+            .read(cx)
+            .workspace
+            .find_profile(profile_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "Profile".into());
         self.tabs.update(cx, |m, cx| {
-            m.bind_ephemeral_panes_in_tab(tab_id, pid, name, cx);
+            if was_bound {
+                m.rebind_focused_and_ephemeral_to_profile(tab_id, profile_id, name.clone(), cx);
+            } else {
+                m.bind_ephemeral_panes_in_tab(tab_id, profile_id, name.clone(), cx);
+            }
         });
         self.persist_tabs(cx);
+        self.set_toast("Saved successfully", cx);
+        true
     }
 
-    /// Flush open tabs + Bound Local cwds to disk (Ctrl+S / debounce).
-    /// Refreshes live cwd via sysinfo — do **not** use on the window-close path.
+    /// Flush open tabs to disk (Ctrl+S / debounce / quit).
+    /// Bound Local start directories are **not** overwritten from live shell cwd.
     pub fn flush_persist(&mut self, cx: &mut App) {
-        self.flush_persist_inner(true, cx);
+        self.flush_persist_inner(cx);
     }
 
-    /// Quit/close flush: use cached cwd only (no `process_cwd`) so WM_CLOSE cannot block.
+    /// Quit/close flush (no process_cwd — see WINDOW_CLOSE_HANG).
     pub fn flush_persist_for_quit(&mut self, cx: &mut App) {
-        self.flush_persist_inner(false, cx);
+        self.flush_persist_inner(cx);
     }
 
-    fn flush_persist_inner(&mut self, refresh_cwd: bool, cx: &mut App) {
+    fn flush_persist_inner(&mut self, cx: &mut App) {
         let sidebar_width = self.sidebar_width;
         let sidebar_visible = self.sidebar_visible;
         let context_panel_width = self.context_panel_width;
         let context_panel_visible = self.context_panel_visible;
-        let (tabs, active, font_size, local_cwds) = self.tabs.update(cx, |m, cx| {
-            let cwds = m.bound_local_cwds(refresh_cwd, cx);
+        let (tabs, active, font_size) = self.tabs.update(cx, |m, _cx| {
             let (tabs, active) = m.snapshot_for_persist();
-            (tabs, active, m.font_size, cwds)
+            (tabs, active, m.font_size)
         });
-        self.store.update(cx, |s, cx| {
-            for (pid, cwd) in local_cwds {
-                s.update_local_profile_cwd(pid, cwd, cx);
-            }
+        self.store.update(cx, |s, _cx| {
             s.ui_state.sidebar_width = sidebar_width;
             s.ui_state.sidebar_visible = sidebar_visible;
             s.ui_state.context_panel_width = context_panel_width;
@@ -1089,6 +1192,12 @@ impl Render for WorkspaceView {
             }))
             .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| {
                 this.show_settings = !this.show_settings;
+                if this.show_settings {
+                    this.show_ssh_form = false;
+                    this.show_wsl_form = false;
+                    this.show_local_form = false;
+                    this.password_prompt = None;
+                }
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| {
@@ -1236,6 +1345,7 @@ impl Render for WorkspaceView {
             .when(self.show_settings, |d| d.child(self.settings.clone()))
             .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
             .when(self.show_wsl_form, |d| d.child(self.wsl_form.clone()))
+            .when(self.show_local_form, |d| d.child(self.local_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
             // Full-window backdrop under TabBar menus (priority 0); menu uses priority 1.
             .when(tab_menus_open, |d| {

@@ -220,6 +220,80 @@ impl SshForm {
         self.focus_handle.focus(window);
     }
 
+    /// Prefill from a live SSH session for Tab **Save As…** (always creates a new profile).
+    pub fn load_for_save_as(
+        &mut self,
+        suggested_name: impl Into<String>,
+        kind: ProfileKind,
+        session_password: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let ProfileKind::Ssh {
+            host,
+            port,
+            user,
+            auth,
+        } = kind
+        else {
+            self.error = Some("Not an SSH session".into());
+            cx.notify();
+            return;
+        };
+
+        self.reset(cx);
+        self.editing = None;
+        let base = {
+            let n = suggested_name.into();
+            if n.trim().is_empty() {
+                format!("{user}@{host}")
+            } else {
+                n
+            }
+        };
+        let names = self.store.read(cx).workspace.all_profile_names();
+        let name = {
+            if !names.iter().any(|n| n == &base) {
+                base
+            } else {
+                let mut n = 2u32;
+                loop {
+                    let candidate = format!("{base} ({n})");
+                    if !names.iter().any(|e| e == &candidate) {
+                        break candidate;
+                    }
+                    n = n.saturating_add(1);
+                    if n > 10_000 {
+                        break format!("{base} ({})", Uuid::new_v4());
+                    }
+                }
+            }
+        };
+        self.name = field_edit(name);
+        self.host = field_edit(host);
+        self.port = field_edit(port.to_string());
+        self.user = field_edit(user);
+        self.forwards.clear();
+        self.forwards_open = false;
+        self.has_stored_password = false;
+        match auth {
+            SshAuth::Password { remember } => {
+                self.use_private_key = false;
+                self.remember = remember;
+                self.key_path = field_edit("");
+                self.password = field_edit(session_password.unwrap_or_default());
+            }
+            SshAuth::PrivateKey { path } => {
+                self.use_private_key = true;
+                self.remember = false;
+                self.key_path = field_edit(path.display().to_string());
+                self.password = field_edit("");
+            }
+        }
+        self.field = Field::Name;
+        self.start_caret_blink(cx);
+        cx.notify();
+    }
+
     fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
         self._caret_blink = Some(cx.spawn(async move |this, cx| {
             loop {

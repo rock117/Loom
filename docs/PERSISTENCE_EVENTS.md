@@ -22,7 +22,7 @@
 | 2 | 退出语义 **B**：只 `emit(WillQuit)`；在 Persistence 回调里 flush 后再 `cx.quit()`；Ctrl+Q 与关窗同一条路径 |
 | 3 | 单独 **`AppBus` Entity** 作为发射方 |
 | 4 | 新建 **`Persistence` Entity** 作为写盘监听者 |
-| 5 | **`BoundLocalCwdChanged`**：只改内存 + `mark_dirty`；真正落盘靠 `WillQuit` / `PersistRequested` / **定时（debounce）** |
+| 5 | ~~`BoundLocalCwdChanged`~~：**已移除**。Bound Local start dir 仅由 Edit Local / Tab **Save** 显式更新（见 [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md) 规则 9） |
 
 ## 实体与事件
 
@@ -33,10 +33,9 @@ AppBus  ──emit──►  AppBusEvent
                  Persistence（subscribe）
                       │
          ┌────────────┼────────────┐
-         ▼            ▼            ▼
-     WillQuit   PersistRequested  BoundLocalCwdChanged
-     flush+quit  debounce flush   更新 profile cwd + dirty
-                                   （并踢一脚 debounce）
+         ▼            ▼            
+     WillQuit   PersistRequested  
+     flush+quit  debounce flush   
 ```
 
 ### `AppBusEvent`
@@ -47,11 +46,7 @@ pub enum AppBusEvent {
     WillQuit,
     /// 会话 / UI 等需要落盘：合并进 debounce 后 flush。
     PersistRequested,
-    /// Bound Local 会话 cwd 变化：只更新 store 内存并 mark_dirty。
-    BoundLocalCwdChanged {
-        profile_id: Uuid,
-        path: PathBuf,
-    },
+    // … SplitPane / ReconnectPane / DuplicateActiveTab / Toast …
 }
 ```
 
@@ -62,8 +57,7 @@ pub enum AppBusEvent {
 持有：
 
 - `Entity<AppBus>`（订阅）
-- `Entity<WorkspaceStore>`、`Entity<TabManager>`
-- `WeakEntity<WorkspaceView>`（调用现有 `flush_persist`：同步 tabs / Bound cwd / UI 尺寸）
+- `Entity<WorkspaceStore>`、`WeakEntity<WorkspaceView>`
 - debounce 任务句柄
 - `flushed_for_quit`（避免重复 quit / 关窗兜底）
 
@@ -71,57 +65,29 @@ pub enum AppBusEvent {
 
 | 事件 | 行为 |
 |------|------|
-| `BoundLocalCwdChanged` | `update_local_profile_cwd`（已有：改内存 + `mark_dirty`，**不** `persist_now`）→ 调度 debounce |
 | `PersistRequested` | 调度 debounce（短间隔合并多次 tab/UI 变更） |
-| `WillQuit` | 取消 debounce → **立即** `flush_persist` → `cx.quit()` |
+| `WillQuit` | 取消 debounce → **立即** `flush_persist_for_quit` → `cx.quit()` |
 
-**Debounce**：约 **300ms**；到时若仍需要写盘，经 `WorkspaceView::flush_persist` 全量同步后 `persist_now`。  
-`WillQuit` 与显式「立刻保存」需求都走立即路径（`WillQuit` 必立即；`PersistRequested` 用 debounce 即可，Ctrl+S 也 emit `PersistRequested`——若需「保存完立刻 toast」可在 debounce 前再立即 flush 一次，实现时 Ctrl+S 采用 **立即 flush**）。
+**Debounce**：约 **300ms**；到时经 `WorkspaceView::flush_persist` 同步 open_tabs / UI 尺寸后 `persist_now`。  
+`flush_persist` **不再**把 live shell cwd 写回 Local Profile。
 
-## 谁 emit
-
-| 事件 | 发射方 |
-|------|--------|
-| `WillQuit` | `WorkspaceView`（`QuitApp`）；窗口 `on_window_should_close`（点 X） |
-| `PersistRequested` | `WorkspaceView`（原 `persist_tabs()` 调用点） |
-| `BoundLocalCwdChanged` | `TabManager`（收到 `TerminalViewEvent::WorkingDirectoryChanged` 且为 Bound Local 后） |
-
-辅助：`AppBus::emit` 通过 `app_bus.update(cx, \|_, cx\| cx.emit(...))`。
-
-## 退出路径（方案 B，2026-09-05 修订）
+### 关窗
 
 ```text
-Ctrl+Q                          窗口标题栏 X
-    │                                 │
-    ▼                                 ▼
-emit(WillQuit)              on_window_should_close:
-    │                         prepare_window_close()
-    │                         （flush_for_quit，无 process_cwd）
-    │                         return true → DestroyWindow
-    └────────────┬────────────┘
-                 ▼
-          Persistence
-           flush_persist_for_quit   ← 只用缓存 cwd
-           flushed_for_quit = true
-           （Ctrl+Q 再 cx.quit()；点 X 靠 on_window_closed）
+点 X → prepare_window_close → flush_persist_for_quit → return true
+Ctrl+Q → WillQuit → flush_persist_for_quit → cx.quit()
 ```
 
 - **禁止**在 `QuitApp` 里直接 `persist_tabs` + `quit`。
-- **禁止**把 `observe_release → flush_persist` 当主路径；若保留，仅作 `!flushed_for_quit` 时的兜底。
-- 点 X **不再** `return false` 等待 Effect：避免 flush/`process_cwd` 堵在 WM_CLOSE 里变成「未响应」。见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)。
-
-### 已知风险（长会话关窗）— 已缓解
-
-`WillQuit` / 关窗 flush **不得**在 UI 线程同步调用 `process_cwd`。关窗用 `flush_persist_for_quit`（缓存 cwd）；Ctrl+S / debounce 仍可用带 refresh 的 `flush_persist`。细节见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)、[LOGGING.md](./LOGGING.md)。
+- **禁止**在 UI 线程为写 Profile 而同步 `process_cwd`（关窗卡死历史见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)）。
 
 ## 与现有代码的对应
 
 | 现状 | 第一阶段后 |
 |------|------------|
 | `QuitApp` → `persist_tabs` → `quit` | `emit(WillQuit)` |
-| `observe_release` → `flush_persist` | `should_close` → `WillQuit`；release 仅兜底 |
 | `persist_tabs()` 多处 | `emit(PersistRequested)` |
-| TabManager 内 `update_local_profile_cwd` + `persist_now` | emit `BoundLocalCwdChanged`；Persistence 只更新内存 + dirty + debounce |
+| live `cd` → Profile cwd | **不写回**；显式 Edit Local / Save cwd |
 | Settings / Profile CRUD 内 `persist_now` | **不变**（非本阶段） |
 
 ## 非目标（第二阶段不做）
@@ -129,12 +95,3 @@ emit(WillQuit)              on_window_should_close:
 - 把 Settings / Profile CRUD 的 `persist_now` 全部改为事件
 - 全局 EventBus / 字符串 topic
 - 后台线程写盘（若 IO 变热再单开）
-
-## 实施清单
-
-1. 文档（本文）
-2. `app_bus.rs` + `persistence.rs`，接入 `ui` 模块
-3. `WorkspaceView::new` 创建并挂住 `AppBus` / `Persistence`；替换 `persist_tabs` / `QuitApp`；注册 `on_window_should_close`
-4. `TabManager` 持有 `AppBus`，cwd 路径改 emit
-5. `app.rs` 去掉（或降级）`observe_release` 主路径 flush
-6. `cargo check`

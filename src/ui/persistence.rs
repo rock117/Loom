@@ -31,14 +31,6 @@ impl Persistence {
             match event {
                 AppBusEvent::WillQuit => this.on_will_quit(cx),
                 AppBusEvent::PersistRequested => this.schedule_debounce(cx),
-                AppBusEvent::BoundLocalCwdChanged { profile_id, path } => {
-                    let profile_id = *profile_id;
-                    let path = path.clone();
-                    this.store.update(cx, |s, cx| {
-                        s.update_local_profile_cwd(profile_id, path, cx);
-                    });
-                    this.schedule_debounce(cx);
-                }
                 AppBusEvent::SplitPane { .. } => {}
                 AppBusEvent::ReconnectPane { .. } => {}
                 AppBusEvent::DuplicateActiveTab => {}

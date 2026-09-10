@@ -11,6 +11,7 @@ Before UI / terminal / session changes, skim:
 2. **`docs/TERMINAL_IME.md`** — printable/CJK → InputHandler; Enter → KeyDown; `handle_input` FocusHandle must match the focused surface.
 3. **`docs/TEXT_FIELDS.md`** — every text field: `RenameEdit` + select + copy/cut/paste (+ IME if focused).
 4. **`docs/WINDOWS_SUBSYSTEM.md`** / **`docs/PLATFORM_SHELL.md`** — GUI `loom.exe` ≠ hidden children; background helpers need `CREATE_NO_WINDOW`.
+5. **Live shell cwd** — cache/OSC is often stale; see quick rule below (and [SESSION_PROFILE_IA.md](../../docs/SESSION_PROFILE_IA.md) § cwd).
 
 **Quick bans:**
 - Bare `String` input with only push/pop and no selection
@@ -18,6 +19,14 @@ Before UI / terminal / session changes, skim:
 - `with_term*` while paint already holds `term_arc`
 - Sync SSH / disk / `recv` / keyring on the UI thread
 - Windows **background** helpers via bare `Command::new` / `std::process::Command::new` for console apps (`wsl.exe`, `powershell`, `cmd`, `nvidia-smi`, `where`, …) — use `crate::platform::new_command` instead (sets `CREATE_NO_WINDOW`). Double-click release must not pop visible terminals.
+- Reading `TerminalView::working_directory()` / pane `kind.cwd` as **ground truth for a user Save / Copy Path / Reveal** without `refresh_working_directory()` first (OSC/`cd` often never updates the cache)
+
+**Live cwd (two clocks):**
+| Need | Do |
+|------|-----|
+| Paint, Files panel, session-only tracking | Cached `working_directory` / pane cwd (OSC when present) |
+| User action that **persists or reveals** “current dir” (Tab **Save**, Copy Path, Reveal) | `refresh_working_directory()` → `platform::process_cwd` then read |
+| Quit / close / debounce flush | **Never** `process_cwd` — hang risk ([WINDOW_CLOSE_HANG.md](../../docs/WINDOW_CLOSE_HANG.md)) |
 
 **Allowed bare `Command` (exceptions):**
 - Integrated terminal user shell via `portable-pty` / ConPTY (intentional PTY)

@@ -26,6 +26,7 @@ pub enum StatusBarEvent {
     Reconnect(Uuid),
     OpenSettings,
     EditSshProfile(Uuid),
+    EditLocalProfile(Uuid),
     /// Toggle profiles sidebar visibility (Zed left-dock).
     ToggleSidebar,
     /// Toggle right context panel visibility.
@@ -285,14 +286,18 @@ impl Render for StatusBar {
                     cx,
                     if is_ssh {
                         "Edit SSH Profile"
+                    } else if profile_id.is_some() {
+                        "Edit Local Profile"
                     } else {
                         "Session"
                     },
                     None,
                     move |_, _, cx| {
-                        if is_ssh {
-                            if let Some(profile_id) = profile_id {
+                        if let Some(profile_id) = profile_id {
+                            if is_ssh {
                                 cx.emit(StatusBarEvent::EditSshProfile(profile_id));
+                            } else {
+                                cx.emit(StatusBarEvent::EditLocalProfile(profile_id));
                             }
                         }
                     },

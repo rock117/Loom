@@ -82,9 +82,12 @@ PaneSession {
 4. **新建 / 侧栏 Duplicate Profile → 只改收藏，不自动打开** Session。
 5. **工作区再开为临时**：Ctrl+T、Tab/终端 Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。
 6. **点侧栏 Profile → Bound Session**（可持久恢复）。
-7. **Tab 右键「Save to…」**（仅当 **focused Pane 为 Ephemeral**）：新建 Profile，并把该 Tab 内 **所有 Ephemeral Pane** bind 为 Bound；已有 Bound 叶子不动。
+7. **Tab 右键 Save / Save As…**（文件隐喻）：
+   - **Bound**（已有 Profile）→ **Save**（仅 Bound Local：写回 start dir）+ **Save As…**（单一菜单；弹出与新建相同的表单，确认后建新 Profile 并绑定当前会话）。
+   - **Ephemeral** → 仅 **Save As…**（同上弹框）。
 8. **重启不恢复临时 tab**；`open_tabs` 只写 Bound Tab。
-9. **Bound Local**：关闭/持久化时把 Bound Pane 的 shell cwd 写回 Profile。
+9. **Bound Local start directory**：打开 Profile 时用 Profile 里存的 start dir；会话内 `cd` **只**更新该 Pane 内存 cwd（Files 等），**不**静默写回 Profile。写回仅通过 **Edit Local…** / 状态栏，或 Tab 右键 **Save**。Save / Save As 成功后 toast **Saved successfully**。
+   - **cwd 两套时钟：** OSC / 缓存的 `working_directory` 常因 shell 未上报而过期；凡用户动作要「当前真实目录」（**Save**、Copy Path、Reveal）必须先 `refresh_working_directory()`（`process_cwd`）。关窗 / flush **禁止** `process_cwd`（见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)）。
 10. **SSH 密码 UI**（打开 / Duplicate / Split / Reconnect）与底层 resolve 同一套优先级；仅当内存与 keyring 都没有时才弹窗，禁止只改 status / `eprintln`。
 11. **Reconnect 粒度**：状态栏 = 该 Tab **全部** Pane；Failed 占位按钮 = **单** Pane；两者密码路径对称（优先各 pane 的 `session_password`）。
 12. **Connecting ≠ Failed**：`terminal == None` 时两者都有；Close/Reconnect 按钮只给 Failed/Disconnected。
@@ -100,7 +103,8 @@ PaneSession {
 | Tab / 终端 / Ctrl+Shift+D Duplicate | 否 | **是** | 是（1） | Ephemeral（SSH 带 `auth_profile_id`） |
 | Split | 否 | 否 | **是** | Ephemeral（SSH 带 `auth_profile_id`） |
 | Ctrl+T | 否 | **是** | 是（1） | Ephemeral Local |
-| Save to… | **是** | 否 | 否 | focused 及同 Tab 其它 Ephemeral → Bound |
+| Save（Bound Local） | 否（写回 start dir） | 否 | 否 | — |
+| Save As… | **是**（弹框确认） | 否 | 否 | 绑定当前会话到新 Profile |
 
 ## Session 来源（Pane 级）
 
@@ -109,7 +113,7 @@ PaneSession {
 | 侧栏打开 | `Some` | `None` | 认证成功后写入 | 可恢复（密码不恢复） |
 | Ctrl+T | `None` | `None` | — | 否 |
 | Duplicate Tab / Split | `None` | 继承 credentials | 从源 clone | 否 |
-| Save to… | 变为 `Some` | 清掉 | 保留（仍仅内存） | 之后可恢复 |
+| Save As… | 变为 `Some` | 清掉 | 保留（仍仅内存） | 之后可恢复 |
 
 ## Duplicate（同文案）
 

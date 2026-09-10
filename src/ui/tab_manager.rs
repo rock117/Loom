@@ -924,7 +924,7 @@ impl TabManager {
                             AppBus::emit(
                                 &self.app_bus,
                                 AppBusEvent::Toast(
-                                    "Split needs a saved SSH password — open from sidebar or Save to… first"
+                                    "Split needs a saved SSH password — open from sidebar or Save As… first"
                                         .into(),
                                 ),
                                 cx,
@@ -1652,40 +1652,35 @@ impl TabManager {
         cx.notify();
     }
 
-    /// Bound Local panes → (profile_id, cwd) for persistence.
-    ///
-    /// When `refresh` is true, asks each terminal to refresh via `process_cwd` (sysinfo).
-    /// Quit/close paths must pass `false` — Windows can hang indefinitely reading PEB cwd
-    /// for long-lived shells (see `docs/WINDOW_CLOSE_HANG.md`).
-    pub fn bound_local_cwds(
-        &self,
-        refresh: bool,
+    /// Focused Bound Local pane → `(profile_id, live cwd)` for **Save**.
+    /// Refreshes via `process_cwd` (user-initiated; not used on quit).
+    pub fn capture_focused_bound_local_cwd_for_save(
+        &mut self,
+        tab_id: Uuid,
         cx: &mut Context<Self>,
-    ) -> Vec<(Uuid, std::path::PathBuf)> {
-        let mut out = Vec::new();
-        for tab in &self.tabs {
-            for pane in tab.panes.values() {
-                let Some(pid) = pane.profile_id else {
-                    continue;
-                };
-                if !pane.kind.is_local() {
-                    continue;
-                }
-                let Some(term) = pane.terminal.as_ref() else {
-                    continue;
-                };
-                let Some(cwd) = term.update(cx, |view, _| {
-                    if refresh {
-                        view.refresh_working_directory();
-                    }
-                    view.working_directory()
-                }) else {
-                    continue;
-                };
-                out.push((pid, cwd));
-            }
+    ) -> Option<(Uuid, std::path::PathBuf)> {
+        let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
+        let focused = tab.focused;
+        let pane = tab.panes.get_mut(&focused)?;
+        let pid = pane.profile_id?;
+        if !pane.kind.is_local() {
+            return None;
         }
-        out
+        let from_term = pane.terminal.as_ref().and_then(|term| {
+            term.update(cx, |view, _| {
+                view.refresh_working_directory();
+                view.working_directory()
+            })
+        });
+        let from_pane = match &pane.kind {
+            ProfileKind::Local { cwd, .. } => cwd.clone(),
+            _ => None,
+        };
+        let cwd = from_term.or(from_pane)?;
+        if let ProfileKind::Local { cwd: stored, .. } = &mut pane.kind {
+            *stored = Some(cwd.clone());
+        }
+        Some((pid, cwd))
     }
 
     pub fn snapshot_for_persist(&self) -> (Vec<(Uuid, Option<String>)>, usize) {
@@ -1864,7 +1859,7 @@ impl TabManager {
                             AppBus::emit(
                                 &self.app_bus,
                                 AppBusEvent::Toast(
-                                    "Duplicate needs a saved SSH password — open from sidebar or Save to… first"
+                                    "Duplicate needs a saved SSH password — open from sidebar or Save As… first"
                                         .into(),
                                 ),
                                 cx,
@@ -1881,7 +1876,7 @@ impl TabManager {
         }
     }
 
-    /// Bind all ephemeral panes in a tab to a newly saved profile (Save to…).
+    /// Bind all ephemeral panes in a tab to a newly saved profile (Save As…).
     pub fn bind_ephemeral_panes_in_tab(
         &mut self,
         tab_id: Uuid,
@@ -1894,6 +1889,30 @@ impl TabManager {
         };
         for pane in tab.panes.values_mut() {
             if pane.profile_id.is_none() {
+                pane.profile_id = Some(profile_id);
+                pane.auth_profile_id = None;
+                pane.label = label.clone();
+            }
+        }
+        tab.title = label;
+        cx.notify();
+    }
+
+    /// Save As… from a Bound focus: rebind focused pane + ephemerals to the new Profile.
+    /// Sibling Bound panes keep their original Profile (like Save As leaving the old file).
+    pub fn rebind_focused_and_ephemeral_to_profile(
+        &mut self,
+        tab_id: Uuid,
+        profile_id: Uuid,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let focused = tab.focused;
+        for (id, pane) in tab.panes.iter_mut() {
+            if *id == focused || pane.profile_id.is_none() {
                 pane.profile_id = Some(profile_id);
                 pane.auth_profile_id = None;
                 pane.label = label.clone();
@@ -1966,23 +1985,13 @@ fn wire_terminal_session(
                 else {
                     return;
                 };
-                let Some(pid) = pane.profile_id else {
-                    return;
-                };
+                // Session-only: do not write Bound profile start directory on cd.
                 if !pane.kind.is_local() {
                     return;
                 }
                 if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
                     *cwd = Some(path.clone());
                 }
-                AppBus::emit(
-                    &this.app_bus,
-                    AppBusEvent::BoundLocalCwdChanged {
-                        profile_id: pid,
-                        path: path.clone(),
-                    },
-                    cx,
-                );
             }
         }
     });

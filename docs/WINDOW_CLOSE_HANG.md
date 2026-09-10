@@ -78,25 +78,19 @@ on_window_should_close
 
 ---
 
-## 主嫌疑（高）：WillQuit → `flush_persist` → `process_cwd`
+## 主嫌疑（高，历史）：WillQuit → `flush_persist` → `process_cwd`
 
-### 调用链
+> **已缓解（2026-09）：** flush **不再**调用 `bound_local_cwds` / `process_cwd` 写回 Profile；Bound Local start dir 仅显式保存。关窗仍用 `flush_persist_for_quit`（只同步 open_tabs / UI）。下文保留作事故复盘。
+
+### 当时调用链
 
 ```text
 Persistence::on_will_quit
   → WorkspaceView::flush_persist
-    → TabManager::bound_local_cwds
-      → 每个 Bound Local pane：
-           terminal.refresh_working_directory()
-             → platform::process_cwd(shell_pid)   // sysinfo，UI 线程同步
-    → WorkspaceStore::persist_now()               // 写 JSON，一般可完成
+    → TabManager::bound_local_cwds   // 已删除
+      → terminal.refresh_working_directory() → process_cwd
+    → WorkspaceStore::persist_now()
 ```
-
-相关代码：
-
-- `src/ui/tab_manager.rs` — `bound_local_cwds`
-- `src/terminal/gpui_emu/view/context_menu.rs` — `refresh_working_directory`
-- `src/platform.rs` — `process_cwd`（`sysinfo` + `ProcessRefreshKind::cwd`）
 
 ### 为何贴合「用一天再卡」
 
@@ -157,11 +151,11 @@ Persistence::on_will_quit
 
 ---
 
-## 已落地缓解（2026-09-05）
+## 已落地缓解（2026-09-05 / 09-10）
 
-1. **`flush_persist_for_quit`**：关窗 / `WillQuit` 只用缓存 cwd，**不**调用 `process_cwd`。
-2. **点 X**：`prepare_window_close` 同步轻量 flush 后 **`return true`**，不再 `return false` 卡在 WM_CLOSE 等待 Effect/`PostQuitMessage`。
-3. Ctrl+S / debounce 仍用带 refresh 的 `flush_persist`（可接受短暂 sysinfo）。
+1. **`flush_persist_for_quit`**：关窗 / `WillQuit` 只同步 tabs / UI，**不**调用 `process_cwd`。
+2. **点 X**：`prepare_window_close` 同步轻量 flush 后 **`return true`**。
+3. **不再**在 flush 路径把 live shell cwd 写回 Local Profile（规则 9）；显式 **Save cwd to profile** / Edit Local 才改 start dir。
 
 仍待加固：SFTP teardown 无限 `await`；转发 `recv_timeout` 堵 UI。
 
@@ -184,8 +178,8 @@ Persistence::on_will_quit
 | --- | --- |
 | 关窗拦截 | `src/ui/workspace_view.rs` (`on_window_should_close` → `prepare_window_close`) |
 | WillQuit / flush | `src/ui/persistence.rs` (`flush_for_quit`, `prepare_window_close`) |
-| flush + cwd | `flush_persist` / `flush_persist_for_quit`；`bound_local_cwds(refresh, …)` |
-| process cwd | `src/platform.rs` (`process_cwd`) |
+| flush | `flush_persist` / `flush_persist_for_quit`（不同步 Profile cwd） |
+| process cwd | `src/platform.rs`（仍用于 Files / 会话内 cwd 探测，**不**在关窗 flush） |
 | pane teardown | `src/ui/tab_manager.rs` (`teardown_pane_io`, `TabManager::Drop`) |
 | SFTP worker 收尾 | `src/session/sftp.rs` (`run_sftp_worker` 末尾 `await` lanes) |
 | 退出文档 | [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md) |

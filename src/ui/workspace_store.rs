@@ -511,7 +511,8 @@ impl WorkspaceStore {
         self.mark_dirty();
     }
 
-    /// Remember last Local shell cwd on a Bound profile (reopen / reconnect).
+    /// Explicitly set Bound Local start directory (Settings / Tab Save).
+    /// Session `cd` must not call this — see SESSION_PROFILE_IA.
     pub fn update_local_profile_cwd(
         &mut self,
         profile_id: Uuid,
@@ -530,6 +531,33 @@ impl WorkspaceStore {
         *stored = Some(cwd);
         self.mark_dirty();
         cx.notify();
+    }
+
+    /// Update Local / WSL profile name and optional start directory.
+    pub fn update_local_profile(
+        &mut self,
+        profile_id: Uuid,
+        name: String,
+        cwd: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(profile_id) else {
+            return false;
+        };
+        if !matches!(profile.kind, ProfileKind::Local { .. }) {
+            return false;
+        }
+        profile.name = name;
+        if let ProfileKind::Local {
+            cwd: stored, ..
+        } = &mut profile.kind
+        {
+            *stored = cwd;
+        }
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
     }
 
     pub fn default_local_profile_id(&self) -> Option<Uuid> {
