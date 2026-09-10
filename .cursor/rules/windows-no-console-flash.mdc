@@ -1,0 +1,36 @@
+---
+description: Windows 后台子进程禁止弹控制台黑窗 — 改 session/platform spawn 时必读
+globs: src/session/**/*.rs,src/platform/**/*.rs
+alwaysApply: false
+---
+
+# Windows: no console flash from background helpers
+
+`loom.exe` is linked as a **GUI** subsystem (`#![windows_subsystem = "windows"]` in `src/main.rs`). That only hides **this** process’s console. Spawning a console app with bare `std::process::Command::new` still opens a visible window (e.g. `wsl.exe` on restore).
+
+## Required
+
+```rust
+// OK — CREATE_NO_WINDOW on Windows
+let output = crate::platform::new_command("wsl.exe")
+    .args(["--list", "--quiet"])
+    .output()?;
+```
+
+Docs: `docs/WINDOWS_SUBSYSTEM.md`, `docs/PLATFORM_SHELL.md`. Implementation: `src/platform/command.rs`.
+
+## Do not
+
+```rust
+// BAD on Windows for wsl / powershell / cmd / nvidia-smi / where / …
+std::process::Command::new("wsl.exe").args(...).output()?;
+```
+
+## Exceptions (bare `Command` OK)
+
+- User shell inside the integrated terminal (`portable-pty` / ConPTY)
+- GUI apps such as `explorer` (no console)
+
+## PR / self-check
+
+If the diff adds `Command::new(` under `src/session/` or `src/platform/`, ask: is this a background probe? If yes → `platform::new_command`.

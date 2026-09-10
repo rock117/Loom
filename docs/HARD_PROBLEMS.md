@@ -7,6 +7,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 - Text-field UX (selection / clipboard / IME): [TEXT_FIELDS.md](./TEXT_FIELDS.md).
 - Logging design (Zed-aligned, phased): [LOGGING.md](./LOGGING.md).
 - Local shell mistaken for “Disconnected” (esp. split panes): [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md).
+- Windows GUI vs child console flash (`CREATE_NO_WINDOW`): [WINDOWS_SUBSYSTEM.md](./WINDOWS_SUBSYSTEM.md), [PLATFORM_SHELL.md](./PLATFORM_SHELL.md).
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---
@@ -219,5 +220,19 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **完整说明：** [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md)。
 
 **代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/ui/tab_manager.rs`、`src/ui/status_bar.rs`、`src/session/local.rs`。
+
+---
+
+### 2026-09-10 — 双击 release 弹出可见 `wsl.exe` 控制台
+
+**现象：** `cargo build --release` 后双击 `loom.exe`，旁边出现标题为 `C:\WINDOWS\system32\wsl.exe` 的终端窗（常多个），内容像 `wsl --list` 的发行版列表 / `process exited`；Loom 主窗本身已是 GUI 子系统。
+
+**原因归类：** `#![windows_subsystem = "windows"]` 只管 **本进程**；restore WSL tab 时 `src/session/wsl.rs` 用裸 `Command::new("wsl.exe")` 跑 `--list` / distro probe，Windows 为 console 子进程分配可见窗口。引入于 WSL profile 功能。
+
+**有效做法：** 后台 helper 一律 `crate::platform::new_command`（`CREATE_NO_WINDOW`）。集成终端用户 shell 仍走 ConPTY，不要套在探测路径上。
+
+**完整说明：** [WINDOWS_SUBSYSTEM.md](./WINDOWS_SUBSYSTEM.md)、[PLATFORM_SHELL.md](./PLATFORM_SHELL.md)。
+
+**代码：** `src/session/wsl.rs`、`src/platform/command.rs`。规则：`.cursor/rules/windows-no-console-flash.mdc`、`loom-recurring-pitfalls.mdc`。
 
 ---
