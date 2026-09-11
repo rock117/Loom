@@ -80,7 +80,7 @@ Transfers footer stays empty unless an SSH pane is focused. Use Reveal / Copy Pa
 
 ### Docker sessions (planned)
 
-Same Files UX as SSH; backend is container listing + `docker cp`, not SFTP. Spec: [DOCKER_SESSION.md](./DOCKER_SESSION.md).
+入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。Files UX 同 SSH；后端为容器列举 + `docker cp`。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
 
 ## Info
 

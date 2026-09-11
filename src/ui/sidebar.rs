@@ -616,6 +616,16 @@ impl Render for Sidebar {
                                 },
                             ))
                             .child(self.ghost_svg(
+                                "btn-docker",
+                                "icons/ui/docker.svg",
+                                "Open Docker container",
+                                false,
+                                cx,
+                                |_, _, cx| {
+                                    cx.emit(SidebarEvent::OpenDockerPicker);
+                                },
+                            ))
+                            .child(self.ghost_svg(
                                 "btn-settings",
                                 "icons/ui/settings.svg",
                                 "Settings",
@@ -1130,6 +1140,7 @@ pub enum SidebarEvent {
     OpenSettings,
     OpenSshForm,
     OpenWslForm,
+    OpenDockerPicker,
     EditSshProfile(Uuid),
     EditLocalProfile(Uuid),
 }

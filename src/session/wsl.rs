@@ -78,6 +78,7 @@ pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
         return Ok(());
     }
     if !is_wsl_executable(shell) {
+        crate::session::docker::preflight_local_spawn(shell, args)?;
         return Ok(());
     }
     let Some(distro) = distro_from_args(args) else {

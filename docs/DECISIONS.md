@@ -197,6 +197,25 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 ---
 
+## 2026-09-11 — Docker 入口：图标弹层（本地 | SSH Profile），不做侧栏 Docker 树
+
+**Status:** accepted（规格修订；实现未开始）
+
+**Context:** 侧栏常驻「Docker 树」与 Profile（收藏配置）语义重合；容器是 `docker ps` 瞬时资源。用户需要本机与「已有 SSH Profile 远端」两种宿主。
+
+**Options:**
+- A — 侧栏 Docker 树（动态列表）  
+- B — 仅本机图标列表  
+- C — **Docker 图标 → 模式（本地 | SSH Profile）→ 对应容器列表**  
+
+**Decision:** 选 C。侧栏不挂 Docker 树；SSH Profile 仍表示宿主机。详见 [DOCKER_SESSION.md](./DOCKER_SESSION.md)「入口 UX」。
+
+**Why:** 发现入口按需弹出；收藏仍走 Profile IA；本地与远端同一套选择器，后端分阶段接通。
+
+**Consequences / follow-ups:** 阶段 1 本地可用时可先露出双模式壳；SSH 模式阶段 3 接通。实现仍须用户明确点名。
+
+---
+
 ## 2026-08-30 — SSH 端口转发为增强能力（非核心）
 
 **Status:** accepted（规格；实现未开始）  

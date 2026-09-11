@@ -56,6 +56,21 @@ impl ProfileKind {
             Self::Local {
                 shell, cwd, args, ..
             } => {
+                if self.is_docker_local() {
+                    // Prefer container id after `exec` (+ flags); fall back to generic label.
+                    let id = args
+                        .iter()
+                        .position(|a| a == "exec")
+                        .and_then(|i| {
+                            args[i + 1..]
+                                .iter()
+                                .find(|a| !a.starts_with('-'))
+                                .map(|s| s.as_str())
+                        })
+                        .unwrap_or("container");
+                    let short = if id.len() > 12 { &id[..12] } else { id };
+                    return format!("docker · {short}");
+                }
                 let shell = shell.as_deref().unwrap_or("default shell");
                 let argv = if args.is_empty() {
                     String::new()
@@ -92,6 +107,17 @@ impl ProfileKind {
         }
     }
 
+    /// Local profile that runs `docker exec …` (ephemeral Docker tabs).
+    pub fn is_docker_local(&self) -> bool {
+        match self {
+            Self::Local { shell, args, .. } => {
+                is_docker_shell(shell.as_deref().unwrap_or(""))
+                    && args.iter().any(|a| a == "exec")
+            }
+            _ => false,
+        }
+    }
+
     /// WSL profiles are Windows-only in the UI (still persist in workspace.json).
     pub fn visible_in_sidebar(&self) -> bool {
         if self.is_wsl_local() {
@@ -107,6 +133,13 @@ fn is_wsl_shell(shell: &str) -> bool {
         .file_stem()
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.eq_ignore_ascii_case("wsl"))
+}
+
+fn is_docker_shell(shell: &str) -> bool {
+    PathBuf::from(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("docker"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
