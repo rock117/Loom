@@ -8,6 +8,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 - Logging design (Zed-aligned, phased): [LOGGING.md](./LOGGING.md).
 - Local shell mistaken for “Disconnected” (esp. split panes): [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md).
 - Windows GUI vs child console flash (`CREATE_NO_WINDOW`): [WINDOWS_SUBSYSTEM.md](./WINDOWS_SUBSYSTEM.md), [PLATFORM_SHELL.md](./PLATFORM_SHELL.md).
+- Agent / TUI 输入光标不可见（反色 + 藏原生光标）：[TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md)。
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---
@@ -165,6 +166,20 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 **完整说明：** [TERMINAL_IME.md](./TERMINAL_IME.md) 一节「Ctrl+F 搜索框无法输入中文」。
 
 **代码：** `src/terminal/gpui_emu/view/mod.rs`、`src/terminal/gpui_emu/view/find.rs`。
+
+---
+
+### 2026-09-11 — Agent CLI / TUI 输入区看不见光标
+
+**现象：** Loom 内跑 Cursor Agent 等 TUI 时可打字，Ask 输入区无 caret；系统终端正常。易误判为「未接管」或「还停在 shell」。
+
+**原因归类：** TUI 发 `\e[?25l` 藏原生光标，用 `Flags::INVERSE` 自绘 caret；Loom 未做反色 fg/bg 对调，且始终画方块光标。
+
+**有效做法：** `resolve_cell_colors` 处理 INVERSE；原生光标尊重 `SHOW_CURSOR` / Hidden；Beam/Underline 分样式。
+
+**完整说明：** [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md)。
+
+**代码：** `src/terminal/gpui_emu/render.rs`。
 
 ---
 

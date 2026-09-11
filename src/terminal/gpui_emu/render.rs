@@ -64,14 +64,28 @@ use super::event::GpuiEventProxy;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Point as AlacPoint};
 use alacritty_terminal::term::Term;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{point_to_viewport, viewport_to_point};
-use alacritty_terminal::vte::ansi::Color;
+use alacritty_terminal::vte::ansi::{Color, CursorShape};
 use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
     SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
+
+/// Resolve cell fg/bg, applying ANSI reverse video (`Flags::INVERSE`).
+///
+/// TUIs such as Cursor Agent hide the native cursor and draw their caret with
+/// inverse-video cells; skipping this swap makes that caret invisible.
+fn resolve_cell_colors(palette: &ColorPalette, cell: &Cell, colors: &Colors) -> (Hsla, Hsla) {
+    let mut fg = palette.resolve(cell.fg, colors);
+    let mut bg = palette.resolve(cell.bg, colors);
+    if cell.flags.contains(Flags::INVERSE) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    (fg, bg)
+}
 
 /// A batched run of text with consistent styling.
 ///
@@ -309,9 +323,8 @@ impl TerminalRenderer {
                 continue;
             }
 
-            // Extract cell styling
-            let fg_color = self.palette.resolve(cell.fg, colors);
-            let bg_color = self.palette.resolve(cell.bg, colors);
+            // Extract cell styling (INVERSE swaps fg/bg for TUI carets, etc.)
+            let (fg_color, bg_color) = resolve_cell_colors(&self.palette, &cell, colors);
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
             let underline = cell.flags.contains(Flags::UNDERLINE);
@@ -667,8 +680,8 @@ impl TerminalRenderer {
                 let x = origin.x + self.cell_width * (col_idx as f32);
                 let y = origin.y + self.cell_height * (line_idx as f32) + vertical_offset;
 
-                // Get cell colors
-                let mut fg_color = self.palette.resolve(cell.fg, colors);
+                // Get cell colors (INVERSE already applied)
+                let (mut fg_color, _) = resolve_cell_colors(&self.palette, &cell, colors);
                 let is_link = url_cols.get(col_idx).copied().unwrap_or(false);
                 if is_link {
                     fg_color = Hsla {
@@ -681,10 +694,12 @@ impl TerminalRenderer {
 
                 // Get cell flags for styling
                 let flags = cell.flags;
-                let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-                let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = is_link
-                    || flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
+                if flags.contains(Flags::HIDDEN) {
+                    continue;
+                }
+                let bold = flags.contains(Flags::BOLD);
+                let italic = flags.contains(Flags::ITALIC);
+                let underline = is_link || flags.contains(Flags::UNDERLINE);
 
                 // Create font with styling
                 let font = Font {
@@ -734,36 +749,87 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor only when it falls inside the current viewport.
-        let cursor_point = grid.cursor.point;
-        if let Some(vp) = point_to_viewport(display_offset, cursor_point) {
-            let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-            let cursor_y = origin.y + self.cell_height * (vp.line as f32);
+        // Native cursor: respect DECTCEM (`?25l/h`) and DECSCUSR Hidden.
+        // Apps like Cursor Agent hide the host cursor and draw their own via INVERSE.
+        let cursor_shape = if term.mode().contains(TermMode::SHOW_CURSOR) {
+            term.cursor_style().shape
+        } else {
+            CursorShape::Hidden
+        };
+        if cursor_shape != CursorShape::Hidden {
+            let cursor_point = grid.cursor.point;
+            if let Some(vp) = point_to_viewport(display_offset, cursor_point) {
+                let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
+                let cursor_y = origin.y + self.cell_height * (vp.line as f32);
+                let cursor_color = self.palette.resolve(
+                    Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
+                    colors,
+                );
 
-            let cursor_color = self.palette.resolve(
-                Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
-                colors,
-            );
-
-            let cursor_bounds = Bounds {
-                origin: Point {
-                    x: cursor_x,
-                    y: cursor_y,
-                },
-                size: Size {
-                    width: self.cell_width,
-                    height: self.cell_height,
-                },
-            };
-
-            window.paint_quad(quad(
-                cursor_bounds,
-                px(0.0),
-                cursor_color,
-                Edges::<Pixels>::default(),
-                transparent_black(),
-                Default::default(),
-            ));
+                match cursor_shape {
+                    CursorShape::Underline => {
+                        let h = (self.cell_height * 0.15).max(px(2.0));
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point {
+                                    x: cursor_x,
+                                    y: cursor_y + self.cell_height - h,
+                                },
+                                size: Size {
+                                    width: self.cell_width,
+                                    height: h,
+                                },
+                            },
+                            px(0.0),
+                            cursor_color,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                    CursorShape::Beam => {
+                        let w = (self.cell_width * 0.15).max(px(2.0));
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point {
+                                    x: cursor_x,
+                                    y: cursor_y,
+                                },
+                                size: Size {
+                                    width: w,
+                                    height: self.cell_height,
+                                },
+                            },
+                            px(0.0),
+                            cursor_color,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                    // Block / HollowBlock: filled cell (hollow not distinguished yet).
+                    // Hidden is filtered above; keep `_` exhaustive for future shapes.
+                    _ => {
+                        window.paint_quad(quad(
+                            Bounds {
+                                origin: Point {
+                                    x: cursor_x,
+                                    y: cursor_y,
+                                },
+                                size: Size {
+                                    width: self.cell_width,
+                                    height: self.cell_height,
+                                },
+                            },
+                            px(0.0),
+                            cursor_color,
+                            Edges::<Pixels>::default(),
+                            transparent_black(),
+                            Default::default(),
+                        ));
+                    }
+                }
+            }
         }
     }
 }
@@ -844,5 +910,45 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_col, 0);
         assert_eq!(merged[0].end_col, 10);
+    }
+
+    #[test]
+    fn inverse_swaps_fg_bg() {
+        let palette = ColorPalette::default();
+        let colors = Colors::default();
+
+        let mut cell = Cell::default();
+        cell.fg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground);
+        cell.bg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background);
+
+        let (fg, bg) = resolve_cell_colors(&palette, &cell, &colors);
+        assert_eq!(fg, palette.foreground());
+        assert_eq!(bg, palette.background());
+
+        cell.flags.insert(Flags::INVERSE);
+        let (fg_inv, bg_inv) = resolve_cell_colors(&palette, &cell, &colors);
+        assert_eq!(fg_inv, palette.background());
+        assert_eq!(bg_inv, palette.foreground());
+    }
+
+    #[test]
+    fn layout_row_inverse_space_gets_swapped_background() {
+        // Agent-style caret: inverse video on a space — must show via bg paint.
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.2,
+            ColorPalette::default(),
+        );
+        let colors = Colors::default();
+        let mut cell = Cell::default();
+        cell.c = ' ';
+        cell.fg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground);
+        cell.bg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background);
+        cell.flags.insert(Flags::INVERSE);
+
+        let (bgs, _) = renderer.layout_row(0, std::iter::once((0, cell)), &colors);
+        assert_eq!(bgs.len(), 1);
+        assert_eq!(bgs[0].color, renderer.palette.foreground());
     }
 }

@@ -19,6 +19,7 @@ For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规�
 For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
 For **PTY 高吞吐输出合并 notify**（已实现，不丢字节）, see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md).  
 For **终端 ANSI 配色预设**（已实现；默认 Default 不变）, see [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md).  
+For **终端反色 / 光标可见性（Agent CLI 等）**（已修复，中文说明）, see [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md).  
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
 For **Session / Profile / Group IA（根级 Profile、嵌套 Group、临时 Tab）**, see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md).  
 For **持久化事件（AppBus / Persistence / WillQuit）**, see [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md).  
@@ -116,6 +117,7 @@ Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should no
 - Prefer **GPUI text system** painting of the cell grid (Zed-style path).
 - Avoid long-term reliance on CPU bitmap → `Image` stretch (blurry on HiDPI).
 - In-house terminal (`terminal/gpui_emu`) paints via GPUI `text_system`; always handle `Event::PtyWrite`.
+- Cell paint must honor **`Flags::INVERSE`** and native cursor **`SHOW_CURSOR` / Hidden** (TUI self-drawn carets); see [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md).
 - Multi-tab: each tab owns a session; closing a tab must not block the UI thread (careful kill / drop order for ConPTY on Windows).
 - App shortcuts (`Ctrl+T` / `Ctrl+W` / `Ctrl+Q`, …) must not steal shell chords such as `Ctrl+C`.
 
