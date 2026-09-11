@@ -2,6 +2,7 @@
 
 pub mod app_bus;
 pub mod context_panel;
+pub mod docker_picker;
 pub mod file_icon;
 pub mod local_form;
 pub mod password_prompt;

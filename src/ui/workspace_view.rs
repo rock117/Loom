@@ -6,6 +6,7 @@ use crate::shared::actions::*;
 use crate::shared::theme;
 use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
+use crate::ui::docker_picker::{DockerPicker, DockerPickerEvent};
 use crate::ui::local_form::{LocalForm, LocalFormEvent};
 use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent};
 use crate::ui::persistence::Persistence;
@@ -53,6 +54,7 @@ pub struct WorkspaceView {
     settings: Entity<SettingsPanel>,
     ssh_form: Entity<SshForm>,
     wsl_form: Entity<WslForm>,
+    docker_picker: Entity<DockerPicker>,
     local_form: Entity<LocalForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
     pending_password: Option<PendingPasswordAction>,
@@ -65,6 +67,7 @@ pub struct WorkspaceView {
     show_settings: bool,
     show_ssh_form: bool,
     show_wsl_form: bool,
+    show_docker_picker: bool,
     show_local_form: bool,
     /// Tab waiting for Save As… dialog to create a profile, then bind.
     pending_save_as_tab: Option<uuid::Uuid>,
@@ -113,6 +116,7 @@ impl WorkspaceView {
         let settings = cx.new(|cx| SettingsPanel::new(store.clone(), cx));
         let ssh_form = cx.new(|cx| SshForm::new(store.clone(), cx));
         let wsl_form = cx.new(|cx| WslForm::new(store.clone(), cx));
+        let docker_picker = cx.new(|cx| DockerPicker::new(store.clone(), cx));
         let local_form = cx.new(|cx| LocalForm::new(store.clone(), cx));
         let workspace_weak = cx.weak_entity();
         let persistence = cx.new(|cx| {
@@ -143,6 +147,7 @@ impl WorkspaceView {
             settings: settings.clone(),
             ssh_form: ssh_form.clone(),
             wsl_form: wsl_form.clone(),
+            docker_picker: docker_picker.clone(),
             local_form: local_form.clone(),
             password_prompt: None,
             pending_password: None,
@@ -155,6 +160,7 @@ impl WorkspaceView {
             show_settings: false,
             show_ssh_form: false,
             show_wsl_form: false,
+            show_docker_picker: false,
             show_local_form: false,
             pending_save_as_tab: None,
             restore_tabs,
@@ -194,6 +200,7 @@ impl WorkspaceView {
                     this.show_settings = true;
                     this.show_ssh_form = false;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -202,6 +209,7 @@ impl WorkspaceView {
                     this.ssh_form.update(cx, |f, cx| f.reset(cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
@@ -214,6 +222,7 @@ impl WorkspaceView {
                     this.wsl_form.update(cx, |f, cx| f.reset(cx));
                     this.show_wsl_form = true;
                     this.show_ssh_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
@@ -222,11 +231,25 @@ impl WorkspaceView {
                         this.wsl_form.read(cx).focus(window);
                     });
                 }
+                SidebarEvent::OpenDockerPicker => {
+                    this.docker_picker.update(cx, |f, cx| f.reset(cx));
+                    this.show_docker_picker = true;
+                    this.show_ssh_form = false;
+                    this.show_wsl_form = false;
+                    this.show_local_form = false;
+                    this.show_settings = false;
+                    this.password_prompt = None;
+                    cx.notify();
+                    cx.defer_in(window, |this, window, cx| {
+                        this.docker_picker.read(cx).focus(window);
+                    });
+                }
                 SidebarEvent::EditSshProfile(id) => {
                     let id = *id;
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
@@ -277,6 +300,7 @@ impl WorkspaceView {
             move |this, _, event: &WslFormEvent, window, cx| match event {
                 WslFormEvent::Close => {
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     cx.notify();
                 }
                 WslFormEvent::Saved {
@@ -284,11 +308,36 @@ impl WorkspaceView {
                     connect,
                 } => {
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     if *connect {
                         this.open_profile_id(*profile_id, window, cx);
                     } else {
                         this.set_toast("Saved successfully", cx);
                     }
+                    cx.notify();
+                }
+            },
+        ));
+
+        view._subscriptions.push(cx.subscribe_in(
+            &docker_picker,
+            window,
+            move |this, _, event: &DockerPickerEvent, _window, cx| match event {
+                DockerPickerEvent::Close => {
+                    this.show_docker_picker = false;
+                    cx.notify();
+                }
+                DockerPickerEvent::OpenLocal {
+                    container_id,
+                    label,
+                } => {
+                    this.show_docker_picker = false;
+                    let id = container_id.clone();
+                    let label = label.clone();
+                    let store = this.store.clone();
+                    this.tabs.update(cx, |m, cx| {
+                        m.open_ephemeral_docker(&id, &label, &store, cx);
+                    });
                     cx.notify();
                 }
             },
@@ -350,6 +399,7 @@ impl WorkspaceView {
                     this.show_settings = true;
                     this.show_ssh_form = false;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.password_prompt = None;
                     cx.notify();
@@ -359,6 +409,7 @@ impl WorkspaceView {
                     this.ssh_form.update(cx, |f, cx| f.load_for_edit(id, cx));
                     this.show_ssh_form = true;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.show_settings = false;
                     this.password_prompt = None;
@@ -572,6 +623,7 @@ impl WorkspaceView {
         self.show_settings = false;
         self.show_ssh_form = false;
         self.show_wsl_form = false;
+        self.show_docker_picker = false;
         self.show_local_form = false;
         cx.notify();
         cx.defer_in(window, |this, window, cx| {
@@ -801,6 +853,7 @@ impl WorkspaceView {
         self.show_local_form = true;
         self.show_ssh_form = false;
         self.show_wsl_form = false;
+        self.show_docker_picker = false;
         self.show_settings = false;
         self.password_prompt = None;
         cx.notify();
@@ -863,6 +916,7 @@ impl WorkspaceView {
                 self.show_local_form = true;
                 self.show_ssh_form = false;
                 self.show_wsl_form = false;
+                self.show_docker_picker = false;
                 cx.notify();
                 cx.defer_in(window, |this, window, cx| {
                     this.local_form.read(cx).focus(window);
@@ -875,6 +929,7 @@ impl WorkspaceView {
                 self.show_ssh_form = true;
                 self.show_local_form = false;
                 self.show_wsl_form = false;
+                self.show_docker_picker = false;
                 cx.notify();
                 cx.defer_in(window, |this, window, cx| {
                     this.ssh_form.read(cx).focus(window);
@@ -1195,6 +1250,7 @@ impl Render for WorkspaceView {
                 if this.show_settings {
                     this.show_ssh_form = false;
                     this.show_wsl_form = false;
+                    this.show_docker_picker = false;
                     this.show_local_form = false;
                     this.password_prompt = None;
                 }
@@ -1345,6 +1401,7 @@ impl Render for WorkspaceView {
             .when(self.show_settings, |d| d.child(self.settings.clone()))
             .when(self.show_ssh_form, |d| d.child(self.ssh_form.clone()))
             .when(self.show_wsl_form, |d| d.child(self.wsl_form.clone()))
+            .when(self.show_docker_picker, |d| d.child(self.docker_picker.clone()))
             .when(self.show_local_form, |d| d.child(self.local_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
             // Full-window backdrop under TabBar menus (priority 0); menu uses priority 1.

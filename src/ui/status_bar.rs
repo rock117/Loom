@@ -304,6 +304,17 @@ impl Render for StatusBar {
                     };
                     if kind.is_wsl_local() {
                         ("icons/ui/wsl.svg", theme::ICON_WSL, label, false)
+                    } else if kind.is_docker_local() {
+                        let nice = crate::session::docker::container_id_from_args(args)
+                            .map(|id| {
+                                if id.len() > 12 {
+                                    format!("docker · {}", &id[..12])
+                                } else {
+                                    format!("docker · {id}")
+                                }
+                            })
+                            .unwrap_or_else(|| "docker".into());
+                        ("icons/ui/docker.svg", theme::ICON_DOCKER, nice, false)
                     } else {
                         ("icons/ui/terminal.svg", theme::ICON_LOCAL, label, false)
                     }

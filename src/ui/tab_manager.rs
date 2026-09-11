@@ -518,6 +518,8 @@ impl TabManager {
         let pane_id = Uuid::new_v4();
         let status = if kind.is_wsl_local() {
             "starting WSL…".to_string()
+        } else if kind.is_docker_local() {
+            "starting Docker…".to_string()
         } else {
             "starting…".to_string()
         };
@@ -1746,6 +1748,36 @@ impl TabManager {
                 eprintln!("loom: ephemeral local failed: {err:#}");
             }
         }
+    }
+
+    /// Ephemeral Docker exec Tab (from Docker picker). Not in sidebar.
+    pub fn open_ephemeral_docker(
+        &mut self,
+        container_id: &str,
+        label: &str,
+        store: &Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) {
+        let (default_shell, font_family) = {
+            let s = store.read(cx);
+            (s.settings.default_shell.clone(), s.settings.font_family.clone())
+        };
+        let kind = crate::session::docker::exec_profile_kind(container_id);
+        let tab_label = if label.trim().is_empty() {
+            format!("docker · {}", &container_id[..container_id.len().min(12)])
+        } else {
+            label.to_string()
+        };
+        self.begin_local_async(
+            None,
+            &kind,
+            &tab_label,
+            default_shell.as_deref(),
+            &font_family,
+            store,
+            None,
+            cx,
+        );
     }
 
     /// Duplicate focused session as a new ephemeral tab.

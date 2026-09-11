@@ -128,6 +128,13 @@ pub const ICON_WSL: Hsla = Hsla {
     l: 0.55,
     a: 1.0,
 };
+/// Docker container glyph (sky / cyan).
+pub const ICON_DOCKER: Hsla = Hsla {
+    h: 0.55,
+    s: 0.55,
+    l: 0.52,
+    a: 1.0,
+};
 /// Group / folder glyph.
 pub const ICON_GROUP: Hsla = Hsla {
     h: 0.12,
