@@ -4928,6 +4928,48 @@ impl ContextPanel {
         .detach();
     }
 
+    /// Monospace Info cell: click copies the value (same pattern as status-bar cwd).
+    fn info_copy_cell(
+        cx: &mut Context<Self>,
+        id: SharedString,
+        text: String,
+        muted: bool,
+        flex: bool,
+    ) -> impl IntoElement {
+        let placeholder = text.is_empty() || text == "—";
+        let display = if text.is_empty() {
+            "—".to_string()
+        } else {
+            text
+        };
+        let tip = format!("{display}\nClick to copy");
+        let copy = display.clone();
+        let color = if muted {
+            theme::TEXT_MUTED
+        } else {
+            theme::TEXT
+        };
+        div()
+            .id(id)
+            .min_w_0()
+            .when(flex, |d| d.flex_1())
+            .text_xs()
+            .font_family("Consolas")
+            .text_color(color)
+            .overflow_hidden()
+            .when(!placeholder, |d| {
+                d.cursor_pointer()
+                    .rounded(px(theme::RADIUS_SM))
+                    .hover(|s| s.bg(theme::HOVER))
+                    .tooltip(move |_, cx| Tooltip::text(tip.clone(), cx))
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        cx.emit(ContextPanelEvent::Toast("Copied".into()));
+                    }))
+            })
+            .child(display)
+    }
+
     fn render_info(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_host_info(cx);
 
@@ -5366,7 +5408,7 @@ impl ContextPanel {
                                         .child("No published ports"),
                                 )
                             })
-                            .children(docker_ports.into_iter().map(|row| {
+                            .children(docker_ports.into_iter().enumerate().map(|(i, row)| {
                                 let left = if row.host.is_empty() {
                                     "—".to_string()
                                 } else {
@@ -5377,29 +5419,26 @@ impl ContextPanel {
                                     .items_center()
                                     .justify_between()
                                     .gap(px(theme::SPACE_2))
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_family("Consolas")
-                                            .text_color(theme::TEXT)
-                                            .overflow_hidden()
-                                            .child(left),
-                                    )
+                                    .child(Self::info_copy_cell(
+                                        cx,
+                                        SharedString::from(format!("ctx-docker-port-host-{i}")),
+                                        left,
+                                        false,
+                                        false,
+                                    ))
                                     .child(
                                         div()
                                             .text_xs()
                                             .text_color(theme::TEXT_MUTED)
                                             .child("→"),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .text_xs()
-                                            .font_family("Consolas")
-                                            .text_color(theme::TEXT_MUTED)
-                                            .overflow_hidden()
-                                            .child(row.container),
-                                    )
+                                    .child(Self::info_copy_cell(
+                                        cx,
+                                        SharedString::from(format!("ctx-docker-port-ctn-{i}")),
+                                        row.container,
+                                        true,
+                                        true,
+                                    ))
                             })),
                     )
                     .child(
@@ -5465,7 +5504,7 @@ impl ContextPanel {
                                         ),
                                 )
                             })
-                            .children(docker_volumes.into_iter().map(|row| {
+                            .children(docker_volumes.into_iter().enumerate().map(|(i, row)| {
                                 let src = if row.source.is_empty() {
                                     "—".to_string()
                                 } else {
@@ -5499,26 +5538,20 @@ impl ContextPanel {
                                             .whitespace_nowrap()
                                             .child(mode),
                                     )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .font_family("Consolas")
-                                            .text_color(theme::TEXT)
-                                            .overflow_hidden()
-                                            .child(src),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .font_family("Consolas")
-                                            .text_color(theme::TEXT_MUTED)
-                                            .overflow_hidden()
-                                            .child(dest),
-                                    )
+                                    .child(Self::info_copy_cell(
+                                        cx,
+                                        SharedString::from(format!("ctx-docker-vol-src-{i}")),
+                                        src,
+                                        false,
+                                        true,
+                                    ))
+                                    .child(Self::info_copy_cell(
+                                        cx,
+                                        SharedString::from(format!("ctx-docker-vol-dst-{i}")),
+                                        dest,
+                                        true,
+                                        true,
+                                    ))
                             })),
                     )
                 })
