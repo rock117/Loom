@@ -63,6 +63,8 @@ pub struct TransferProgress {
     pub label: Option<String>,
     /// Optional local path update (e.g. final archive path).
     pub local_path: Option<PathBuf>,
+    /// Lightweight status phase (`Copying…`) — not a filename; prefer rare updates.
+    pub phase: Option<String>,
 }
 
 /// Result of a finished upload/download.
@@ -93,6 +95,22 @@ fn progress_msg(
         overall_total,
         label: None,
         local_path: None,
+        phase: None,
+    }
+}
+
+fn progress_phase(id: uuid::Uuid, phase: impl Into<String>) -> TransferProgress {
+    TransferProgress {
+        id,
+        done: 0,
+        total: None,
+        files_done: None,
+        files_total: None,
+        overall_done: None,
+        overall_total: None,
+        label: None,
+        local_path: None,
+        phase: Some(phase.into()),
     }
 }
 
@@ -654,12 +672,14 @@ async fn docker_download_staged(
     let name = path_basename(remote);
     let tmp = crate::session::docker_ssh::mktemp_dir(session).await?;
     let staged = format!("{tmp}/{name}");
+    let _ = progress.try_send(progress_phase(id, "Copying from container…"));
     if let Err(err) =
         crate::session::docker_ssh::docker_cp_out(session, container, remote, &staged).await
     {
         let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
         return Err(err);
     }
+    let _ = progress.try_send(progress_phase(id, "Downloading…"));
     let result = download_path(
         session,
         sftp,
@@ -692,6 +712,7 @@ async fn docker_upload_staged(
         .ok_or_else(|| anyhow::anyhow!("invalid local path"))?;
     let tmp = crate::session::docker_ssh::mktemp_dir(session).await?;
     let staged_dir = tmp.clone();
+    let _ = progress.try_send(progress_phase(id, "Uploading…"));
     let outcome = upload_path(
         sftp,
         id,
@@ -705,6 +726,7 @@ async fn docker_upload_staged(
     let staged = format!("{tmp}/{name}");
     match outcome {
         Ok(o) => {
+            let _ = progress.try_send(progress_phase(id, "Copying into container…"));
             if let Err(err) =
                 crate::session::docker_ssh::docker_cp_in(session, container, &staged, remote_dir)
                     .await
@@ -1081,6 +1103,7 @@ async fn download_compressed(
         overall_total: size,
         label: Some(archive_name),
         local_path: Some(local_archive.clone()),
+        phase: None,
     });
     let bytes = download_file(
         sftp,
@@ -1280,6 +1303,7 @@ async fn upload_path(
             overall_total: None,
             label: Some(archive_name.clone()),
             local_path: None,
+            phase: Some("Compressing…".into()),
         });
         tokio::task::spawn_blocking(move || {
             let matcher = filter_opts

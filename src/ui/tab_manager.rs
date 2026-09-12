@@ -378,6 +378,7 @@ impl TabManager {
         let show_line_numbers = self.show_line_numbers;
         let ansi_palette = self.ansi_palette;
         let label = format!("{user}@{host}:{port}");
+        let is_docker = kind.is_docker_ssh();
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
@@ -401,8 +402,12 @@ impl TabManager {
                         let config = terminal_config(font_size, &family, show_line_numbers, ansi_palette);
                         let resize = handles.resize.clone();
                         let terminal = cx.new(|cx| {
-                            TerminalView::new(handles.writer, handles.reader, config, cx)
-                                .with_resize_callback(move |c, r| resize(c, r))
+                            let mut view = TerminalView::new(handles.writer, handles.reader, config, cx)
+                                .with_resize_callback(move |c, r| resize(c, r));
+                            if is_docker {
+                                view = view.with_docker_session();
+                            }
+                            view
                         });
                         let term_subs = wire_terminal_session(&terminal, None, cx);
                         pane.terminal = Some(terminal);
@@ -658,7 +663,9 @@ impl TabManager {
                                 .with_resize_callback(resize)
                                 .with_local_session();
                             // Skip process_cwd for Docker — PID is the host docker client.
-                            if !kind.is_docker_local() {
+                            if kind.is_docker_local() {
+                                view = view.with_docker_session();
+                            } else {
                                 view = view.with_shell_pid(pty.shell_pid);
                             }
                             view
@@ -729,7 +736,9 @@ impl TabManager {
             let mut view = TerminalView::new(pty.writer, pty.reader, config, cx)
                 .with_resize_callback(resize)
                 .with_local_session();
-            if !kind.is_docker_local() {
+            if kind.is_docker_local() {
+                view = view.with_docker_session();
+            } else {
                 view = view.with_shell_pid(pty.shell_pid);
             }
             view
@@ -1179,6 +1188,8 @@ impl TabManager {
                         pane.state = ConnectionState::Connecting;
                         pane.status_message = if kind.is_wsl_local() {
                             "reconnecting WSL…".into()
+                        } else if kind.is_docker_local() {
+                            "reconnecting Docker…".into()
                         } else {
                             "reconnecting…".into()
                         };
@@ -1287,8 +1298,23 @@ impl TabManager {
             return;
         }
 
+        let is_docker_local = pane.kind.is_docker_local();
+        let is_docker_ssh = pane.kind.is_docker_ssh();
+        let docker_container = if is_docker_local {
+            match &pane.kind {
+                ProfileKind::Local { args, .. } => crate::session::docker::container_id_from_args(args)
+                    .map(str::to_string),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         let is_local = pane.kind.is_local();
-        let can_auto = is_local && pane.local_auto_restarts_left > 0;
+        let can_auto = is_local && !is_docker_local && pane.local_auto_restarts_left > 0;
+        let can_auto_docker = is_docker_local
+            && pane.local_auto_restarts_left > 0
+            && docker_container.is_some();
         if can_auto {
             pane.local_auto_restarts_left -= 1;
         }
@@ -1301,6 +1327,53 @@ impl TabManager {
             let _ = tx.send(());
         }
         teardown_pty(killer, master);
+
+        if can_auto_docker {
+            let container_id = docker_container.expect("checked above");
+            pane.local_auto_restarts_left =
+                pane.local_auto_restarts_left.saturating_sub(1);
+            pane.state = ConnectionState::Connecting;
+            pane.status_message = "checking container…".into();
+            // Keep last terminal output until we know whether to re-exec.
+            cx.spawn(async move |this, cx| {
+                let running = cx
+                    .background_spawn(async move {
+                        crate::session::docker::container_is_running(&container_id)
+                            .unwrap_or(false)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let Some(pane) = this
+                        .tabs
+                        .iter_mut()
+                        .find_map(|t| t.panes.get_mut(&pane_id))
+                    else {
+                        return;
+                    };
+                    if !matches!(pane.state, ConnectionState::Connecting) {
+                        return;
+                    }
+                    if running {
+                        drop(pane.terminal.take());
+                        pane.status_message = "reconnecting Docker…".into();
+                        AppBus::emit(
+                            &this.app_bus,
+                            AppBusEvent::ReconnectPane { pane_id },
+                            cx,
+                        );
+                    } else {
+                        pane.state = ConnectionState::Failed;
+                        pane.status_message =
+                            "container stopped — use Reconnect in the status bar".into();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
 
         if can_auto {
             // Match Windows Terminal / VS Code "restart on exit": respawn silently.
@@ -1321,7 +1394,9 @@ impl TabManager {
         }
 
         pane.state = ConnectionState::Failed;
-        pane.status_message = if is_local {
+        pane.status_message = if is_docker_local || is_docker_ssh {
+            "container session ended — use Reconnect in the status bar".into()
+        } else if is_local {
             "shell exited — use Reconnect in the status bar".into()
         } else {
             "disconnected — use Reconnect in the status bar".into()

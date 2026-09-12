@@ -280,6 +280,18 @@ pub fn copy_from_container(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create {}", parent.display()))?;
     }
+    let _ = progress.send(TransferProgress {
+        id,
+        done: 0,
+        total: None,
+        files_done: None,
+        files_total: None,
+        overall_done: None,
+        overall_total: None,
+        label: None,
+        local_path: None,
+        phase: Some("Copying…".into()),
+    });
     let src = docker_cp_spec(container, remote);
     let mut child = docker_cmd()
         .arg("cp")
@@ -289,7 +301,7 @@ pub fn copy_from_container(
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn docker cp (download)")?;
-    wait_child_cancellable(&mut child, &cancel, id, &progress)?;
+    wait_child_cancellable(&mut child, &cancel)?;
     let bytes = dir_or_file_size(local).unwrap_or(0);
     let files = if local.is_dir() {
         count_files(local).unwrap_or(1)
@@ -306,6 +318,7 @@ pub fn copy_from_container(
         overall_total: Some(bytes),
         label: None,
         local_path: Some(local.to_path_buf()),
+        phase: None,
     });
     Ok(TransferOutcome {
         files,
@@ -326,6 +339,27 @@ pub fn copy_to_container(
     if !local.exists() {
         bail!("Local path missing: {}", local.display());
     }
+    let bytes_hint = dir_or_file_size(local).unwrap_or(0);
+    let _ = progress.send(TransferProgress {
+        id,
+        done: 0,
+        total: if bytes_hint > 0 {
+            Some(bytes_hint)
+        } else {
+            None
+        },
+        files_done: None,
+        files_total: None,
+        overall_done: Some(0),
+        overall_total: if bytes_hint > 0 {
+            Some(bytes_hint)
+        } else {
+            None
+        },
+        label: None,
+        local_path: None,
+        phase: Some("Copying…".into()),
+    });
     let dest = docker_cp_spec(container, remote);
     let mut child = docker_cmd()
         .arg("cp")
@@ -335,8 +369,8 @@ pub fn copy_to_container(
         .stderr(Stdio::piped())
         .spawn()
         .context("spawn docker cp (upload)")?;
-    wait_child_cancellable(&mut child, &cancel, id, &progress)?;
-    let bytes = dir_or_file_size(local).unwrap_or(0);
+    wait_child_cancellable(&mut child, &cancel)?;
+    let bytes = bytes_hint;
     let files = if local.is_dir() {
         count_files(local).unwrap_or(1)
     } else {
@@ -352,6 +386,7 @@ pub fn copy_to_container(
         overall_total: Some(bytes),
         label: None,
         local_path: None,
+        phase: None,
     });
     Ok(TransferOutcome {
         files,
@@ -360,12 +395,8 @@ pub fn copy_to_container(
     })
 }
 
-fn wait_child_cancellable(
-    child: &mut Child,
-    cancel: &TransferCancel,
-    id: uuid::Uuid,
-    progress: &flume::Sender<TransferProgress>,
-) -> Result<()> {
+/// Wait for `docker cp` without flooding the UI with empty progress ticks.
+fn wait_child_cancellable(child: &mut Child, cancel: &TransferCancel) -> Result<()> {
     let stderr = child.stderr.take();
     let err_thread = stderr.map(|err| {
         thread::spawn(move || {
@@ -401,17 +432,7 @@ fn wait_child_cancellable(
                 return Ok(());
             }
             Ok(None) => {
-                let _ = progress.send(TransferProgress {
-                    id,
-                    done: 0,
-                    total: None,
-                    files_done: None,
-                    files_total: None,
-                    overall_done: None,
-                    overall_total: None,
-                    label: None,
-                    local_path: None,
-                });
+                // Cancel poll only — no progress spam (docker cp has no byte stream).
                 thread::sleep(Duration::from_millis(200));
             }
             Err(e) => bail!("wait docker cp: {e}"),

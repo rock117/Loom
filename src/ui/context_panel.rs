@@ -103,6 +103,8 @@ struct TransferRow {
     elapsed: Option<std::time::Duration>,
     bytes_done: u64,
     bytes_total: Option<u64>,
+    /// Coarse phase from the worker (`Copying…`) — rare updates only.
+    phase: Option<String>,
     /// Set on Remove/Clear so the SFTP worker aborts and frees the transfer lane.
     cancel: TransferCancel,
 }
@@ -1006,6 +1008,7 @@ impl ContextPanel {
                 } else {
                     Some(entry.size)
                 },
+                phase: None,
                 cancel: cancel.clone(),
             },
         );
@@ -1184,6 +1187,7 @@ impl ContextPanel {
                 elapsed: None,
                 bytes_done: 0,
                 bytes_total: if is_dir { None } else { Some(entry.size) },
+                phase: None,
                 cancel: cancel.clone(),
             },
         );
@@ -1485,6 +1489,7 @@ impl ContextPanel {
                 elapsed: None,
                 bytes_done: 0,
                 bytes_total: None,
+                phase: None,
                 cancel: cancel.clone(),
             },
         );
@@ -1619,6 +1624,7 @@ impl ContextPanel {
                 elapsed: None,
                 bytes_done: 0,
                 bytes_total: None,
+                phase: None,
                 cancel: cancel.clone(),
             },
         );
@@ -1751,6 +1757,8 @@ impl ContextPanel {
                 row.local_path = Some(path);
                 row.is_dir = false;
             }
+            // `None` clears a prior coarse phase once real SFTP ticks arrive.
+            row.phase = p.phase;
         }
     }
 
@@ -1785,6 +1793,7 @@ impl ContextPanel {
                     .map(|t| t.elapsed())
                     .unwrap_or_default(),
             );
+            row.phase = None;
             if row.open_after {
                 open_path = row.local_path.clone();
             }
@@ -1798,6 +1807,7 @@ impl ContextPanel {
     fn fail_transfer(&mut self, id: Uuid, msg: String) {
         if let Some(row) = self.find_transfer_mut(id) {
             row.elapsed = row.started_at.map(|t| t.elapsed());
+            row.phase = None;
             row.status = TransferStatus::Failed(msg);
         }
     }
@@ -6495,6 +6505,9 @@ fn transfer_status_label(row: &TransferRow) -> String {
             files_done,
             files_total,
         } => {
+            if let Some(phase) = row.phase.as_ref().filter(|s| !s.is_empty()) {
+                parts.push(phase.clone());
+            }
             if scanning {
                 parts.push(match files_total {
                     Some(t) => format!("Scanning · {t}"),
@@ -6504,7 +6517,13 @@ fn transfer_status_label(row: &TransferRow) -> String {
                 let d = files_done.unwrap_or(0);
                 parts.push(match files_total {
                     Some(t) => format!("{d}/{t}"),
-                    None => "…".into(),
+                    None => {
+                        if row.phase.is_some() {
+                            String::new()
+                        } else {
+                            "…".into()
+                        }
+                    }
                 });
             } else {
                 match total {
@@ -6514,11 +6533,13 @@ fn transfer_status_label(row: &TransferRow) -> String {
                     _ if *done > 0 => {
                         parts.push(format_size(*done));
                     }
-                    _ => {
+                    _ if row.phase.is_none() => {
                         parts.push("…".into());
                     }
+                    _ => {}
                 }
             }
+            parts.retain(|p| !p.is_empty());
         }
         TransferStatus::Done { files } => {
             parts.push("Done".into());

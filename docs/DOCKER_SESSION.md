@@ -2,7 +2,7 @@
 
 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[CONTEXT_PANEL.md](./CONTEXT_PANEL.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md)、[BACKLOG.md](./BACKLOG.md)。
 
-> **状态**：阶段 1（本机列表 + exec）**已实现**；阶段 2（本地 Files + `docker cp`）**已实现**；阶段 3（SSH Profile 列表 + exec + Files/`docker cp`）**已实现**（选择器远端 `docker ps` + Save Docker-over-SSH Profile）。阶段 4 仍须用户明确点名。  
+> **状态**：阶段 1（本机列表 + exec）**已实现**；阶段 2（本地 Files + `docker cp`）**已实现**；阶段 3（SSH Profile 列表 + exec + Files/`docker cp`）**已实现**。阶段 4 部分：断线/容器退出体验与粗粒度 cp 阶段 **已做**；钉选 Profile、exec 选项仍须用户点名。  
 > **文档约定**：中文。
 
 ## 一句话目标
@@ -180,7 +180,7 @@ Docker pane
 | 1 | 入口 UI + **本地** 容器列表 + exec 进 shell（无 Files） | **已实现**（本机） |
 | 2 | **本地** Files 浏览 + `docker cp` + Transfers / 取消 | **已实现** |
 | 3 | 模式 **SSH Profile**：远端列表 + exec + cp | **已实现**（picker SSH 列表 / Save；exec + Files 走 Docker-over-SSH Profile） |
-| 4 | 钉选 Profile、exec 选项、进度精细化 | 未做 |
+| 4 | 钉选 Profile、exec 选项；断线/容器退出文案与停容器探测、粗粒度 cp 阶段 | 断线 + 粗进度 **已做**；钉选 / exec 选项仍未做 |
 
 阶段 3：Docker 选择器 SSH 模式选 Profile → 后台 `list_running_containers_ssh`（缺密码走 `NeedSshPassword`）→ Save 为 `new_ssh_docker_profile`。
 
