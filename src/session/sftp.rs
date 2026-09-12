@@ -149,6 +149,67 @@ pub enum SftpRequest {
     HostProbe {
         reply: Sender<Result<crate::session::host_info::HostSnapshot>>,
     },
+    /// Docker-over-SSH browse / mutate (exec on Handle; no SFTP).
+    DockerHome {
+        container: String,
+        reply: Sender<Result<String>>,
+    },
+    DockerList {
+        container: String,
+        path: String,
+        reply: Sender<Result<Vec<RemoteEntry>>>,
+    },
+    DockerMkdir {
+        container: String,
+        path: String,
+        reply: Sender<Result<()>>,
+    },
+    DockerRemove {
+        container: String,
+        path: String,
+        is_dir: bool,
+        reply: Sender<Result<()>>,
+    },
+    DockerRename {
+        container: String,
+        from: String,
+        to: String,
+        reply: Sender<Result<()>>,
+    },
+    DockerChmod {
+        container: String,
+        path: String,
+        mode: u32,
+        reply: Sender<Result<()>>,
+    },
+    DockerProbe {
+        container: String,
+        reply: Sender<Result<crate::session::host_info::HostSnapshot>>,
+    },
+    DockerResolveDir {
+        container: String,
+        path: String,
+        reply: Sender<Result<String, String>>,
+    },
+    /// Stage with remote `docker cp`, then SFTP pull/push.
+    DockerDownload {
+        id: uuid::Uuid,
+        container: String,
+        remote: String,
+        local: PathBuf,
+        progress: Sender<TransferProgress>,
+        reply: Sender<Result<TransferOutcome>>,
+        cancel: TransferCancel,
+    },
+    DockerUpload {
+        id: uuid::Uuid,
+        container: String,
+        local: PathBuf,
+        remote_dir: String,
+        progress: Sender<TransferProgress>,
+        reply: Sender<Result<TransferOutcome>>,
+        cancel: TransferCancel,
+    },
 }
 
 /// Cloneable handle used by the UI to talk to the SSH thread's SFTP pool.
@@ -230,6 +291,20 @@ fn is_host_probe(req: &SftpRequest) -> bool {
     matches!(req, SftpRequest::HostProbe { .. })
 }
 
+fn is_docker_exec_request(req: &SftpRequest) -> bool {
+    matches!(
+        req,
+        SftpRequest::DockerHome { .. }
+            | SftpRequest::DockerList { .. }
+            | SftpRequest::DockerMkdir { .. }
+            | SftpRequest::DockerRemove { .. }
+            | SftpRequest::DockerRename { .. }
+            | SftpRequest::DockerChmod { .. }
+            | SftpRequest::DockerProbe { .. }
+            | SftpRequest::DockerResolveDir { .. }
+    )
+}
+
 /// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
 /// Sessions are opened lazily and closed after idle; closing `req_rx` tears the pool down.
 pub async fn run_sftp_worker(
@@ -257,6 +332,13 @@ pub async fn run_sftp_worker(
             tokio::spawn(async move {
                 let result = crate::session::host_info::collect_via_ssh(&session).await;
                 let _ = reply.send(result);
+            });
+            continue;
+        }
+        if is_docker_exec_request(&req) {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                dispatch_docker_exec(&session, req).await;
             });
             continue;
         }
@@ -424,6 +506,219 @@ async fn dispatch_request(
                 "host probe must not run on SFTP lane"
             )));
         }
+        SftpRequest::DockerDownload {
+            id,
+            container,
+            remote,
+            local,
+            progress,
+            reply,
+            cancel,
+        } => {
+            let _ = reply.send(
+                docker_download_staged(
+                    session, sftp, id, &container, &remote, &local, progress, cancel,
+                )
+                .await,
+            );
+        }
+        SftpRequest::DockerUpload {
+            id,
+            container,
+            local,
+            remote_dir,
+            progress,
+            reply,
+            cancel,
+        } => {
+            let _ = reply.send(
+                docker_upload_staged(
+                    session, sftp, id, &container, &local, &remote_dir, progress, cancel,
+                )
+                .await,
+            );
+        }
+        SftpRequest::DockerHome { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker browse must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DockerList { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker browse must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DockerMkdir { reply, .. }
+        | SftpRequest::DockerRemove { reply, .. }
+        | SftpRequest::DockerRename { reply, .. }
+        | SftpRequest::DockerChmod { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker browse must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DockerProbe { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker probe must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DockerResolveDir { reply, .. } => {
+            let _ = reply.send(Err("docker resolve must not run on SFTP lane".into()));
+        }
+    }
+}
+
+async fn dispatch_docker_exec(session: &client::Handle<ClientHandler>, req: SftpRequest) {
+    match req {
+        SftpRequest::DockerHome { container, reply } => {
+            let _ = reply.send(crate::session::docker_ssh::home_dir(session, &container).await);
+        }
+        SftpRequest::DockerList {
+            container,
+            path,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::list_dir(session, &container, &path).await,
+            );
+        }
+        SftpRequest::DockerMkdir {
+            container,
+            path,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::create_dir(session, &container, &path).await,
+            );
+        }
+        SftpRequest::DockerRemove {
+            container,
+            path,
+            is_dir,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::remove_path(session, &container, &path, is_dir)
+                    .await,
+            );
+        }
+        SftpRequest::DockerRename {
+            container,
+            from,
+            to,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::rename(session, &container, &from, &to).await,
+            );
+        }
+        SftpRequest::DockerChmod {
+            container,
+            path,
+            mode,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::chmod(session, &container, &path, mode).await,
+            );
+        }
+        SftpRequest::DockerProbe { container, reply } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::container_snapshot(session, &container).await,
+            );
+        }
+        SftpRequest::DockerResolveDir {
+            container,
+            path,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::resolve_existing_dir(session, &container, &path)
+                    .await,
+            );
+        }
+        _ => {}
+    }
+}
+
+async fn docker_download_staged(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    id: uuid::Uuid,
+    container: &str,
+    remote: &str,
+    local: &Path,
+    progress: Sender<TransferProgress>,
+    cancel: TransferCancel,
+) -> Result<TransferOutcome> {
+    ensure_not_cancelled(&cancel)?;
+    let name = path_basename(remote);
+    let tmp = crate::session::docker_ssh::mktemp_dir(session).await?;
+    let staged = format!("{tmp}/{name}");
+    if let Err(err) =
+        crate::session::docker_ssh::docker_cp_out(session, container, remote, &staged).await
+    {
+        let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
+        return Err(err);
+    }
+    let result = download_path(
+        session,
+        sftp,
+        id,
+        &staged,
+        local,
+        &TransferOptions::default(),
+        &progress,
+        &cancel,
+    )
+    .await;
+    let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
+    result
+}
+
+async fn docker_upload_staged(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    id: uuid::Uuid,
+    container: &str,
+    local: &Path,
+    remote_dir: &str,
+    progress: Sender<TransferProgress>,
+    cancel: TransferCancel,
+) -> Result<TransferOutcome> {
+    ensure_not_cancelled(&cancel)?;
+    let name = local
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid local path"))?;
+    let tmp = crate::session::docker_ssh::mktemp_dir(session).await?;
+    let staged_dir = tmp.clone();
+    let outcome = upload_path(
+        sftp,
+        id,
+        local,
+        &staged_dir,
+        &TransferOptions::default(),
+        &progress,
+        &cancel,
+    )
+    .await;
+    let staged = format!("{tmp}/{name}");
+    match outcome {
+        Ok(o) => {
+            if let Err(err) =
+                crate::session::docker_ssh::docker_cp_in(session, container, &staged, remote_dir)
+                    .await
+            {
+                let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
+                return Err(err);
+            }
+            let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
+            Ok(o)
+        }
+        Err(err) => {
+            let _ = crate::session::docker_ssh::rm_rf(session, &tmp).await;
+            Err(err)
+        }
     }
 }
 
@@ -444,23 +739,34 @@ async fn open_sftp(session: &client::Handle<ClientHandler>) -> Result<SftpSessio
 fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
     let msg = format!("{err:#}");
     match req {
-        SftpRequest::Home { reply } => {
+        SftpRequest::Home { reply }
+        | SftpRequest::DockerHome { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
-        SftpRequest::List { reply, .. } => {
+        SftpRequest::List { reply, .. } | SftpRequest::DockerList { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
-        SftpRequest::Download { reply, .. } | SftpRequest::Upload { reply, .. } => {
+        SftpRequest::Download { reply, .. }
+        | SftpRequest::Upload { reply, .. }
+        | SftpRequest::DockerDownload { reply, .. }
+        | SftpRequest::DockerUpload { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::Mkdir { reply, .. }
         | SftpRequest::Remove { reply, .. }
         | SftpRequest::Rename { reply, .. }
-        | SftpRequest::Chmod { reply, .. } => {
+        | SftpRequest::Chmod { reply, .. }
+        | SftpRequest::DockerMkdir { reply, .. }
+        | SftpRequest::DockerRemove { reply, .. }
+        | SftpRequest::DockerRename { reply, .. }
+        | SftpRequest::DockerChmod { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
-        SftpRequest::HostProbe { reply } => {
+        SftpRequest::HostProbe { reply } | SftpRequest::DockerProbe { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
+        }
+        SftpRequest::DockerResolveDir { reply, .. } => {
+            let _ = reply.send(Err(msg));
         }
     }
 }

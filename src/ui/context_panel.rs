@@ -310,12 +310,15 @@ impl ContextPanel {
         let tab = self.tabs.read(cx).active_tab()?;
         let pane = tab.focused_pane()?;
         let id = pane.id;
-        if let Some(sftp) = pane.ssh_sftp.clone() {
-            return Some((id, FilesKind::Sftp, Some(sftp)));
-        }
-        // Docker is also `ProfileKind::Local` — check before host Local FS.
+        // Docker Local / Docker-over-SSH before plain Local or host SFTP.
         if pane.kind.is_docker_local() {
             return Some((id, FilesKind::Docker, None));
+        }
+        if pane.kind.is_docker_ssh() {
+            return Some((id, FilesKind::Docker, pane.ssh_sftp.clone()));
+        }
+        if let Some(sftp) = pane.ssh_sftp.clone() {
+            return Some((id, FilesKind::Sftp, Some(sftp)));
         }
         if pane.kind.is_local() {
             return Some((id, FilesKind::Local, None));
@@ -323,11 +326,25 @@ impl ContextPanel {
         None
     }
 
-    fn focused_docker_container(&self, cx: &App) -> Option<(Uuid, String)> {
+    /// `(pane_id, container_id, optional SFTP handle for Docker-over-SSH)`.
+    fn focused_docker(
+        &self,
+        cx: &App,
+    ) -> Option<(Uuid, String, Option<SftpHandle>)> {
         let tab = self.tabs.read(cx).active_tab()?;
         let pane = tab.focused_pane()?;
         let id = docker_fs::container_id_from_kind(&pane.kind)?.to_string();
-        Some((pane.id, id))
+        let sftp = if pane.kind.is_docker_ssh() {
+            pane.ssh_sftp.clone()
+        } else {
+            None
+        };
+        Some((pane.id, id, sftp))
+    }
+
+    fn focused_docker_container(&self, cx: &App) -> Option<(Uuid, String)> {
+        let (pane_id, container, _) = self.focused_docker(cx)?;
+        Some((pane_id, container))
     }
 
     fn files_supports_transfer(&self) -> bool {
@@ -500,11 +517,51 @@ impl ContextPanel {
     }
 
     fn go_home_docker(&mut self, cx: &mut Context<Self>) {
-        let Some((_, container)) = self.focused_docker_container(cx) else {
+        let Some((_, container, sftp)) = self.focused_docker(cx) else {
             self.error = Some("Docker container unavailable".into());
             cx.notify();
             return;
         };
+        if let Some(sftp) = sftp {
+            let (tx, rx) = flume::bounded(1);
+            if sftp
+                .request(SftpRequest::DockerHome {
+                    container,
+                    reply: tx,
+                })
+                .is_err()
+            {
+                self.error = Some("SSH session unavailable".into());
+                cx.notify();
+                return;
+            }
+            self.listing = true;
+            self.error = None;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let result = rx.recv_async().await;
+                this.update(cx, |this, cx| {
+                    this.listing = false;
+                    match result {
+                        Ok(Ok(home)) => {
+                            this.home = Some(home.clone());
+                            this.load_dir(home, cx);
+                        }
+                        Ok(Err(err)) => {
+                            this.error = Some(format!("{err:#}"));
+                            cx.notify();
+                        }
+                        Err(_) => {
+                            this.error = Some("Docker home request cancelled".into());
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         self.listing = true;
         self.error = None;
         cx.notify();
@@ -649,11 +706,63 @@ impl ContextPanel {
     }
 
     fn load_dir_docker(&mut self, path: String, cx: &mut Context<Self>) {
-        let Some((_, container)) = self.focused_docker_container(cx) else {
+        let Some((_, container, sftp)) = self.focused_docker(cx) else {
             self.error = Some("Docker container unavailable".into());
             cx.notify();
             return;
         };
+        if let Some(sftp) = sftp {
+            let (tx, rx) = flume::bounded(1);
+            if sftp
+                .request(SftpRequest::DockerList {
+                    container,
+                    path: path.clone(),
+                    reply: tx,
+                })
+                .is_err()
+            {
+                self.error = Some("SSH session unavailable".into());
+                cx.notify();
+                return;
+            }
+            self.list_gen = self.list_gen.wrapping_add(1);
+            let req_gen = self.list_gen;
+            self.listing = true;
+            self.error = None;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                let result = rx.recv_async().await;
+                this.update(cx, |this, cx| {
+                    if req_gen != this.list_gen {
+                        return;
+                    }
+                    this.listing = false;
+                    match result {
+                        Ok(Ok(entries)) => {
+                            this.cwd = Some(path.clone());
+                            this.path_edit = RenameEdit::new(path);
+                            this.editing_path = false;
+                            this.entries = entries;
+                            this.selected = None;
+                            this.error = None;
+                        }
+                        Ok(Err(err)) => {
+                            this.error = Some(format!(
+                                "{err:#} (path missing or not a directory)"
+                            ));
+                            this.editing_path = true;
+                        }
+                        Err(_) => {
+                            this.error = Some("List cancelled".into());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         self.list_gen = self.list_gen.wrapping_add(1);
         let req_gen = self.list_gen;
         self.listing = true;
@@ -817,7 +926,7 @@ impl ContextPanel {
                     self.start_uploads(pane_id, sftp, dest, locals, TransferOptions::default(), cx);
                 }
                 Some(FilesKind::Docker) => {
-                    let Some((_, container)) = self.focused_docker_container(cx) else {
+                    let Some((_, container, sftp)) = self.focused_docker(cx) else {
                         self.error = Some("Docker container unavailable".into());
                         cx.notify();
                         return;
@@ -825,6 +934,7 @@ impl ContextPanel {
                     self.start_uploads_docker(
                         pane_id,
                         container,
+                        sftp,
                         dest,
                         locals,
                         cx,
@@ -1044,7 +1154,7 @@ impl ContextPanel {
         dest_dir: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        let Some((pane_id, container)) = self.focused_docker_container(cx) else {
+        let Some((pane_id, container, sftp)) = self.focused_docker(cx) else {
             self.error = Some("Docker container unavailable".into());
             cx.notify();
             return;
@@ -1135,18 +1245,41 @@ impl ContextPanel {
 
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
-            let cancel_flag = cancel.clone();
-            std::thread::spawn(move || {
-                let result = docker_fs::copy_from_container(
-                    &container,
-                    &remote,
-                    &local,
-                    id,
-                    progress_tx,
-                    cancel_flag,
-                );
-                let _ = reply_tx.send(result);
-            });
+
+            if let Some(sftp) = sftp {
+                if sftp
+                    .request(SftpRequest::DockerDownload {
+                        id,
+                        container,
+                        remote,
+                        local,
+                        progress: progress_tx,
+                        reply: reply_tx,
+                        cancel,
+                    })
+                    .is_err()
+                {
+                    this.update(cx, |this, cx| {
+                        this.fail_transfer(id, "SSH session unavailable".into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            } else {
+                let cancel_flag = cancel.clone();
+                std::thread::spawn(move || {
+                    let result = docker_fs::copy_from_container(
+                        &container,
+                        &remote,
+                        &local,
+                        id,
+                        progress_tx,
+                        cancel_flag,
+                    );
+                    let _ = reply_tx.send(result);
+                });
+            }
 
             loop {
                 tokio::select! {
@@ -1438,6 +1571,7 @@ impl ContextPanel {
         &mut self,
         pane_id: Uuid,
         container: String,
+        sftp: Option<SftpHandle>,
         remote_dir: String,
         locals: Vec<PathBuf>,
         cx: &mut Context<Self>,
@@ -1446,6 +1580,7 @@ impl ContextPanel {
             self.start_one_upload_docker(
                 pane_id,
                 container.clone(),
+                sftp.clone(),
                 remote_dir.clone(),
                 local,
                 cx,
@@ -1457,6 +1592,7 @@ impl ContextPanel {
         &mut self,
         pane_id: Uuid,
         container: String,
+        sftp: Option<SftpHandle>,
         remote_dir: String,
         local: PathBuf,
         cx: &mut Context<Self>,
@@ -1491,19 +1627,40 @@ impl ContextPanel {
         cx.spawn(async move |this, cx| {
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
-            let cancel_flag = cancel.clone();
-            std::thread::spawn(move || {
-                // Dest is the container directory; docker places the basename inside it.
-                let result = docker_fs::copy_to_container(
-                    &container,
-                    &local,
-                    &remote_dir,
-                    id,
-                    progress_tx,
-                    cancel_flag,
-                );
-                let _ = reply_tx.send(result);
-            });
+            if let Some(sftp) = sftp {
+                if sftp
+                    .request(SftpRequest::DockerUpload {
+                        id,
+                        container,
+                        local,
+                        remote_dir,
+                        progress: progress_tx,
+                        reply: reply_tx,
+                        cancel,
+                    })
+                    .is_err()
+                {
+                    this.update(cx, |this, cx| {
+                        this.fail_transfer(id, "SSH session unavailable".into());
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            } else {
+                let cancel_flag = cancel.clone();
+                std::thread::spawn(move || {
+                    let result = docker_fs::copy_to_container(
+                        &container,
+                        &local,
+                        &remote_dir,
+                        id,
+                        progress_tx,
+                        cancel_flag,
+                    );
+                    let _ = reply_tx.send(result);
+                });
+            }
 
             loop {
                 tokio::select! {
@@ -1824,7 +1981,7 @@ impl ContextPanel {
                 }
             },
             Some(FilesKind::Docker) => {
-                let Some((_, container)) = self.focused_docker_container(cx) else {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
                     self.error = Some("Docker container unavailable".into());
                     cx.notify();
                     return;
@@ -1833,6 +1990,49 @@ impl ContextPanel {
                 if trimmed.is_empty() {
                     self.error = Some("Path is empty".into());
                     cx.notify();
+                    return;
+                }
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerResolveDir {
+                            container,
+                            path: trimmed,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    self.listing = true;
+                    cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            this.listing = false;
+                            match result {
+                                Ok(Ok(dir)) => {
+                                    this.editing_path = false;
+                                    this.error = None;
+                                    this.load_dir(dir, cx);
+                                }
+                                Ok(Err(msg)) => {
+                                    this.error = Some(msg);
+                                    this.editing_path = true;
+                                    cx.notify();
+                                }
+                                Err(_) => {
+                                    this.error = Some("Path check cancelled".into());
+                                    this.editing_path = true;
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
                     return;
                 }
                 self.listing = true;
@@ -2375,12 +2575,12 @@ impl ContextPanel {
             PendingTransfer::Upload { pane_id, locals } => {
                 match self.files_kind {
                     Some(FilesKind::Docker) => {
-                        let Some((_, container)) = self.focused_docker_container(cx) else {
+                        let Some((_, container, sftp)) = self.focused_docker(cx) else {
                             self.error = Some("Docker container unavailable".into());
                             cx.notify();
                             return;
                         };
-                        self.start_uploads_docker(pane_id, container, dest, locals, cx);
+                        self.start_uploads_docker(pane_id, container, sftp, dest, locals, cx);
                     }
                     _ => {
                         let Some((_, sftp)) = self.focused_sftp(cx) else {
@@ -2467,9 +2667,42 @@ impl ContextPanel {
                 .detach();
             }
             Some(FilesKind::Docker) => {
-                let Some((_, container)) = self.focused_docker_container(cx) else {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
                     return;
                 };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerMkdir {
+                            container,
+                            path: path.clone(),
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(())) => {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                }
+                                Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                                Err(_) => this.error = Some("Mkdir cancelled".into()),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move {
@@ -2555,9 +2788,43 @@ impl ContextPanel {
                 .detach();
             }
             Some(FilesKind::Docker) => {
-                let Some((_, container)) = self.focused_docker_container(cx) else {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
                     return;
                 };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerRename {
+                            container,
+                            from: from.clone(),
+                            to: to.clone(),
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(())) => {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                }
+                                Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                                Err(_) => this.error = Some("Rename cancelled".into()),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move {
@@ -2642,9 +2909,43 @@ impl ContextPanel {
                 .detach();
             }
             Some(FilesKind::Docker) => {
-                let Some((_, container)) = self.focused_docker_container(cx) else {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
                     return;
                 };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerChmod {
+                            container,
+                            path: path.clone(),
+                            mode,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(())) => {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                }
+                                Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                                Err(_) => this.error = Some("Chmod cancelled".into()),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move {
@@ -2729,9 +3030,43 @@ impl ContextPanel {
                 .detach();
             }
             Some(FilesKind::Docker) => {
-                let Some((_, container)) = self.focused_docker_container(cx) else {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
                     return;
                 };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerRemove {
+                            container,
+                            path: path.clone(),
+                            is_dir,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(())) => {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                }
+                                Ok(Err(err)) => this.error = Some(format!("{err:#}")),
+                                Err(_) => this.error = Some("Delete cancelled".into()),
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move {
@@ -4402,7 +4737,7 @@ impl ContextPanel {
                 return;
             }
             // Local without going through focused_files? use profile kind.
-            if pane.kind.is_docker_local() {
+            if pane.kind.is_docker_local() || pane.kind.is_docker_ssh() {
                 self.start_docker_host_probe(pane.id, cx);
                 return;
             }
@@ -4487,7 +4822,7 @@ impl ContextPanel {
     }
 
     fn start_docker_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        let Some((_, container)) = self.focused_docker_container(cx) else {
+        let Some((_, container, sftp)) = self.focused_docker(cx) else {
             self.host_info_error = Some("Docker container unavailable".into());
             cx.notify();
             return;
@@ -4496,6 +4831,43 @@ impl ContextPanel {
         self.host_info_error = None;
         self.host_info_pane = Some(pane_id);
         cx.notify();
+        if let Some(sftp) = sftp {
+            let (tx, rx) = flume::bounded(1);
+            if sftp
+                .request(SftpRequest::DockerProbe {
+                    container,
+                    reply: tx,
+                })
+                .is_err()
+            {
+                self.host_info_loading = false;
+                self.host_info_error = Some("SSH session unavailable".into());
+                cx.notify();
+                return;
+            }
+            cx.spawn(async move |this, cx| {
+                let result = rx.recv_async().await;
+                this.update(cx, |this, cx| {
+                    this.host_info_loading = false;
+                    match result {
+                        Ok(Ok(snap)) => {
+                            this.host_info = Some(snap);
+                            this.host_info_error = None;
+                        }
+                        Ok(Err(err)) => {
+                            this.host_info_error = Some(format!("{err:#}"));
+                        }
+                        Err(_) => {
+                            this.host_info_error = Some("Host probe cancelled".into());
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { docker_fs::container_snapshot(&container) })
@@ -5396,6 +5768,7 @@ impl ContextPanel {
                 port,
                 user,
                 auth,
+                ..
             } => {
                 let identity = match auth {
                     SshAuth::PrivateKey { path } => Some(path.clone()),

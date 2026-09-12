@@ -175,6 +175,7 @@ impl SshForm {
             port,
             user,
             auth,
+            ..
         } = profile.kind
         else {
             self.error = Some("Not an SSH profile".into());
@@ -233,6 +234,7 @@ impl SshForm {
             port,
             user,
             auth,
+            ..
         } = kind
         else {
             self.error = Some("Not an SSH session".into());
@@ -636,6 +638,7 @@ impl SshForm {
                     port,
                     user,
                     auth,
+                    docker_container: None,
                 },
                 forwards: self.forwards.clone(),
             };

@@ -33,6 +33,9 @@ pub struct SshConnectParams {
     pub auth: SshAuthMaterial,
     pub cols: u32,
     pub rows: u32,
+    /// When set, request a PTY then `exec` this command instead of a login shell
+    /// (used for remote `docker exec -it …`).
+    pub remote_command: Option<String>,
 }
 
 /// Handles returned to the UI after a successful SSH shell start.
@@ -136,6 +139,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let auth = params.auth.clone();
     let cols = params.cols.max(1);
     let rows = params.rows.max(1);
+    let remote_command = params.remote_command.clone();
 
     thread::Builder::new()
         .name("loom-ssh".into())
@@ -160,6 +164,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                     auth,
                     cols,
                     rows,
+                    remote_command,
                     stdin_rx,
                     stdout_tx.clone(),
                     resize_rx,
@@ -214,6 +219,7 @@ async fn run_session(
     auth: SshAuthMaterial,
     cols: u32,
     rows: u32,
+    remote_command: Option<String>,
     stdin_rx: Receiver<Vec<u8>>,
     stdout_tx: Sender<Vec<u8>>,
     resize_rx: Receiver<(u32, u32)>,
@@ -251,10 +257,17 @@ async fn run_session(
         .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
         .await
         .context("request PTY")?;
-    channel
-        .request_shell(true)
-        .await
-        .context("request shell")?;
+    if let Some(cmd) = remote_command.as_deref() {
+        channel
+            .exec(true, cmd)
+            .await
+            .context("request remote command")?;
+    } else {
+        channel
+            .request_shell(true)
+            .await
+            .context("request shell")?;
+    }
 
     // Share Handle via Arc so SFTP / forwards can open channels while the shell runs.
     let session = Arc::new(session);
@@ -393,4 +406,110 @@ async fn authenticate(
         }
     }
     Ok(())
+}
+
+/// One-shot SSH `exec` without a PTY (listing / probes). Must not run on the UI thread.
+pub fn exec_once_blocking(
+    host: &str,
+    port: u16,
+    user: &str,
+    auth: SshAuthMaterial,
+    command: &str,
+) -> Result<String> {
+    let host = host.to_string();
+    let user = user.to_string();
+    let command = command.to_string();
+    let (tx, rx) = flume::bounded(1);
+    thread::Builder::new()
+        .name("loom-ssh-exec".into())
+        .spawn(move || {
+            let rt = match RtBuilder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(err) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("tokio runtime: {err}")));
+                    return;
+                }
+            };
+            let result = rt.block_on(async move {
+                exec_once_async(&host, port, &user, auth, &command).await
+            });
+            let _ = tx.send(result);
+        })
+        .context("spawn SSH exec thread")?;
+    match rx.recv_timeout(Duration::from_secs(45)) {
+        Ok(r) => r,
+        Err(_) => bail!("SSH command timed out"),
+    }
+}
+
+async fn exec_once_async(
+    host: &str,
+    port: u16,
+    user: &str,
+    auth: SshAuthMaterial,
+    command: &str,
+) -> Result<String> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(60)),
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
+    let handler = ClientHandler {
+        host: host.to_string(),
+        port,
+    };
+    let mut session = client::connect(config, (host, port), handler)
+        .await
+        .with_context(|| format!("connect to {host}:{port}"))?;
+    authenticate(&mut session, user, auth)
+        .await
+        .context("SSH authentication")?;
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .context("open exec channel")?;
+    channel
+        .exec(true, command)
+        .await
+        .context("exec remote command")?;
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut status = None;
+    loop {
+        match channel.wait().await {
+            Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
+            Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
+            Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
+            Some(ChannelMsg::Eof) | None => break,
+            _ => {}
+        }
+    }
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "done", "")
+        .await;
+    if status != Some(0) {
+        let err = String::from_utf8_lossy(&stderr);
+        let out = String::from_utf8_lossy(&stdout);
+        let detail = [err.trim(), out.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("remote command failed");
+        bail!("{detail}");
+    }
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// POSIX single-quote wrap for remote shell fragments.
+pub fn shell_single_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }

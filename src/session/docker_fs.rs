@@ -15,8 +15,11 @@ use super::docker::{container_id_from_args, docker_program};
 use super::sftp::{RemoteEntry, TransferCancel, TransferOutcome, TransferProgress};
 use crate::model::ProfileKind;
 
-/// Resolve container id from a Docker Local profile kind.
+/// Resolve container id from a Docker Local or Docker-over-SSH profile kind.
 pub fn container_id_from_kind(kind: &ProfileKind) -> Option<&str> {
+    if let Some(id) = kind.docker_ssh_container_id() {
+        return Some(id);
+    }
     match kind {
         ProfileKind::Local { args, .. } if kind.is_docker_local() => {
             container_id_from_args(args)

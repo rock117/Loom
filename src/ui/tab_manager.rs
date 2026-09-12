@@ -345,11 +345,20 @@ impl TabManager {
         cx: &mut Context<Self>,
     ) {
         let ProfileKind::Ssh {
-            host, port, user, ..
+            host,
+            port,
+            user,
+            docker_container,
+            ..
         } = kind
         else {
             return;
         };
+
+        let remote_command = docker_container
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(crate::session::docker::exec_remote_command);
 
         let params = SshConnectParams {
             host: host.clone(),
@@ -358,6 +367,7 @@ impl TabManager {
             auth,
             cols: 80,
             rows: 24,
+            remote_command,
         };
         let family = if font_family.trim().is_empty() {
             platform::monospace_font_family().to_string()

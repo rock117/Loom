@@ -78,9 +78,9 @@ Drag the sash between the file list and Transfers to change their height ratio
 Files browses the local filesystem (terminal working directory as home when known).  
 Transfers footer stays empty unless an SSH pane is focused. Use Reveal / Copy Path from the terminal context menu as needed.
 
-### Docker sessions（本机 Files 已通）
+### Docker sessions（本机 + SSH 宿主）
 
-入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。本机：Files UX 同 SSH；后端 `docker_fs` 列举 + `docker cp`。经 SSH 的远端 Docker 仍属阶段 3。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
+入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。本机：`docker_fs`；经 SSH：`docker_ssh`（列举 + 远端 `docker cp` 再 SFTP）。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
 
 ## Info
 
@@ -111,7 +111,7 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 | Doc | `docs/CONTEXT_PANEL.md`、`docs/SFTP_POOL.md` |
 | SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
-| Docker FS | `src/session/docker_fs.rs`（本机容器；`docker exec` 列举 / `docker cp` 传输） |
+| Docker FS | `src/session/docker_fs.rs`（本机）；`src/session/docker_ssh.rs`（经 SSH） |
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
 | UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs`、`src/ui/transfer_settings.rs` |
 | Transfer filter / archive | `src/session/transfer_filter.rs`、`src/session/transfer_archive.rs` |

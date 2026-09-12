@@ -2,7 +2,7 @@
 
 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[CONTEXT_PANEL.md](./CONTEXT_PANEL.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md)、[BACKLOG.md](./BACKLOG.md)。
 
-> **状态**：阶段 1（本机列表 + exec）**已实现**；阶段 2（本地 Files + `docker cp`）**已实现**；SSH 远端未做。实现后续阶段仍须用户明确点名。  
+> **状态**：阶段 1（本机列表 + exec）**已实现**；阶段 2（本地 Files + `docker cp`）**已实现**；阶段 3（SSH Profile 列表 + exec + Files/`docker cp`）**已实现**（选择器远端 `docker ps` + Save Docker-over-SSH Profile）。阶段 4 仍须用户明确点名。  
 > **文档约定**：中文。
 
 ## 一句话目标
@@ -178,10 +178,10 @@ Docker pane
 | 0 | 本规格（含图标双模式入口） | **完成** |
 | 1 | 入口 UI + **本地** 容器列表 + exec 进 shell（无 Files） | **已实现**（本机） |
 | 2 | **本地** Files 浏览 + `docker cp` + Transfers / 取消 | **已实现** |
-| 3 | 模式 **SSH Profile**：远端列表 + exec + cp | UI 壳已有；后端未做 |
+| 3 | 模式 **SSH Profile**：远端列表 + exec + cp | **已实现**（picker SSH 列表 / Save；exec + Files 走 Docker-over-SSH Profile） |
 | 4 | 钉选 Profile、exec 选项、进度精细化 | 未做 |
 
-阶段 1 即可做出「本地 | SSH Profile」切换壳；SSH 页在阶段 3 前可为「即将推出」或禁用。
+阶段 3：Docker 选择器 SSH 模式选 Profile → 后台 `list_running_containers_ssh`（缺密码走 `NeedSshPassword`）→ Save 为 `new_ssh_docker_profile`。
 
 ## 实现映射（落地时填写）
 
@@ -189,10 +189,10 @@ Docker pane
 |----|----------|
 | 规格 | `docs/DOCKER_SESSION.md`（本文） |
 | 选择器 UI | `src/ui/docker_picker.rs`；侧栏 `icons/ui/docker.svg` |
-| 会话 / exec | `src/session/docker.rs` + `TabManager::open_ephemeral_docker`（Local `docker exec`） |
-| Files 桥 | `src/session/docker_fs.rs`（list / mkdir / rm / mv / chmod / `docker cp`） |
-| Context | `context_panel.rs` · `FilesKind::Docker`（焦点 Docker pane 时；勿当 Local 宿主 FS） |
-| Pane | 阶段 1 复用 `ProfileKind::Local` + docker argv；Ephemeral Tab |
+| 会话 / exec | `docker.rs` + Local exec；SSH：`ProfileKind::Ssh.docker_container` + PTY `request_exec` |
+| Files 桥 | 本机 `docker_fs.rs`；远端 `docker_ssh.rs`（exec 列举 + `docker cp` 暂存 + SFTP） |
+| Context | `FilesKind::Docker`（Local 或 Docker-over-SSH；后者优先于宿主 SFTP） |
+| Pane | Local docker argv，或 SSH + `docker_container` |
 
 ## 验收
 
