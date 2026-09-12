@@ -322,22 +322,21 @@ impl WorkspaceView {
         view._subscriptions.push(cx.subscribe_in(
             &docker_picker,
             window,
-            move |this, _, event: &DockerPickerEvent, _window, cx| match event {
+            move |this, _, event: &DockerPickerEvent, window, cx| match event {
                 DockerPickerEvent::Close => {
                     this.show_docker_picker = false;
                     cx.notify();
                 }
-                DockerPickerEvent::OpenLocal {
-                    container_id,
-                    label,
+                DockerPickerEvent::Saved {
+                    profile_id,
+                    connect,
                 } => {
                     this.show_docker_picker = false;
-                    let id = container_id.clone();
-                    let label = label.clone();
-                    let store = this.store.clone();
-                    this.tabs.update(cx, |m, cx| {
-                        m.open_ephemeral_docker(&id, &label, &store, cx);
-                    });
+                    if *connect {
+                        this.open_profile_id(*profile_id, window, cx);
+                    } else {
+                        this.set_toast("Saved successfully", cx);
+                    }
                     cx.notify();
                 }
             },

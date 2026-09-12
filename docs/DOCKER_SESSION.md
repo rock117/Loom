@@ -62,8 +62,10 @@
 |----|------|
 | 模式 1 · 本地 | 本机 `docker ps`（优先 running）；刷新 / 搜索过滤 |
 | 模式 2 · SSH Profile | 列出工作区里已有的 **SSH Profile**；选中后再拉该机容器列表（经 SSH 执行 `docker ps`） |
+| **Name** | 与 WSL 相同：可编辑 Profile 名；选容器时若未手改则默认填容器名（重名自动加后缀） |
+| 按钮 | **Save**（只写入侧栏）/ **Save & Open**（写入并打开 Tab）；Enter = Save & Open |
 | 无 SSH Profile | 模式 2 显示空态 + 引导去 New SSH |
-| 打开结果 | 默认 **Ephemeral** Tab（不自动写入侧栏）；可选后期「钉为 Profile」 |
+| 打开结果 | Bound Session（侧栏可见 Docker 图标 Profile）；`docker exec -it …` |
 | 异步 | `docker ps` / SSH 列举均在后台；**禁止堵 UI 线程**；Windows 子进程用 `platform::new_command`（`CREATE_NO_WINDOW`） |
 | 错误 | 本机无 Docker、引擎未起、远端无 `docker`、权限不足 → 可操作错误文案，不卡死 |
 
@@ -153,9 +155,9 @@ Docker pane
 
 | 做 | 不做 |
 |----|------|
-| 侧栏继续只放 Local / SSH / WSL **Profile** | **不做**侧栏常驻 Docker 容器树 |
-| Docker 入口 = 图标弹层（模式 + 列表） | 把瞬时 `docker ps` 行当成 Profile |
-| 后期可选：钉「宿主 + 选择器」为 Profile | 第三套与 Group/Profile 平行的导航 |
+| 侧栏放 Local / SSH / WSL / **Docker**（`docker exec` Local Profile） | **不做**侧栏常驻 Docker 容器树（瞬时 `docker ps`） |
+| Docker 入口 = 图标弹层（模式 + **Name** + 列表 + Save / Save & Open） | 把瞬时列表行直接当 Profile（须经 Name 确认写入） |
+| 后期可选：SSH 宿主 + 容器选择器钉选 | 第三套与 Group/Profile 平行的导航 |
 
 ## Info 面板
 

@@ -158,6 +158,7 @@ impl Sidebar {
     fn profile_icon(kind: SidebarProfileKind) -> (&'static str, Hsla) {
         match kind {
             SidebarProfileKind::Wsl => ("icons/ui/wsl.svg", theme::ICON_WSL),
+            SidebarProfileKind::Docker => ("icons/ui/docker.svg", theme::ICON_DOCKER),
             SidebarProfileKind::Local => ("icons/ui/terminal.svg", theme::ICON_LOCAL),
             SidebarProfileKind::Ssh => ("icons/ui/remote.svg", theme::ICON_REMOTE),
         }

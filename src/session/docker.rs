@@ -200,6 +200,16 @@ pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Build a sidebar Profile for local `docker exec` (same shape as WSL Local profiles).
+pub fn new_profile(name: impl Into<String>, container_id: &str) -> crate::model::Profile {
+    crate::model::Profile {
+        id: uuid::Uuid::new_v4(),
+        name: name.into(),
+        kind: exec_profile_kind(container_id),
+        forwards: Vec::new(),
+    }
+}
+
 /// Soft probe used by the picker before listing (optional fast fail).
 #[allow(dead_code)]
 pub fn docker_engine_ok() -> Result<()> {

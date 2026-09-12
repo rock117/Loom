@@ -403,6 +403,7 @@ pub enum SidebarEntry {
 pub enum SidebarProfileKind {
     Local,
     Wsl,
+    Docker,
     Ssh,
 }
 
@@ -410,6 +411,8 @@ impl SidebarProfileKind {
     pub fn from_profile_kind(kind: &ProfileKind) -> Self {
         if kind.is_wsl_local() {
             Self::Wsl
+        } else if kind.is_docker_local() {
+            Self::Docker
         } else if kind.is_local() {
             Self::Local
         } else {
