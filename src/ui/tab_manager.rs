@@ -495,7 +495,13 @@ impl TabManager {
                 s.settings.local_proxy_no_proxy.clone(),
             )
         };
-        let spawn_cwd = cwd_override.as_deref().or(cwd.as_deref());
+        // Docker exec: never pass container OSC / profile cwd to docker.exe — on
+        // Windows a Unix path like `/root` can make CreateProcess fail (split/dup).
+        let spawn_cwd = if kind.is_docker_local() {
+            None
+        } else {
+            cwd_override.as_deref().or(cwd.as_deref())
+        };
         let pty = LocalPty::spawn(
             &shell_path,
             &spawn_args,
@@ -603,12 +609,19 @@ impl TabManager {
                 s.settings.local_proxy_no_proxy.clone(),
             )
         };
-        let spawn_cwd = cwd_override.or(cwd);
+        // Docker exec: ignore cwd_override (OSC/split) and profile cwd for the
+        // host docker.exe process — container paths are not valid Windows CWDs.
+        let spawn_cwd = if kind.is_docker_local() {
+            None
+        } else {
+            cwd_override.or(cwd)
+        };
         let font_size = self.font_size;
         let show_line_numbers = self.show_line_numbers;
         let ansi_palette = self.ansi_palette;
         let label_for_status = kind.summary();
         let cwd_for_ui = spawn_cwd.clone();
+        let is_docker = kind.is_docker_local();
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
@@ -651,9 +664,8 @@ impl TabManager {
                         let master = pty.master.clone();
                         let killer = pty.killer;
                         let resize = LocalPty::resize_callback(master.clone());
-                        // Docker exec: host spawn cwd is docker.exe's path — do not seed
-                        // terminal / status-bar cwd with it. Container path arrives via OSC.
-                        let working_dir = if kind.is_docker_local() {
+                        // Docker: do not seed terminal / status-bar cwd from host spawn path.
+                        let working_dir = if is_docker {
                             None
                         } else {
                             cwd_for_ui.or_else(LocalPty::default_cwd)
@@ -662,8 +674,7 @@ impl TabManager {
                             let mut view = TerminalView::new(pty.writer, pty.reader, config, cx)
                                 .with_resize_callback(resize)
                                 .with_local_session();
-                            // Skip process_cwd for Docker — PID is the host docker client.
-                            if kind.is_docker_local() {
+                            if is_docker {
                                 view = view.with_docker_session();
                             } else {
                                 view = view.with_shell_pid(pty.shell_pid);
