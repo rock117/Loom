@@ -304,6 +304,230 @@ pub fn docker_engine_ok() -> Result<()> {
     Ok(())
 }
 
+const MAX_DOCKER_PORTS: usize = 32;
+const MAX_DOCKER_VOLUMES: usize = 24;
+
+#[derive(Debug, Deserialize)]
+struct InspectJson {
+    #[serde(rename = "Id", default)]
+    id: String,
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Config")]
+    config: Option<InspectConfig>,
+    #[serde(rename = "State")]
+    state: Option<InspectState>,
+    #[serde(rename = "NetworkSettings")]
+    network: Option<InspectNetwork>,
+    #[serde(rename = "Mounts", default)]
+    mounts: Vec<InspectMount>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectConfig {
+    #[serde(rename = "Image", default)]
+    image: String,
+    #[serde(rename = "Hostname", default)]
+    hostname: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectState {
+    #[serde(rename = "Status", default)]
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectNetwork {
+    /// `null` binding = published but unbound / not mapped yet.
+    #[serde(rename = "Ports", default)]
+    ports: std::collections::BTreeMap<String, Option<Vec<InspectPortBinding>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectPortBinding {
+    #[serde(rename = "HostIp", default)]
+    host_ip: String,
+    #[serde(rename = "HostPort", default)]
+    host_port: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectMount {
+    #[serde(rename = "Type", default)]
+    type_: String,
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Source", default)]
+    source: String,
+    #[serde(rename = "Destination", default)]
+    destination: String,
+    #[serde(rename = "RW", default = "default_true")]
+    rw: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Build an Info-tab snapshot from `docker inspect --format '{{json .}}'` output.
+pub fn host_snapshot_from_inspect(
+    json: &str,
+    container_fallback: &str,
+    via_ssh: bool,
+) -> Result<crate::session::host_info::HostSnapshot> {
+    use crate::session::host_info::{DockerPortMap, DockerVolumeMap, HostSnapshot};
+
+    let raw = json.trim();
+    // Some clients wrap as a one-element array.
+    let inspect: InspectJson = if raw.starts_with('[') {
+        let list: Vec<InspectJson> =
+            serde_json::from_str(raw).context("parse docker inspect JSON array")?;
+        list.into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("docker inspect returned an empty array"))?
+    } else {
+        serde_json::from_str(raw).context("parse docker inspect JSON")?
+    };
+
+    let name = inspect
+        .name
+        .trim()
+        .trim_start_matches('/')
+        .to_string();
+    let name = if name.is_empty() {
+        container_fallback.trim().to_string()
+    } else {
+        name
+    };
+    let image = inspect
+        .config
+        .as_ref()
+        .map(|c| c.image.clone())
+        .unwrap_or_default();
+    let status = inspect
+        .state
+        .as_ref()
+        .map(|s| s.status.clone())
+        .unwrap_or_default();
+    let hostname = inspect
+        .config
+        .as_ref()
+        .map(|c| c.hostname.clone())
+        .unwrap_or_default();
+    let id = inspect.id.trim();
+    let short_id = if id.len() >= 12 { &id[..12] } else { id };
+
+    let mut docker_ports = Vec::new();
+    if let Some(net) = inspect.network.as_ref() {
+        for (container_port, bindings) in &net.ports {
+            match bindings {
+                None => {
+                    docker_ports.push(DockerPortMap {
+                        host: String::new(),
+                        container: container_port.clone(),
+                    });
+                }
+                Some(list) if list.is_empty() => {
+                    docker_ports.push(DockerPortMap {
+                        host: String::new(),
+                        container: container_port.clone(),
+                    });
+                }
+                Some(list) => {
+                    for b in list {
+                        let ip = if b.host_ip.is_empty() {
+                            "0.0.0.0"
+                        } else {
+                            b.host_ip.as_str()
+                        };
+                        let host = if b.host_port.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{ip}:{}", b.host_port)
+                        };
+                        docker_ports.push(DockerPortMap {
+                            host,
+                            container: container_port.clone(),
+                        });
+                    }
+                }
+            }
+            if docker_ports.len() >= MAX_DOCKER_PORTS {
+                break;
+            }
+        }
+        docker_ports.sort_by(|a, b| {
+            a.container
+                .cmp(&b.container)
+                .then_with(|| a.host.cmp(&b.host))
+        });
+        docker_ports.truncate(MAX_DOCKER_PORTS);
+    }
+
+    let mut docker_volumes = Vec::new();
+    for m in inspect.mounts {
+        let kind = if m.type_.is_empty() {
+            "mount".into()
+        } else {
+            m.type_.clone()
+        };
+        let source = if kind.eq_ignore_ascii_case("volume") && !m.name.is_empty() {
+            m.name
+        } else if kind.eq_ignore_ascii_case("tmpfs") {
+            String::new()
+        } else {
+            m.source
+        };
+        if m.destination.is_empty() && source.is_empty() {
+            continue;
+        }
+        docker_volumes.push(DockerVolumeMap {
+            kind,
+            source,
+            destination: m.destination,
+            read_only: !m.rw,
+        });
+        if docker_volumes.len() >= MAX_DOCKER_VOLUMES {
+            break;
+        }
+    }
+
+    let os = if via_ssh {
+        format!("Docker · {status} (SSH host)")
+    } else {
+        format!("Docker · {status}")
+    };
+    let title = if hostname.is_empty() {
+        name.clone()
+    } else {
+        hostname
+    };
+
+    Ok(HostSnapshot {
+        hostname: title,
+        os,
+        kernel: if short_id.is_empty() {
+            format!("container {container_fallback}")
+        } else {
+            format!("container {short_id}")
+        },
+        cpu_model: image,
+        cpu_cores: 0,
+        cpu_usage_pct: None,
+        mem_used: 0,
+        mem_total: 0,
+        disks: Vec::new(),
+        gpus: Vec::new(),
+        listening: Vec::new(),
+        load: Some(name),
+        uptime_secs: 0,
+        is_docker: true,
+        docker_ports,
+        docker_volumes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,5 +557,48 @@ mod tests {
         let cmd = exec_remote_command("abc");
         assert!(cmd.starts_with("docker exec -it abc sh -c "));
         assert!(cmd.contains("bash"));
+    }
+
+    #[test]
+    fn inspect_json_ports_and_mounts() {
+        let json = r#"{
+            "Id": "abcdef1234567890",
+            "Name": "/web",
+            "Config": {"Image": "nginx:latest", "Hostname": "web"},
+            "State": {"Status": "running"},
+            "NetworkSettings": {
+                "Ports": {
+                    "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}],
+                    "443/tcp": null
+                }
+            },
+            "Mounts": [
+                {"Type": "bind", "Source": "/data", "Destination": "/app", "RW": true},
+                {"Type": "volume", "Name": "pgdata", "Source": "/var/lib/docker/volumes/pgdata/_data", "Destination": "/var/lib/postgresql/data", "RW": false}
+            ]
+        }"#;
+        let snap = host_snapshot_from_inspect(json, "abcdef", false).unwrap();
+        assert!(snap.is_docker);
+        assert_eq!(snap.hostname, "web");
+        assert_eq!(snap.cpu_model, "nginx:latest");
+        assert_eq!(snap.docker_ports.len(), 2);
+        let p80 = snap
+            .docker_ports
+            .iter()
+            .find(|p| p.container == "80/tcp")
+            .expect("80/tcp");
+        assert_eq!(p80.host, "0.0.0.0:8080");
+        let p443 = snap
+            .docker_ports
+            .iter()
+            .find(|p| p.container == "443/tcp")
+            .expect("443/tcp");
+        assert!(p443.host.is_empty());
+        assert_eq!(snap.docker_volumes.len(), 2);
+        assert_eq!(snap.docker_volumes[0].kind, "bind");
+        assert_eq!(snap.docker_volumes[0].source, "/data");
+        assert_eq!(snap.docker_volumes[1].kind, "volume");
+        assert_eq!(snap.docker_volumes[1].source, "pgdata");
+        assert!(snap.docker_volumes[1].read_only);
     }
 }

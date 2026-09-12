@@ -4934,6 +4934,16 @@ impl ContextPanel {
         let loading = self.host_info_loading;
         let err = self.host_info_error.clone();
         let snap = self.host_info.clone();
+        let info_title = if snap.as_ref().is_some_and(|s| s.is_docker) {
+            "Container"
+        } else {
+            "Host"
+        };
+        let refresh_tip = if snap.as_ref().is_some_and(|s| s.is_docker) {
+            "Refresh container info"
+        } else {
+            "Refresh host info"
+        };
 
         // Industry pattern (narrow side panel): label+% · full-width continuous meter · used/total.
         // Severity on the fill (≥90% danger) — same idea as Activity Monitor / Task Manager.
@@ -5018,7 +5028,7 @@ impl ContextPanel {
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::TEXT_MUTED)
-                            .child("Host"),
+                            .child(info_title),
                     )
                     .child(
                         div()
@@ -5037,7 +5047,7 @@ impl ContextPanel {
                                     .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
                             })
                             .child(if loading { "…" } else { "↻" })
-                            .tooltip(|_, cx| Tooltip::text("Refresh host info", cx))
+                            .tooltip(move |_, cx| Tooltip::text(refresh_tip, cx))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if this.host_info_loading {
                                     return;
@@ -5051,7 +5061,11 @@ impl ContextPanel {
                     div()
                         .text_xs()
                         .text_color(theme::TEXT_MUTED)
-                        .child("Loading host info…"),
+                        .child(if info_title == "Container" {
+                            "Loading container info…"
+                        } else {
+                            "Loading host info…"
+                        }),
                 )
             })
             .when_some(err, |d, msg| {
@@ -5063,6 +5077,7 @@ impl ContextPanel {
                 )
             })
             .when_some(snap, |d, s| {
+                let is_docker = s.is_docker;
                 let os_line = if s.kernel.is_empty() {
                     s.os.clone()
                 } else {
@@ -5070,26 +5085,47 @@ impl ContextPanel {
                 };
                 let cpu_line = {
                     let model = if s.cpu_model.is_empty() {
-                        "—"
+                        "—".to_string()
                     } else {
-                        s.cpu_model.as_str()
+                        s.cpu_model.clone()
                     };
-                    // Keep the identity line short: cores (+ usage if known).
-                    if let Some(pct) = s.cpu_usage_pct {
+                    if is_docker {
+                        // Image identity only (no fake "0 cores").
+                        model
+                    } else if let Some(pct) = s.cpu_usage_pct {
                         format!("{model} · {} cores · {pct:.0}%", s.cpu_cores)
                     } else {
                         format!("{model} · {} cores", s.cpu_cores)
                     }
                 };
-                let footer = match &s.load {
-                    Some(load) if !load.is_empty() => {
-                        format!(
-                            "Load {load} · Up {}",
-                            host_info::format_uptime(s.uptime_secs)
-                        )
+                let footer = if is_docker {
+                    match &s.load {
+                        Some(name) if !name.is_empty() => format!("Name {name}"),
+                        _ => String::new(),
                     }
-                    _ => format!("Up {}", host_info::format_uptime(s.uptime_secs)),
+                } else {
+                    match &s.load {
+                        Some(load) if !load.is_empty() => {
+                            format!(
+                                "Load {load} · Up {}",
+                                host_info::format_uptime(s.uptime_secs)
+                            )
+                        }
+                        _ => format!("Up {}", host_info::format_uptime(s.uptime_secs)),
+                    }
                 };
+                let show_resources = !is_docker
+                    && (s.mem_total > 0 || !s.disks.is_empty() || !s.gpus.is_empty());
+                let docker_ports = s.docker_ports.clone();
+                let docker_volumes = s.docker_volumes.clone();
+                let mem_used = s.mem_used;
+                let mem_total = s.mem_total;
+                let mem_ratio = s.mem_ratio();
+                let hostname = s.hostname.clone();
+                let listening = s.listening;
+                let disks = s.disks;
+                let gpus = s.gpus;
+                let footer_for_resources = footer.clone();
 
                 d.child(
                     // Identity: hostname as title, OS/CPU as muted lines.
@@ -5103,7 +5139,7 @@ impl ContextPanel {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::TEXT)
                                 .overflow_hidden()
-                                .child(s.hostname.clone()),
+                                .child(hostname),
                         )
                         .child(
                             div()
@@ -5120,7 +5156,8 @@ impl ContextPanel {
                                 .child(cpu_line),
                         ),
                 )
-                .child(
+                .when(show_resources, |d| {
+                    d.child(
                     div()
                         .mt(px(theme::SPACE_1))
                         .pt(px(theme::SPACE_2))
@@ -5138,11 +5175,11 @@ impl ContextPanel {
                         )
                         .child(resource_meter(
                             "Memory".into(),
-                            s.mem_used,
-                            s.mem_total,
-                            s.mem_ratio(),
+                            mem_used,
+                            mem_total,
+                            mem_ratio,
                         ))
-                        .children(s.disks.into_iter().map(|d| {
+                        .children(disks.into_iter().map(|d| {
                             resource_meter(
                                 format!("Disk ({})", d.mount),
                                 d.used,
@@ -5150,7 +5187,7 @@ impl ContextPanel {
                                 d.ratio(),
                             )
                         }))
-                        .children(s.gpus.into_iter().map(|g| {
+                        .children(gpus.into_iter().map(|g| {
                             // Name + optional VRAM meter (same pattern as Memory/Disk).
                             let detail = match (g.vram_used, g.vram_total, g.usage_pct) {
                                 (Some(used), Some(total), Some(util)) => Some(format!(
@@ -5291,10 +5328,201 @@ impl ContextPanel {
                             div()
                                 .text_xs()
                                 .text_color(theme::TEXT_MUTED)
-                                .child(footer),
+                                .child(footer_for_resources),
                         ),
                 )
-                .when(!s.listening.is_empty(), |d| {
+                })
+                .when(is_docker && !footer.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .child(footer),
+                    )
+                })
+                .when(is_docker, |d| {
+                    d.child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .pt(px(theme::SPACE_2))
+                            .border_t_1()
+                            .border_color(theme::BORDER_SUBTLE)
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child("Ports"),
+                            )
+                            .when(docker_ports.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_DISABLED)
+                                        .child("No published ports"),
+                                )
+                            })
+                            .children(docker_ports.into_iter().map(|row| {
+                                let left = if row.host.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    row.host
+                                };
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT)
+                                            .overflow_hidden()
+                                            .child(left),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .child("→"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT_MUTED)
+                                            .overflow_hidden()
+                                            .child(row.container),
+                                    )
+                            })),
+                    )
+                    .child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .pt(px(theme::SPACE_2))
+                            .border_t_1()
+                            .border_color(theme::BORDER_SUBTLE)
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child("Volumes"),
+                            )
+                            .when(docker_volumes.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_DISABLED)
+                                        .child("No mounts"),
+                                )
+                            })
+                            .when(!docker_volumes.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(theme::SPACE_2))
+                                        .child(
+                                            div()
+                                                .w(px(52.0))
+                                                .text_xs()
+                                                .text_color(theme::TEXT_DISABLED)
+                                                .child("Type"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w(px(40.0))
+                                                .text_xs()
+                                                .text_color(theme::TEXT_DISABLED)
+                                                .whitespace_nowrap()
+                                                .child("Mode"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_DISABLED)
+                                                .child("Source"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_DISABLED)
+                                                .child("Destination"),
+                                        ),
+                                )
+                            })
+                            .children(docker_volumes.into_iter().map(|row| {
+                                let src = if row.source.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    row.source
+                                };
+                                let dest = if row.destination.is_empty() {
+                                    "—".to_string()
+                                } else {
+                                    row.destination
+                                };
+                                let mode = if row.read_only { "ro" } else { "rw" };
+                                let kind = row.kind;
+                                div()
+                                    .flex()
+                                    .items_start()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(
+                                        div()
+                                            .w(px(52.0))
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .overflow_hidden()
+                                            .child(kind),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px(40.0))
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT_MUTED)
+                                            .whitespace_nowrap()
+                                            .child(mode),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT)
+                                            .overflow_hidden()
+                                            .child(src),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .font_family("Consolas")
+                                            .text_color(theme::TEXT_MUTED)
+                                            .overflow_hidden()
+                                            .child(dest),
+                                    )
+                            })),
+                    )
+                })
+                .when(!listening.is_empty(), |d| {
                     d.child(
                         div()
                             .mt(px(theme::SPACE_1))
@@ -5311,7 +5539,7 @@ impl ContextPanel {
                                     .text_color(theme::TEXT_MUTED)
                                     .child("Listening"),
                             )
-                            .children(s.listening.into_iter().map(|row| {
+                            .children(listening.into_iter().map(|row| {
                                 let label = if row.proto == "udp" {
                                     format!("{} · udp", row.port)
                                 } else {
