@@ -314,7 +314,12 @@ impl TabBar {
             .iter()
             .find(|t| t.id == tab_id)
             .and_then(|t| t.focused_pane())
-            .is_some_and(|p| p.profile_id.is_some() && p.kind.is_local());
+            .is_some_and(|p| {
+                // Docker Local is ProfileKind::Local but has no host start-dir to Save.
+                p.profile_id.is_some()
+                    && p.kind.is_local()
+                    && !p.kind.is_docker_local()
+            });
         let current_group = profile_id.and_then(|pid| {
             self.store
                 .read(cx)
