@@ -481,21 +481,26 @@ async fn exec_once_async(
             Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
             Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
             Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
-            Some(ChannelMsg::Eof) | None => break,
+            // Do not stop on Eof — ExitStatus often arrives after it; missing status
+            // used to treat successful stdout (e.g. docker ps JSON) as an error.
+            Some(ChannelMsg::Eof) => {}
+            None => break,
             _ => {}
         }
     }
     let _ = session
         .disconnect(Disconnect::ByApplication, "done", "")
         .await;
-    if status != Some(0) {
-        let err = String::from_utf8_lossy(&stderr);
-        let out = String::from_utf8_lossy(&stdout);
-        let detail = [err.trim(), out.trim()]
-            .into_iter()
-            .find(|s| !s.is_empty())
-            .unwrap_or("remote command failed");
-        bail!("{detail}");
+    if let Some(code) = status {
+        if code != 0 {
+            let err = String::from_utf8_lossy(&stderr);
+            let out = String::from_utf8_lossy(&stdout);
+            let detail = [err.trim(), out.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or("remote command failed");
+            bail!("{detail}");
+        }
     }
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
