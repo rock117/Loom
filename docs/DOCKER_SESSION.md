@@ -26,6 +26,7 @@
 | 入口 | 本机 shell Profile | `user@host` Profile | **工具栏 Docker 图标 → 选宿主 → 选容器**（见下） |
 | Shell | portable-pty | russh PTY | **`docker exec -it`**（本机 CLI 或经 SSH）→ 同一套终端 pane |
 | Files | 本机目录（已有） | SFTP | **浏览 + `docker cp` 传输** |
+| 状态栏 cwd | 本机 / OSC | OSC | **仅容器内路径（OSC）**；不显示 `docker.exe` 宿主 cwd |
 | Transfers 页脚 | — | 已有 | **复用**（Queued / 进度 / 取消） |
 | Info | Local | SSH 摘要 | 容器名、ID、镜像、状态、宿主（本机 / 哪个 SSH Profile） |
 

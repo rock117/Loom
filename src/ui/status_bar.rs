@@ -88,7 +88,8 @@ impl StatusBar {
         }));
     }
 
-    /// Refresh live cwd for focused Local/WSL only (SSH remote cwd stays OSC-only).
+    /// Refresh live cwd for focused Local/WSL only (SSH / Docker stay OSC-only —
+    /// `process_cwd` on `docker.exe` is the host client cwd, not the container).
     fn poll_focused_local_cwd(&mut self, cx: &mut Context<Self>) {
         let term = self.tabs.read(cx).active.and_then(|id| {
             self.tabs
@@ -97,7 +98,9 @@ impl StatusBar {
                 .iter()
                 .find(|t| t.id == id)
                 .and_then(|t| t.focused_pane())
-                .filter(|p| p.kind.is_local() && p.terminal.is_some())
+                .filter(|p| {
+                    p.kind.is_local() && !p.kind.is_docker_local() && p.terminal.is_some()
+                })
                 .and_then(|p| p.terminal.clone())
         });
         let Some(term) = term else {
@@ -202,6 +205,12 @@ impl StatusBar {
             .terminal
             .as_ref()
             .and_then(|t| t.read(cx).working_directory());
+        // Docker: never fall back to Local spawn cwd (host path of docker.exe).
+        // Show OSC-reported container path only; hide until then. Also drop any
+        // stale host path left from older seeds / process_cwd polls.
+        if pane.kind.is_docker() {
+            return from_term.filter(|p| Self::docker_cwd_plausible(p));
+        }
         if from_term.is_some() {
             return from_term;
         }
@@ -209,6 +218,18 @@ impl StatusBar {
             ProfileKind::Local { cwd, .. } => cwd.clone(),
             ProfileKind::Ssh { .. } => None,
         }
+    }
+
+    /// Container paths are Unix-style; reject Windows drive / UNC (docker.exe client cwd).
+    fn docker_cwd_plausible(path: &std::path::Path) -> bool {
+        let s = path.to_string_lossy();
+        if s.len() >= 2 && s.as_bytes()[1] == b':' {
+            return false;
+        }
+        if s.starts_with(r"\\") {
+            return false;
+        }
+        true
     }
 
     fn cwd_segment(
