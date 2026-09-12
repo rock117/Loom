@@ -31,18 +31,21 @@ pub async fn remote_exec(
             Some(ChannelMsg::Data { ref data }) => stdout.extend_from_slice(data),
             Some(ChannelMsg::ExtendedData { ref data, .. }) => stderr.extend_from_slice(data),
             Some(ChannelMsg::ExitStatus { exit_status }) => status = Some(exit_status),
-            Some(ChannelMsg::Eof) | None => break,
+            Some(ChannelMsg::Eof) => {}
+            None => break,
             _ => {}
         }
     }
-    if status != Some(0) {
-        let err = String::from_utf8_lossy(&stderr);
-        let out = String::from_utf8_lossy(&stdout);
-        let detail = [err.trim(), out.trim()]
-            .into_iter()
-            .find(|s| !s.is_empty())
-            .unwrap_or("remote docker command failed");
-        bail!("{detail}");
+    if let Some(code) = status {
+        if code != 0 {
+            let err = String::from_utf8_lossy(&stderr);
+            let out = String::from_utf8_lossy(&stdout);
+            let detail = [err.trim(), out.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .unwrap_or("remote docker command failed");
+            bail!("{detail}");
+        }
     }
     Ok(String::from_utf8_lossy(&stdout).into_owned())
 }

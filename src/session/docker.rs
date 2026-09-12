@@ -43,11 +43,11 @@ impl ContainerInfo {
 struct DockerPsJson {
     #[serde(rename = "ID")]
     id: String,
-    #[serde(rename = "Names")]
+    #[serde(rename = "Names", default)]
     names: String,
-    #[serde(rename = "Image")]
+    #[serde(rename = "Image", default)]
     image: String,
-    #[serde(rename = "Status")]
+    #[serde(rename = "Status", default)]
     status: String,
 }
 
