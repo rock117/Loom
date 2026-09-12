@@ -2,7 +2,7 @@
 
 WindTerm-style **third column** on the right: a **session context panel** for the focused pane.
 
-Related: [ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[SFTP_POOL.md](./SFTP_POOL.md)**（SFTP 连接池 / 浏览与传输并行 / 资源回收，中文规格）、**[DOCKER_SESSION.md](./DOCKER_SESSION.md)**（Docker exec + Files / `docker cp`，规格已定未实现）。
+Related: [ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[SFTP_POOL.md](./SFTP_POOL.md)**（SFTP 连接池 / 浏览与传输并行 / 资源回收，中文规格）、**[DOCKER_SESSION.md](./DOCKER_SESSION.md)**（Docker exec + Files / `docker cp`）。
 
 ## Layout
 
@@ -17,7 +17,7 @@ Right panel sections:
 
 | Tab | Role |
 |-----|------|
-| **Files** | Session file browser: **SSH** → SFTP；**Local** → 本机目录；**Docker**（规划）→ 浏览 + `docker cp`（见 [DOCKER_SESSION.md](./DOCKER_SESSION.md)） |
+| **Files** | Session file browser: **SSH** → SFTP；**Local** → 本机目录；**Docker**（本机阶段 2）→ 容器浏览 + `docker cp`（见 [DOCKER_SESSION.md](./DOCKER_SESSION.md)） |
 | **Info** | Light session summary (profile, target, cwd, size) |
 
 Transfer progress lives in a **footer under Files** (not a separate tab). SSH uploads/downloads only.
@@ -78,9 +78,9 @@ Drag the sash between the file list and Transfers to change their height ratio
 Files browses the local filesystem (terminal working directory as home when known).  
 Transfers footer stays empty unless an SSH pane is focused. Use Reveal / Copy Path from the terminal context menu as needed.
 
-### Docker sessions (planned)
+### Docker sessions（本机 Files 已通）
 
-入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。Files UX 同 SSH；后端为容器列举 + `docker cp`。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
+入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。本机：Files UX 同 SSH；后端 `docker_fs` 列举 + `docker cp`。经 SSH 的远端 Docker 仍属阶段 3。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
 
 ## Info
 
@@ -111,6 +111,7 @@ Compact **Host** view (no session summary). Loads on first open for the current 
 | Doc | `docs/CONTEXT_PANEL.md`、`docs/SFTP_POOL.md` |
 | SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
+| Docker FS | `src/session/docker_fs.rs`（本机容器；`docker exec` 列举 / `docker cp` 传输） |
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
 | UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs`、`src/ui/transfer_settings.rs` |
 | Transfer filter / archive | `src/session/transfer_filter.rs`、`src/session/transfer_archive.rs` |

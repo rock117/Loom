@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::model::{ConnectionState, ProfileKind, SshAuth, format_open_ssh_command, suggest_free_bind_port};
 use crate::platform;
+use crate::session::docker_fs;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
 use crate::session::sftp::{
@@ -42,6 +43,8 @@ enum TransferDir {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FilesKind {
     Sftp,
+    /// Local profile pane (`docker exec`); browse via exec, transfer via `docker cp`.
+    Docker,
     Local,
 }
 
@@ -302,7 +305,7 @@ impl ContextPanel {
         Some((id, sftp))
     }
 
-    /// SSH SFTP, or a Local profile pane for filesystem browsing.
+    /// SSH SFTP, Docker container FS, or a Local profile pane for filesystem browsing.
     fn focused_files(&self, cx: &App) -> Option<(Uuid, FilesKind, Option<SftpHandle>)> {
         let tab = self.tabs.read(cx).active_tab()?;
         let pane = tab.focused_pane()?;
@@ -310,10 +313,28 @@ impl ContextPanel {
         if let Some(sftp) = pane.ssh_sftp.clone() {
             return Some((id, FilesKind::Sftp, Some(sftp)));
         }
+        // Docker is also `ProfileKind::Local` — check before host Local FS.
+        if pane.kind.is_docker_local() {
+            return Some((id, FilesKind::Docker, None));
+        }
         if pane.kind.is_local() {
             return Some((id, FilesKind::Local, None));
         }
         None
+    }
+
+    fn focused_docker_container(&self, cx: &App) -> Option<(Uuid, String)> {
+        let tab = self.tabs.read(cx).active_tab()?;
+        let pane = tab.focused_pane()?;
+        let id = docker_fs::container_id_from_kind(&pane.kind)?.to_string();
+        Some((pane.id, id))
+    }
+
+    fn files_supports_transfer(&self) -> bool {
+        matches!(
+            self.files_kind,
+            Some(FilesKind::Sftp | FilesKind::Docker)
+        )
     }
 
     fn reset_files_state(&mut self) {
@@ -428,6 +449,7 @@ impl ContextPanel {
                     self.error = Some("SFTP unavailable".into());
                 }
             }
+            FilesKind::Docker => self.go_home_docker(cx),
             FilesKind::Local => self.go_home_local(cx),
         }
     }
@@ -477,6 +499,37 @@ impl ContextPanel {
         self.load_dir(home, cx);
     }
 
+    fn go_home_docker(&mut self, cx: &mut Context<Self>) {
+        let Some((_, container)) = self.focused_docker_container(cx) else {
+            self.error = Some("Docker container unavailable".into());
+            cx.notify();
+            return;
+        };
+        self.listing = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { docker_fs::home_dir(&container) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.listing = false;
+                match result {
+                    Ok(home) => {
+                        this.home = Some(home.clone());
+                        this.load_dir(home, cx);
+                    }
+                    Err(err) => {
+                        this.error = Some(format!("{err:#}"));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn go_home(&mut self, cx: &mut Context<Self>) {
         match self.files_kind {
             Some(FilesKind::Sftp) => {
@@ -484,6 +537,7 @@ impl ContextPanel {
                     self.go_home_sftp(sftp, cx);
                 }
             }
+            Some(FilesKind::Docker) => self.go_home_docker(cx),
             Some(FilesKind::Local) => self.go_home_local(cx),
             None => {}
         }
@@ -492,6 +546,7 @@ impl ContextPanel {
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
         match self.files_kind {
             Some(FilesKind::Sftp) => self.load_dir_sftp(path, cx),
+            Some(FilesKind::Docker) => self.load_dir_docker(path, cx),
             Some(FilesKind::Local) => self.load_dir_local(path, cx),
             None => {
                 self.error = Some("No file session".into());
@@ -593,12 +648,59 @@ impl ContextPanel {
         .detach();
     }
 
+    fn load_dir_docker(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some((_, container)) = self.focused_docker_container(cx) else {
+            self.error = Some("Docker container unavailable".into());
+            cx.notify();
+            return;
+        };
+        self.list_gen = self.list_gen.wrapping_add(1);
+        let req_gen = self.list_gen;
+        self.listing = true;
+        self.error = None;
+        cx.notify();
+        let path_for_list = path.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    docker_fs::list_dir(&container, &path_for_list)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if req_gen != this.list_gen {
+                    return;
+                }
+                this.listing = false;
+                match result {
+                    Ok(entries) => {
+                        this.cwd = Some(path.clone());
+                        this.path_edit = RenameEdit::new(path);
+                        this.editing_path = false;
+                        this.entries = entries;
+                        this.selected = None;
+                        this.error = None;
+                    }
+                    Err(err) => {
+                        this.error = Some(format!(
+                            "{err:#} (path missing or not a directory)"
+                        ));
+                        this.editing_path = true;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let Some(cwd) = self.cwd.clone() else {
             return;
         };
         let parent = match self.files_kind {
             Some(FilesKind::Local) => local_fs::parent_path(&cwd),
+            Some(FilesKind::Docker) => docker_fs::parent_path(&cwd),
             _ => parent_remote(&cwd),
         };
         if let Some(parent) = parent {
@@ -612,7 +714,7 @@ impl ContextPanel {
             return;
         }
         match self.files_kind {
-            Some(FilesKind::Sftp) => self.begin_open_remote(entry, cx),
+            Some(FilesKind::Sftp | FilesKind::Docker) => self.begin_open_remote(entry, cx),
             Some(FilesKind::Local) => {
                 platform::open_path_detached(PathBuf::from(entry.path));
             }
@@ -640,7 +742,7 @@ impl ContextPanel {
             return;
         }
         match self.files_kind {
-            Some(FilesKind::Sftp) => self.begin_open_remote(entry, cx),
+            Some(FilesKind::Sftp | FilesKind::Docker) => self.begin_open_remote(entry, cx),
             Some(FilesKind::Local) => {
                 platform::open_path_detached(PathBuf::from(entry.path));
             }
@@ -649,7 +751,7 @@ impl ContextPanel {
     }
 
     fn download_selected(&mut self, cx: &mut Context<Self>) {
-        if self.files_kind != Some(FilesKind::Sftp) {
+        if !self.files_supports_transfer() {
             return;
         }
         let Some(path) = self.selected.clone() else {
@@ -666,6 +768,17 @@ impl ContextPanel {
             .last_download_dir
             .clone()
             .unwrap_or_else(default_download_dir);
+        // Docker: plain `docker cp` (no remote zip / include filters).
+        if self.files_kind == Some(FilesKind::Docker) {
+            self.download_entry(
+                entry,
+                false,
+                TransferOptions::default(),
+                Some(PathBuf::from(dest)),
+                cx,
+            );
+            return;
+        }
         // Single remote file: no include/exclude/compress UI — go straight to Downloads.
         if !entry.is_dir {
             self.download_entry(
@@ -693,13 +806,35 @@ impl ContextPanel {
         let dest = self.cwd.clone().unwrap_or_else(|| ".".into());
         // File-only payloads skip settings (folders / mixed still need filters).
         let all_files = !locals.is_empty() && locals.iter().all(|p| p.is_file());
-        if all_files {
-            let Some((_, sftp)) = self.focused_sftp(cx) else {
-                self.error = Some("No SSH session".into());
-                cx.notify();
-                return;
-            };
-            self.start_uploads(pane_id, sftp, dest, locals, TransferOptions::default(), cx);
+        if all_files || self.files_kind == Some(FilesKind::Docker) {
+            match self.files_kind {
+                Some(FilesKind::Sftp) => {
+                    let Some((_, sftp)) = self.focused_sftp(cx) else {
+                        self.error = Some("No SSH session".into());
+                        cx.notify();
+                        return;
+                    };
+                    self.start_uploads(pane_id, sftp, dest, locals, TransferOptions::default(), cx);
+                }
+                Some(FilesKind::Docker) => {
+                    let Some((_, container)) = self.focused_docker_container(cx) else {
+                        self.error = Some("Docker container unavailable".into());
+                        cx.notify();
+                        return;
+                    };
+                    self.start_uploads_docker(
+                        pane_id,
+                        container,
+                        dest,
+                        locals,
+                        cx,
+                    );
+                }
+                _ => {
+                    self.error = Some("Upload not available".into());
+                    cx.notify();
+                }
+            }
             return;
         }
         let form =
@@ -719,6 +854,10 @@ impl ContextPanel {
         dest_dir: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) {
+        if self.files_kind == Some(FilesKind::Docker) {
+            self.download_entry_docker(entry, open_after, dest_dir, cx);
+            return;
+        }
         let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
@@ -898,8 +1037,167 @@ impl ContextPanel {
         .detach();
     }
 
+    fn download_entry_docker(
+        &mut self,
+        entry: RemoteEntry,
+        open_after: bool,
+        dest_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, container)) = self.focused_docker_container(cx) else {
+            self.error = Some("Docker container unavailable".into());
+            cx.notify();
+            return;
+        };
+        if open_after && entry.is_dir {
+            self.error = Some("Cannot open a remote folder this way".into());
+            cx.notify();
+            return;
+        }
+        let remote = entry.path.clone();
+        let name = entry.name.clone();
+        let is_dir = entry.is_dir;
+        let id = Uuid::new_v4();
+        let cancel = transfer_cancel_flag();
+
+        self.pane_transfers_mut(pane_id).insert(
+            0,
+            TransferRow {
+                id,
+                label: name.clone(),
+                direction: TransferDir::Download,
+                status: TransferStatus::Queued,
+                local_path: None,
+                is_dir,
+                open_after,
+                started_at: None,
+                elapsed: None,
+                bytes_done: 0,
+                bytes_total: if is_dir { None } else { Some(entry.size) },
+                cancel: cancel.clone(),
+            },
+        );
+        if open_after {
+            cx.emit(ContextPanelEvent::Toast(
+                format!("Downloading “{name}” — opens when ready").into(),
+            ));
+        }
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let local = if open_after {
+                match open_cache_path(&name) {
+                    Ok(p) => Some(p),
+                    Err(err) => {
+                        this.update(cx, |this, cx| {
+                            this.fail_transfer(id, format!("Temp folder: {err:#}"));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+            } else if let Some(dir) = dest_dir {
+                Some(dir.join(&name))
+            } else if is_dir {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Download folder to…")
+                    .pick_folder()
+                    .await
+                    .map(|h| h.path().join(&name))
+            } else {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Save file")
+                    .set_file_name(&name)
+                    .save_file()
+                    .await
+                    .map(|h| h.path().to_path_buf())
+            };
+
+            let Some(local) = local else {
+                this.update(cx, |this, cx| {
+                    this.fail_transfer(id, "Cancelled".into());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            };
+
+            this.update(cx, |this, cx| {
+                if let Some(row) = this.find_transfer_mut(id) {
+                    row.local_path = Some(local.clone());
+                    row.status = TransferStatus::Queued;
+                    row.started_at = Some(std::time::Instant::now());
+                }
+                cx.notify();
+            })
+            .ok();
+
+            let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let cancel_flag = cancel.clone();
+            std::thread::spawn(move || {
+                let result = docker_fs::copy_from_container(
+                    &container,
+                    &remote,
+                    &local,
+                    id,
+                    progress_tx,
+                    cancel_flag,
+                );
+                let _ = reply_tx.send(result);
+            });
+
+            loop {
+                tokio::select! {
+                    p = progress_rx.recv_async() => {
+                        if let Ok(p) = p {
+                            this.update(cx, |this, cx| {
+                                this.update_transfer_progress(p);
+                                cx.notify();
+                            }).ok();
+                        }
+                    }
+                    result = reply_rx.recv_async() => {
+                        this.update(cx, |this, cx| {
+                            if this.find_transfer(id).is_some() {
+                                match result {
+                                    Ok(Ok(outcome)) => {
+                                        let files = if is_dir {
+                                            Some(outcome.files)
+                                        } else {
+                                            None
+                                        };
+                                        this.finish_transfer(
+                                            id,
+                                            files,
+                                            Some(outcome.bytes),
+                                            outcome.saved_as,
+                                        );
+                                    }
+                                    Ok(Err(err)) => {
+                                        let msg = format!("{err:#}");
+                                        if msg.contains("cancelled") {
+                                            this.remove_transfer_silent(id);
+                                        } else {
+                                            this.fail_transfer(id, msg);
+                                        }
+                                    }
+                                    Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
+                                }
+                            }
+                            cx.notify();
+                        }).ok();
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     fn upload_file(&mut self, cx: &mut Context<Self>) {
-        if self.files_kind != Some(FilesKind::Sftp) {
+        if !self.files_supports_transfer() {
             return;
         }
         let Some(_cwd) = self.cwd.clone() else {
@@ -907,10 +1205,24 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        let Some((pane_id, _sftp)) = self.focused_sftp(cx) else {
-            self.error = Some("No SSH session".into());
-            cx.notify();
-            return;
+        let pane_id = match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((pane_id, _)) = self.focused_sftp(cx) else {
+                    self.error = Some("No SSH session".into());
+                    cx.notify();
+                    return;
+                };
+                pane_id
+            }
+            Some(FilesKind::Docker) => {
+                let Some((pane_id, _)) = self.focused_docker_container(cx) else {
+                    self.error = Some("Docker container unavailable".into());
+                    cx.notify();
+                    return;
+                };
+                pane_id
+            }
+            _ => return,
         };
 
         cx.spawn(async move |this, cx| {
@@ -934,7 +1246,7 @@ impl ContextPanel {
     }
 
     fn upload_folder(&mut self, cx: &mut Context<Self>) {
-        if self.files_kind != Some(FilesKind::Sftp) {
+        if !self.files_supports_transfer() {
             return;
         }
         let Some(_cwd) = self.cwd.clone() else {
@@ -942,10 +1254,24 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        let Some((pane_id, _sftp)) = self.focused_sftp(cx) else {
-            self.error = Some("No SSH session".into());
-            cx.notify();
-            return;
+        let pane_id = match self.files_kind {
+            Some(FilesKind::Sftp) => {
+                let Some((pane_id, _)) = self.focused_sftp(cx) else {
+                    self.error = Some("No SSH session".into());
+                    cx.notify();
+                    return;
+                };
+                pane_id
+            }
+            Some(FilesKind::Docker) => {
+                let Some((pane_id, _)) = self.focused_docker_container(cx) else {
+                    self.error = Some("Docker container unavailable".into());
+                    cx.notify();
+                    return;
+                };
+                pane_id
+            }
+            _ => return,
         };
 
         cx.spawn(async move |this, cx| {
@@ -1065,6 +1391,128 @@ impl ContextPanel {
                                 }).ok();
                             }
                             Err(_) => {}
+                        }
+                    }
+                    result = reply_rx.recv_async() => {
+                        this.update(cx, |this, cx| {
+                            if this.find_transfer(id).is_some() {
+                                match result {
+                                    Ok(Ok(outcome)) => {
+                                        let files = if is_dir {
+                                            Some(outcome.files)
+                                        } else {
+                                            None
+                                        };
+                                        this.finish_transfer(
+                                            id,
+                                            files,
+                                            Some(outcome.bytes),
+                                            outcome.saved_as,
+                                        );
+                                        if let Some(cwd) = this.cwd.clone() {
+                                            this.load_dir(cwd, cx);
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        let msg = format!("{err:#}");
+                                        if msg.contains("cancelled") {
+                                            this.remove_transfer_silent(id);
+                                        } else {
+                                            this.fail_transfer(id, msg);
+                                        }
+                                    }
+                                    Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
+                                }
+                            }
+                            cx.notify();
+                        }).ok();
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn start_uploads_docker(
+        &mut self,
+        pane_id: Uuid,
+        container: String,
+        remote_dir: String,
+        locals: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        for local in locals {
+            self.start_one_upload_docker(
+                pane_id,
+                container.clone(),
+                remote_dir.clone(),
+                local,
+                cx,
+            );
+        }
+    }
+
+    fn start_one_upload_docker(
+        &mut self,
+        pane_id: Uuid,
+        container: String,
+        remote_dir: String,
+        local: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let id = Uuid::new_v4();
+        let base_name = local
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| local.display().to_string());
+        let is_dir = local.is_dir();
+        let cancel = transfer_cancel_flag();
+
+        self.pane_transfers_mut(pane_id).insert(
+            0,
+            TransferRow {
+                id,
+                label: base_name,
+                direction: TransferDir::Upload,
+                status: TransferStatus::Queued,
+                local_path: Some(local.clone()),
+                is_dir,
+                open_after: false,
+                started_at: Some(std::time::Instant::now()),
+                elapsed: None,
+                bytes_done: 0,
+                bytes_total: None,
+                cancel: cancel.clone(),
+            },
+        );
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            let cancel_flag = cancel.clone();
+            std::thread::spawn(move || {
+                // Dest is the container directory; docker places the basename inside it.
+                let result = docker_fs::copy_to_container(
+                    &container,
+                    &local,
+                    &remote_dir,
+                    id,
+                    progress_tx,
+                    cancel_flag,
+                );
+                let _ = reply_tx.send(result);
+            });
+
+            loop {
+                tokio::select! {
+                    p = progress_rx.recv_async() => {
+                        if let Ok(p) = p {
+                            this.update(cx, |this, cx| {
+                                this.update_transfer_progress(p);
+                                cx.notify();
+                            }).ok();
                         }
                     }
                     result = reply_rx.recv_async() => {
@@ -1375,6 +1823,45 @@ impl ContextPanel {
                     cx.notify();
                 }
             },
+            Some(FilesKind::Docker) => {
+                let Some((_, container)) = self.focused_docker_container(cx) else {
+                    self.error = Some("Docker container unavailable".into());
+                    cx.notify();
+                    return;
+                };
+                let trimmed = raw.trim().trim_matches('"').trim().to_string();
+                if trimmed.is_empty() {
+                    self.error = Some("Path is empty".into());
+                    cx.notify();
+                    return;
+                }
+                self.listing = true;
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            docker_fs::resolve_existing_dir(&container, &trimmed)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.listing = false;
+                        match result {
+                            Ok(dir) => {
+                                this.editing_path = false;
+                                this.error = None;
+                                this.load_dir(dir, cx);
+                            }
+                            Err(msg) => {
+                                this.error = Some(msg);
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             Some(FilesKind::Sftp) => {
                 let trimmed = raw.trim().trim_matches('"').trim().to_string();
                 if trimmed.is_empty() {
@@ -1800,7 +2287,7 @@ impl ContextPanel {
                     return;
                 };
                 let path = match self.files_kind {
-                    Some(FilesKind::Sftp) => join_remote(&cwd, &name),
+                    Some(FilesKind::Sftp | FilesKind::Docker) => join_remote(&cwd, &name),
                     Some(FilesKind::Local) => local_fs::join_child(&cwd, &name)
                         .to_string_lossy()
                         .into_owned(),
@@ -1823,13 +2310,14 @@ impl ContextPanel {
                 }
                 let parent = match self.files_kind {
                     Some(FilesKind::Local) => local_fs::parent_path(&path),
+                    Some(FilesKind::Docker) => docker_fs::parent_path(&path),
                     _ => parent_remote(&path),
                 };
                 let Some(parent) = parent.or_else(|| self.cwd.clone()) else {
                     return;
                 };
                 let to = match self.files_kind {
-                    Some(FilesKind::Sftp) => join_remote(&parent, &name),
+                    Some(FilesKind::Sftp | FilesKind::Docker) => join_remote(&parent, &name),
                     Some(FilesKind::Local) => local_fs::join_child(&parent, &name)
                         .to_string_lossy()
                         .into_owned(),
@@ -1885,22 +2373,38 @@ impl ContextPanel {
                 self.download_entry(entry, false, options, Some(dest_path), cx);
             }
             PendingTransfer::Upload { pane_id, locals } => {
-                let Some((_, sftp)) = self.focused_sftp(cx) else {
-                    self.error = Some("No SSH session".into());
-                    cx.notify();
-                    return;
-                };
-                if options.compress {
-                    let names: Vec<String> = locals
-                        .iter()
-                        .filter_map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                        .collect();
-                    let preview = names.first().cloned().unwrap_or_else(|| "files".into());
-                    cx.emit(ContextPanelEvent::Toast(
-                        format!("Zipping “{preview}” locally, then uploading .zip…").into(),
-                    ));
+                match self.files_kind {
+                    Some(FilesKind::Docker) => {
+                        let Some((_, container)) = self.focused_docker_container(cx) else {
+                            self.error = Some("Docker container unavailable".into());
+                            cx.notify();
+                            return;
+                        };
+                        self.start_uploads_docker(pane_id, container, dest, locals, cx);
+                    }
+                    _ => {
+                        let Some((_, sftp)) = self.focused_sftp(cx) else {
+                            self.error = Some("No SSH session".into());
+                            cx.notify();
+                            return;
+                        };
+                        if options.compress {
+                            let names: Vec<String> = locals
+                                .iter()
+                                .filter_map(|p| {
+                                    p.file_name().map(|s| s.to_string_lossy().into_owned())
+                                })
+                                .collect();
+                            let preview =
+                                names.first().cloned().unwrap_or_else(|| "files".into());
+                            cx.emit(ContextPanelEvent::Toast(
+                                format!("Zipping “{preview}” locally, then uploading .zip…")
+                                    .into(),
+                            ));
+                        }
+                        self.start_uploads(pane_id, sftp, dest, locals, options, cx);
+                    }
                 }
-                self.start_uploads(pane_id, sftp, dest, locals, options, cx);
             }
         }
     }
@@ -1946,6 +2450,31 @@ impl ContextPanel {
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move { local_fs::create_dir(&path_buf) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Docker) => {
+                let Some((_, container)) = self.focused_docker_container(cx) else {
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            docker_fs::create_dir(&container, &path)
+                        })
                         .await;
                     this.update(cx, |this, cx| {
                         match result {
@@ -2025,6 +2554,31 @@ impl ContextPanel {
                 })
                 .detach();
             }
+            Some(FilesKind::Docker) => {
+                let Some((_, container)) = self.focused_docker_container(cx) else {
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            docker_fs::rename(&container, &from, &to)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             None => {}
         }
     }
@@ -2087,6 +2641,31 @@ impl ContextPanel {
                 })
                 .detach();
             }
+            Some(FilesKind::Docker) => {
+                let Some((_, container)) = self.focused_docker_container(cx) else {
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            docker_fs::chmod(&container, &path, mode)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
             None => {}
         }
     }
@@ -2133,6 +2712,31 @@ impl ContextPanel {
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move { local_fs::remove_path(&path_buf, is_dir) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(()) => {
+                                if let Some(cwd) = this.cwd.clone() {
+                                    this.load_dir(cwd, cx);
+                                }
+                            }
+                            Err(err) => this.error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Docker) => {
+                let Some((_, container)) = self.focused_docker_container(cx) else {
+                    return;
+                };
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            docker_fs::remove_path(&container, &path, is_dir)
+                        })
                         .await;
                     this.update(cx, |this, cx| {
                         match result {
@@ -2472,16 +3076,18 @@ impl ContextPanel {
                         .text_xs()
                         .text_color(theme::TEXT_MUTED)
                         .child(
-                            "Open a Local or SSH session. Local panes browse the filesystem; \
-                             SSH panes use SFTP for browse, upload, and download.",
+                            "Open a Local, Docker, or SSH session. Local panes browse the host \
+                             filesystem; Docker panes browse the container (`docker cp` for \
+                             transfers); SSH panes use SFTP.",
                         ),
                 )
                 .into_any_element();
         }
 
-        let is_sftp = self.files_kind == Some(FilesKind::Sftp);
+        let can_transfer = self.files_supports_transfer();
         let can_up = self.cwd.as_ref().is_some_and(|p| match self.files_kind {
             Some(FilesKind::Local) => local_fs::parent_path(p).is_some(),
+            Some(FilesKind::Docker) => docker_fs::parent_path(p).is_some(),
             _ => parent_remote(p).is_some(),
         });
         let listing = self.listing;
@@ -2649,7 +3255,7 @@ impl ContextPanel {
                         )
                     })
                     .when(!search_open, |d| d.child(div().flex_1()))
-                    .when(is_sftp, |d| {
+                    .when(can_transfer, |d| {
                         d.child(self.nav_btn(
                             "ctx-download",
                             "↓",
@@ -2724,7 +3330,7 @@ impl ContextPanel {
                         .child("Loading…"),
                 )
             })
-            .child(self.render_files_split(entries, selected, &search_query, is_sftp, cx))
+            .child(self.render_files_split(entries, selected, &search_query, can_transfer, cx))
             .into_any_element()
     }
 
@@ -3185,7 +3791,7 @@ impl ContextPanel {
                         })
                         .on_drop(cx.listener(
                             move |this, paths: &ExternalPaths, _, cx| {
-                                if this.files_kind != Some(FilesKind::Sftp) {
+                                if !this.files_supports_transfer() {
                                     return;
                                 }
                                 let Some(cwd) = this.cwd.clone() else {
@@ -3193,8 +3799,22 @@ impl ContextPanel {
                                     cx.notify();
                                     return;
                                 };
-                                let Some((pane_id, _sftp)) = this.focused_sftp(cx) else {
-                                    return;
+                                let pane_id = match this.files_kind {
+                                    Some(FilesKind::Sftp) => {
+                                        let Some((pane_id, _)) = this.focused_sftp(cx) else {
+                                            return;
+                                        };
+                                        pane_id
+                                    }
+                                    Some(FilesKind::Docker) => {
+                                        let Some((pane_id, _)) =
+                                            this.focused_docker_container(cx)
+                                        else {
+                                            return;
+                                        };
+                                        pane_id
+                                    }
+                                    _ => return,
                                 };
                                 let locals: Vec<PathBuf> = paths.paths().to_vec();
                                 if locals.is_empty() {
@@ -3782,13 +4402,17 @@ impl ContextPanel {
                 return;
             }
             // Local without going through focused_files? use profile kind.
+            if pane.kind.is_docker_local() {
+                self.start_docker_host_probe(pane.id, cx);
+                return;
+            }
             let is_local = pane.kind.is_local()
                 || pane.profile_id.is_some_and(|pid| {
                     self.store
                         .read(cx)
                         .workspace
                         .find_profile(pid)
-                        .is_some_and(|p| p.kind.is_local())
+                        .is_some_and(|p| p.kind.is_local() && !p.kind.is_docker_local())
                 });
             if is_local {
                 self.start_local_host_probe(pane.id, cx);
@@ -3800,6 +4424,7 @@ impl ContextPanel {
         };
         match kind {
             FilesKind::Local => self.start_local_host_probe(pane_id, cx),
+            FilesKind::Docker => self.start_docker_host_probe(pane_id, cx),
             FilesKind::Sftp => {
                 if let Some(sftp) = sftp {
                     self.start_ssh_host_probe(pane_id, sftp, cx);
@@ -3842,6 +4467,38 @@ impl ContextPanel {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { host_info::collect_local() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.host_info_loading = false;
+                match result {
+                    Ok(snap) => {
+                        this.host_info = Some(snap);
+                        this.host_info_error = None;
+                    }
+                    Err(err) => {
+                        this.host_info_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn start_docker_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        let Some((_, container)) = self.focused_docker_container(cx) else {
+            self.host_info_error = Some("Docker container unavailable".into());
+            cx.notify();
+            return;
+        };
+        self.host_info_loading = true;
+        self.host_info_error = None;
+        self.host_info_pane = Some(pane_id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { docker_fs::container_snapshot(&container) })
                 .await;
             this.update(cx, |this, cx| {
                 this.host_info_loading = false;

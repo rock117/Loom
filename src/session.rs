@@ -2,6 +2,7 @@
 
 pub mod credentials;
 pub mod docker;
+pub mod docker_fs;
 pub mod forward;
 pub mod known_hosts;
 pub mod host_info;
