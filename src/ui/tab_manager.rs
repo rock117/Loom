@@ -646,12 +646,22 @@ impl TabManager {
                         let master = pty.master.clone();
                         let killer = pty.killer;
                         let resize = LocalPty::resize_callback(master.clone());
-                        let working_dir = cwd_for_ui.or_else(LocalPty::default_cwd);
+                        // Docker exec: host spawn cwd is docker.exe's path — do not seed
+                        // terminal / status-bar cwd with it. Container path arrives via OSC.
+                        let working_dir = if kind.is_docker_local() {
+                            None
+                        } else {
+                            cwd_for_ui.or_else(LocalPty::default_cwd)
+                        };
                         let terminal = cx.new(|cx| {
-                            TerminalView::new(pty.writer, pty.reader, config, cx)
+                            let mut view = TerminalView::new(pty.writer, pty.reader, config, cx)
                                 .with_resize_callback(resize)
-                                .with_shell_pid(pty.shell_pid)
-                                .with_local_session()
+                                .with_local_session();
+                            // Skip process_cwd for Docker — PID is the host docker client.
+                            if !kind.is_docker_local() {
+                                view = view.with_shell_pid(pty.shell_pid);
+                            }
+                            view
                         });
                         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
                         if let ProfileKind::Local {
@@ -710,12 +720,19 @@ impl TabManager {
             self.show_line_numbers,
             self.ansi_palette,
         );
-        let working_dir = spawn_cwd.or_else(LocalPty::default_cwd);
+        let working_dir = if kind.is_docker_local() {
+            None
+        } else {
+            spawn_cwd.or_else(LocalPty::default_cwd)
+        };
         let terminal = cx.new(|cx| {
-            TerminalView::new(pty.writer, pty.reader, config, cx)
+            let mut view = TerminalView::new(pty.writer, pty.reader, config, cx)
                 .with_resize_callback(resize)
-                .with_shell_pid(pty.shell_pid)
-                .with_local_session()
+                .with_local_session();
+            if !kind.is_docker_local() {
+                view = view.with_shell_pid(pty.shell_pid);
+            }
+            view
         });
         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
         terminal.read(cx).focus_handle().focus(window);
@@ -723,7 +740,13 @@ impl TabManager {
         let cwd_label = working_dir
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| ".".into());
+            .unwrap_or_else(|| {
+                if kind.is_docker_local() {
+                    "container".into()
+                } else {
+                    ".".into()
+                }
+            });
         let shell_short = std::path::Path::new(shell_path)
             .file_name()
             .and_then(|s| s.to_str())
@@ -1675,7 +1698,7 @@ impl TabManager {
         let focused = tab.focused;
         let pane = tab.panes.get_mut(&focused)?;
         let pid = pane.profile_id?;
-        if !pane.kind.is_local() {
+        if !pane.kind.is_local() || pane.kind.is_docker_local() {
             return None;
         }
         let from_term = pane.terminal.as_ref().and_then(|term| {
@@ -2028,7 +2051,8 @@ fn wire_terminal_session(
                     return;
                 };
                 // Session-only: do not write Bound profile start directory on cd.
-                if !pane.kind.is_local() {
+                // Docker: pane kind cwd is not a host start dir.
+                if !pane.kind.is_local() || pane.kind.is_docker_local() {
                     return;
                 }
                 if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
