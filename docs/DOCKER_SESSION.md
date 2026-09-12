@@ -2,7 +2,7 @@
 
 相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、[CONTEXT_PANEL.md](./CONTEXT_PANEL.md)、[SFTP_POOL.md](./SFTP_POOL.md)、[SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md)、[BACKLOG.md](./BACKLOG.md)。
 
-> **状态**：阶段 1（本机列表 + exec）**已实现**；Files / SSH 远端未做。实现后续阶段仍须用户明确点名。  
+> **状态**：阶段 1（本机列表 + exec）**已实现**；阶段 2（本地 Files + `docker cp`）**已实现**；SSH 远端未做。实现后续阶段仍须用户明确点名。  
 > **文档约定**：中文。
 
 ## 一句话目标
@@ -177,7 +177,7 @@ Docker pane
 |------|------|------|
 | 0 | 本规格（含图标双模式入口） | **完成** |
 | 1 | 入口 UI + **本地** 容器列表 + exec 进 shell（无 Files） | **已实现**（本机） |
-| 2 | **本地** Files 浏览 + `docker cp` + Transfers / 取消 | 未做 |
+| 2 | **本地** Files 浏览 + `docker cp` + Transfers / 取消 | **已实现** |
 | 3 | 模式 **SSH Profile**：远端列表 + exec + cp | UI 壳已有；后端未做 |
 | 4 | 钉选 Profile、exec 选项、进度精细化 | 未做 |
 
@@ -190,8 +190,8 @@ Docker pane
 | 规格 | `docs/DOCKER_SESSION.md`（本文） |
 | 选择器 UI | `src/ui/docker_picker.rs`；侧栏 `icons/ui/docker.svg` |
 | 会话 / exec | `src/session/docker.rs` + `TabManager::open_ephemeral_docker`（Local `docker exec`） |
-| Files 桥 | （阶段 2）对标 `src/session/sftp.rs` |
-| Context | （阶段 2）`context_panel.rs` 按会话类型切换后端 |
+| Files 桥 | `src/session/docker_fs.rs`（list / mkdir / rm / mv / chmod / `docker cp`） |
+| Context | `context_panel.rs` · `FilesKind::Docker`（焦点 Docker pane 时；勿当 Local 宿主 FS） |
 | Pane | 阶段 1 复用 `ProfileKind::Local` + docker argv；Ephemeral Tab |
 
 ## 验收
