@@ -226,12 +226,19 @@ impl WorkspaceStore {
         if !matches!(profile.kind, crate::model::ProfileKind::Ssh { .. }) {
             return false;
         }
+        let docker_container = match &profile.kind {
+            crate::model::ProfileKind::Ssh {
+                docker_container, ..
+            } => docker_container.clone(),
+            _ => None,
+        };
         profile.name = name;
         profile.kind = crate::model::ProfileKind::Ssh {
             host,
             port,
             user,
             auth,
+            docker_container,
         };
         profile.forwards = forwards;
         self.selection = Selection::Profile(id);

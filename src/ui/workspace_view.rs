@@ -38,6 +38,10 @@ enum PendingPasswordAction {
         pane_id: uuid::Uuid,
         direction: SplitDirection,
     },
+    /// Docker picker: list containers on an SSH host after password entry.
+    DockerList {
+        profile_id: uuid::Uuid,
+    },
 }
 
 pub struct WorkspaceView {
@@ -339,6 +343,24 @@ impl WorkspaceView {
                     }
                     cx.notify();
                 }
+                DockerPickerEvent::NeedSshPassword { profile_id } => {
+                    let title = this
+                        .store
+                        .read(cx)
+                        .workspace
+                        .find_profile(*profile_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "SSH".into());
+                    this.show_password_prompt(
+                        *profile_id,
+                        title,
+                        PendingPasswordAction::DockerList {
+                            profile_id: *profile_id,
+                        },
+                        window,
+                        cx,
+                    );
+                }
             },
         ));
 
@@ -589,6 +611,8 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let keep_docker_picker =
+            matches!(&action, PendingPasswordAction::DockerList { .. });
         self.pending_password.replace(action);
         let prompt = cx.new(|cx| PasswordPrompt::new(profile_id, title, cx));
         self._subscriptions.push(cx.subscribe_in(&prompt, window, {
@@ -622,7 +646,9 @@ impl WorkspaceView {
         self.show_settings = false;
         self.show_ssh_form = false;
         self.show_wsl_form = false;
-        self.show_docker_picker = false;
+        if !keep_docker_picker {
+            self.show_docker_picker = false;
+        }
         self.show_local_form = false;
         cx.notify();
         cx.defer_in(window, |this, window, cx| {
@@ -681,6 +707,15 @@ impl WorkspaceView {
                     m.split_pane_with_password(
                         pane_id, direction, password, &store, window, cx,
                     )
+                });
+            }
+            PendingPasswordAction::DockerList { profile_id } => {
+                self.docker_picker.update(cx, |p, cx| {
+                    p.continue_ssh_list(profile_id, password, cx);
+                });
+                self.show_docker_picker = true;
+                cx.defer_in(window, |this, window, cx| {
+                    this.docker_picker.read(cx).focus(window);
                 });
             }
         }

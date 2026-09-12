@@ -1,13 +1,21 @@
 //! Overlay: pick Docker host (Local | SSH Profile) → Name + container → Save / Save & Open.
 //!
-//! Local mode saves a sidebar Profile (`docker exec …`), same IA as WSL. SSH remote
-//! listing is deferred (see `docs/DOCKER_SESSION.md`).
+//! - **Local** — `docker ps` on this machine; saves a Local profile (`docker exec …`).
+//! - **SSH** — pick an existing SSH profile, list containers via
+//!   [`docker::list_running_containers_ssh`] on a background thread; saves a
+//!   Docker-over-SSH profile (`new_ssh_docker_profile`). Password auth reuses the
+//!   host profile keyring; missing password emits [`DockerPickerEvent::NeedSshPassword`].
+//!
+//! See `docs/DOCKER_SESSION.md`.
 
 use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
+use crate::model::{Profile, ProfileKind, SshAuth};
+use crate::session::credentials;
 use crate::session::docker::{self, ContainerInfo};
+use crate::session::ssh::SshAuthMaterial;
 use crate::shared::theme;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
 use crate::ui::workspace_store::WorkspaceStore;
@@ -18,6 +26,10 @@ pub enum DockerPickerEvent {
     Saved {
         profile_id: Uuid,
         connect: bool,
+    },
+    /// Password auth required for listing containers on this SSH host profile.
+    NeedSshPassword {
+        profile_id: Uuid,
     },
 }
 
@@ -144,29 +156,144 @@ impl DockerPicker {
         self._load_task = Some(cx.spawn(async move |this, cx| {
             let result = rx.recv_async().await;
             this.update(cx, |this, cx| {
-                match result {
-                    Ok(Ok(list)) => {
-                        if let Some(first) = list.first() {
-                            this.apply_container_default_name(&first.display_label(), cx);
-                            this.selected_container = Some(first.id.clone());
-                        } else {
-                            this.selected_container = None;
-                        }
-                        this.containers = ContainerList::Ready(list);
-                    }
-                    Ok(Err(err)) => {
-                        this.containers = ContainerList::Error(format!("{err:#}"));
-                        this.selected_container = None;
-                    }
-                    Err(_) => {
-                        this.containers = ContainerList::Error("List cancelled".into());
-                        this.selected_container = None;
-                    }
-                }
-                cx.notify();
+                this.apply_list_result(result, cx);
             })
             .ok();
         }));
+    }
+
+    /// List containers on the selected SSH host (background thread).
+    ///
+    /// When `password` is `None`, resolves auth like TabManager (keyring / key file).
+    /// Missing password emits [`DockerPickerEvent::NeedSshPassword`].
+    fn refresh_ssh(&mut self, password: Option<String>, cx: &mut Context<Self>) {
+        let Some(profile_id) = self.selected_ssh else {
+            self.containers = ContainerList::Ready(Vec::new());
+            self.selected_container = None;
+            self.error = None;
+            cx.notify();
+            return;
+        };
+
+        let Some(profile) = self
+            .store
+            .read(cx)
+            .workspace
+            .find_profile(profile_id)
+            .cloned()
+        else {
+            self.containers = ContainerList::Error("SSH profile not found".into());
+            self.selected_container = None;
+            cx.notify();
+            return;
+        };
+
+        let ProfileKind::Ssh {
+            host, port, user, ..
+        } = profile.kind.clone()
+        else {
+            self.containers = ContainerList::Error("Not an SSH profile".into());
+            self.selected_container = None;
+            cx.notify();
+            return;
+        };
+
+        let auth = match resolve_ssh_auth(&profile, password) {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                self.containers = ContainerList::Loading;
+                self.selected_container = None;
+                self.error = None;
+                cx.notify();
+                cx.emit(DockerPickerEvent::NeedSshPassword { profile_id });
+                return;
+            }
+            Err(err) => {
+                self.containers = ContainerList::Error(format!("{err:#}"));
+                self.selected_container = None;
+                cx.notify();
+                return;
+            }
+        };
+
+        self.containers = ContainerList::Loading;
+        self.selected_container = None;
+        self.error = None;
+        cx.notify();
+
+        let (tx, rx) = flume::bounded(1);
+        let _ = std::thread::Builder::new()
+            .name("loom-docker-ps-ssh".into())
+            .spawn(move || {
+                let result = docker::list_running_containers_ssh(&host, port, &user, auth);
+                let _ = tx.send(result);
+            });
+
+        self._load_task = Some(cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                this.apply_list_result(result, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// After [`DockerPickerEvent::NeedSshPassword`], workspace submits the password here.
+    pub fn continue_ssh_list(
+        &mut self,
+        profile_id: Uuid,
+        password: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.mode = HostMode::Ssh;
+        self.selected_ssh = Some(profile_id);
+        self.error = None;
+        self.refresh_ssh(Some(password), cx);
+    }
+
+    fn apply_list_result(
+        &mut self,
+        result: Result<Result<Vec<ContainerInfo>, anyhow::Error>, flume::RecvError>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(Ok(list)) => {
+                if let Some(first) = list.first() {
+                    self.apply_container_default_name(&first.display_label(), cx);
+                    self.selected_container = Some(first.id.clone());
+                } else {
+                    self.selected_container = None;
+                }
+                self.containers = ContainerList::Ready(list);
+            }
+            Ok(Err(err)) => {
+                self.containers = ContainerList::Error(format!("{err:#}"));
+                self.selected_container = None;
+            }
+            Err(_) => {
+                self.containers = ContainerList::Error("List cancelled".into());
+                self.selected_container = None;
+            }
+        }
+        cx.notify();
+    }
+
+    fn select_ssh_profile(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        self.selected_ssh = Some(id);
+        self.name_touched = false;
+        self.error = None;
+        self.refresh_ssh(None, cx);
+    }
+
+    fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        self.name_touched = false;
+        match self.mode {
+            HostMode::Local => self.refresh_local(cx),
+            HostMode::Ssh => {
+                self.reload_ssh_profiles(cx);
+                self.refresh_ssh(None, cx);
+            }
+        }
     }
 
     fn apply_container_default_name(&mut self, label: &str, cx: &App) {
@@ -218,11 +345,6 @@ impl DockerPicker {
     }
 
     fn save(&mut self, connect: bool, cx: &mut Context<Self>) {
-        if self.mode != HostMode::Local {
-            self.error = Some("Remote Docker over SSH is not available yet.".into());
-            cx.notify();
-            return;
-        }
         let ContainerList::Ready(ref list) = self.containers else {
             self.error = Some("Wait for the container list to load.".into());
             cx.notify();
@@ -247,15 +369,67 @@ impl DockerPicker {
             cx.notify();
             return;
         }
-        let profile = docker::new_profile(name, &row.id);
+
+        let profile = match self.mode {
+            HostMode::Local => docker::new_profile(name, &row.id),
+            HostMode::Ssh => {
+                let Some(host_id) = self.selected_ssh else {
+                    self.error = Some("Select an SSH profile".into());
+                    cx.notify();
+                    return;
+                };
+                let Some(host_profile) = self
+                    .store
+                    .read(cx)
+                    .workspace
+                    .find_profile(host_id)
+                    .cloned()
+                else {
+                    self.error = Some("SSH profile not found".into());
+                    cx.notify();
+                    return;
+                };
+                let ProfileKind::Ssh {
+                    host,
+                    port,
+                    user,
+                    auth,
+                    ..
+                } = host_profile.kind
+                else {
+                    self.error = Some("Not an SSH profile".into());
+                    cx.notify();
+                    return;
+                };
+                docker::new_ssh_docker_profile(name, host, port, user, auth, &row.id)
+            }
+        };
+
+        let host_ssh_id = self.selected_ssh.filter(|_| self.mode == HostMode::Ssh);
         let profile_id = self.store.update(cx, |s, cx| {
             let target = s.insert_target();
             s.place_profile(profile, target, cx)
         });
+
+        if let Some(host_id) = host_ssh_id {
+            if let Ok(Some(pw)) = credentials::get_password(host_id) {
+                let _ = credentials::set_password(profile_id, &pw);
+            }
+        }
+
         cx.emit(DockerPickerEvent::Saved {
             profile_id,
             connect,
         });
+    }
+
+    fn can_save(&self) -> bool {
+        let list_ready =
+            matches!(&self.containers, ContainerList::Ready(_)) && self.selected_container.is_some();
+        match self.mode {
+            HostMode::Local => list_ready,
+            HostMode::Ssh => list_ready && self.selected_ssh.is_some(),
+        }
     }
 
     fn handle_edit_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
@@ -440,6 +614,28 @@ fn collect_ssh_in_group(g: &crate::model::Group, out: &mut Vec<SshProfileRow>) {
     }
 }
 
+/// Same priority as TabManager: prompt override → OS keyring / private key path.
+fn resolve_ssh_auth(
+    profile: &Profile,
+    password_override: Option<String>,
+) -> anyhow::Result<Option<SshAuthMaterial>> {
+    let ProfileKind::Ssh { auth, .. } = &profile.kind else {
+        anyhow::bail!("not an SSH profile");
+    };
+    match auth {
+        SshAuth::Password { .. } => {
+            if let Some(p) = password_override {
+                return Ok(Some(SshAuthMaterial::Password(p)));
+            }
+            Ok(credentials::get_password(profile.id)?.map(SshAuthMaterial::Password))
+        }
+        SshAuth::PrivateKey { path } => Ok(Some(SshAuthMaterial::PrivateKey {
+            path: path.clone(),
+            passphrase: None,
+        })),
+    }
+}
+
 impl Focusable for DockerPicker {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -557,9 +753,9 @@ impl Render for DockerPicker {
         let err = self.error.clone();
         let name_edit = self.name.clone();
         let view = cx.entity();
-        let can_save = mode == HostMode::Local
-            && matches!(&containers, ContainerList::Ready(_))
-            && selected_c.is_some();
+        let can_save = self.can_save();
+        let show_name_and_containers =
+            mode == HostMode::Local || (mode == HostMode::Ssh && selected_ssh.is_some());
 
         div()
             .id("docker-picker-overlay")
@@ -610,11 +806,7 @@ impl Render for DockerPicker {
                             cx.stop_propagation();
                             return;
                         }
-                        if key == "enter"
-                            && this.mode == HostMode::Local
-                            && matches!(&this.containers, ContainerList::Ready(_))
-                            && this.selected_container.is_some()
-                        {
+                        if key == "enter" && this.can_save() {
                             this.save(true, cx);
                             cx.stop_propagation();
                             return;
@@ -649,13 +841,7 @@ impl Render for DockerPicker {
                                     .cursor_pointer()
                                     .child("Refresh")
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.mode == HostMode::Local {
-                                            this.name_touched = false;
-                                            this.refresh_local(cx);
-                                        } else {
-                                            this.reload_ssh_profiles(cx);
-                                            cx.notify();
-                                        }
+                                        this.refresh_current(cx);
                                         cx.stop_propagation();
                                     })),
                             ),
@@ -675,7 +861,8 @@ impl Render for DockerPicker {
                             .child(mode_tab("Local", mode == HostMode::Local, cx, |this, _, cx| {
                                 this.mode = HostMode::Local;
                                 this.error = None;
-                                cx.notify();
+                                this.name_touched = false;
+                                this.refresh_local(cx);
                             }))
                             .child(mode_tab(
                                 "SSH Profile",
@@ -685,11 +872,21 @@ impl Render for DockerPicker {
                                     this.mode = HostMode::Ssh;
                                     this.error = None;
                                     this.reload_ssh_profiles(cx);
-                                    cx.notify();
+                                    if this.selected_ssh.is_some() {
+                                        this.name_touched = false;
+                                        this.refresh_ssh(None, cx);
+                                    } else {
+                                        this.containers = ContainerList::Ready(Vec::new());
+                                        this.selected_container = None;
+                                        cx.notify();
+                                    }
                                 },
                             )),
                     )
-                    .when(mode == HostMode::Local, |d| {
+                    .when(mode == HostMode::Ssh, |d| {
+                        d.child(ssh_profiles_body(ssh_profiles, selected_ssh, cx))
+                    })
+                    .when(show_name_and_containers, |d| {
                         d.child(
                             div()
                                 .flex()
@@ -752,10 +949,16 @@ impl Render for DockerPicker {
                                         ),
                                 ),
                         )
-                        .child(local_body(containers, selected_c, cx))
-                    })
-                    .when(mode == HostMode::Ssh, |d| {
-                        d.child(ssh_body(ssh_profiles, selected_ssh, cx))
+                        .child(containers_body(
+                            if mode == HostMode::Local {
+                                "Running containers (this machine)"
+                            } else {
+                                "Running containers (via SSH)"
+                            },
+                            containers,
+                            selected_c,
+                            cx,
+                        ))
                     })
                     .when_some(err, |d, msg| {
                         d.child(
@@ -836,7 +1039,8 @@ fn mode_tab(
         }))
 }
 
-fn local_body(
+fn containers_body(
+    label: &'static str,
     list: ContainerList,
     selected: Option<String>,
     cx: &mut Context<DockerPicker>,
@@ -851,7 +1055,7 @@ fn local_body(
             div()
                 .text_xs()
                 .text_color(theme::TEXT_MUTED)
-                .child("Running containers (this machine)"),
+                .child(label),
         )
         .child(
             div()
@@ -945,7 +1149,7 @@ fn local_body(
         )
 }
 
-fn ssh_body(
+fn ssh_profiles_body(
     profiles: Vec<SshProfileRow>,
     selected: Option<Uuid>,
     cx: &mut Context<DockerPicker>,
@@ -1021,27 +1225,12 @@ fn ssh_body(
                                         .child(p.summary),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.selected_ssh = Some(id);
-                                    cx.notify();
+                                    this.select_ssh_profile(id, cx);
                                     cx.stop_propagation();
                                 }))
                         }))
                         .into_any_element()
                 }),
-        )
-        .child(
-            div()
-                .mt_1()
-                .p_3()
-                .rounded(px(4.0))
-                .bg(theme::ELEVATED)
-                .border_1()
-                .border_color(theme::BORDER_SUBTLE)
-                .text_xs()
-                .text_color(theme::TEXT_MUTED)
-                .child(
-                    "Remote Docker over SSH is planned next: pick a profile here, then list containers on that host. Not available in this build yet.",
-                ),
         )
 }
 

@@ -38,6 +38,10 @@ pub enum ProfileKind {
         port: u16,
         user: String,
         auth: SshAuth,
+        /// When set, the session PTY runs `docker exec -it` into this container
+        /// on the SSH host (Docker-over-SSH profiles). Older workspace files omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        docker_container: Option<String>,
     },
 }
 
@@ -83,8 +87,20 @@ impl ProfileKind {
                 }
             }
             Self::Ssh {
-                host, port, user, ..
-            } => format!("ssh · {user}@{host}:{port}"),
+                host,
+                port,
+                user,
+                docker_container,
+                ..
+            } => {
+                if let Some(id) = docker_container.as_deref() {
+                    let id = id.trim();
+                    let short = if id.len() > 12 { &id[..12] } else { id };
+                    format!("docker · {short} @ {user}@{host}:{port}")
+                } else {
+                    format!("ssh · {user}@{host}:{port}")
+                }
+            }
         }
     }
 
@@ -115,6 +131,32 @@ impl ProfileKind {
                     && args.iter().any(|a| a == "exec")
             }
             _ => false,
+        }
+    }
+
+    /// SSH profile that opens `docker exec` on the remote host.
+    pub fn is_docker_ssh(&self) -> bool {
+        matches!(
+            self,
+            Self::Ssh {
+                docker_container: Some(id),
+                ..
+            } if !id.trim().is_empty()
+        )
+    }
+
+    pub fn is_docker(&self) -> bool {
+        self.is_docker_local() || self.is_docker_ssh()
+    }
+
+    /// Container id for Docker-over-SSH profiles.
+    pub fn docker_ssh_container_id(&self) -> Option<&str> {
+        match self {
+            Self::Ssh {
+                docker_container: Some(id),
+                ..
+            } if !id.trim().is_empty() => Some(id.trim()),
+            _ => None,
         }
     }
 
@@ -186,6 +228,7 @@ impl Profile {
                 port,
                 user,
                 auth: SshAuth::Password { remember: true },
+                docker_container: None,
             },
             forwards: Vec::new(),
         }
