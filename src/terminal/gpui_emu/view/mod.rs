@@ -475,6 +475,9 @@ pub struct TerminalView {
 
     /// Local / WSL PTY (vs SSH). Affects end-of-session banner copy.
     is_local_session: bool,
+
+    /// Docker exec session (local or over SSH). Banner uses container wording.
+    is_docker_session: bool,
 }
 
 struct ScrollbarDrag {
@@ -649,6 +652,7 @@ impl TerminalView {
             ime_marked: None,
             session_alive: true,
             is_local_session: false,
+            is_docker_session: false,
         }
     }
 
@@ -661,6 +665,12 @@ impl TerminalView {
     /// Mark this view as a local/WSL PTY (banner says "Shell exited", not "Disconnected").
     pub fn with_local_session(mut self) -> Self {
         self.is_local_session = true;
+        self
+    }
+
+    /// Docker exec (local CLI or over SSH) — banner uses container wording.
+    pub fn with_docker_session(mut self) -> Self {
+        self.is_docker_session = true;
         self
     }
 
@@ -2194,7 +2204,9 @@ impl Render for TerminalView {
                             div()
                                 .text_xs()
                                 .text_color(rgb(0xffffff))
-                                .child(if self.is_local_session {
+                                .child(if self.is_docker_session {
+                                    "Container session ended — click Reconnect in the status bar to exec again."
+                                } else if self.is_local_session {
                                     "Shell exited — click Reconnect in the status bar to start again."
                                 } else {
                                     "Disconnected — click Reconnect in the status bar to restore this session."

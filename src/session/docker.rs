@@ -234,19 +234,29 @@ pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
     }
 
     // Container still present / running?
-    let mut inspect = crate::platform::new_command(shell);
+    if !container_is_running(id)? {
+        bail!("Container `{id}` is not running.");
+    }
+    Ok(())
+}
+
+/// Fast `docker inspect` running check (background thread only — not UI).
+pub fn container_is_running(container_id: &str) -> Result<bool> {
+    let id = container_id.trim();
+    if id.is_empty() {
+        return Ok(false);
+    }
+    let program = docker_program();
+    let mut inspect = crate::platform::new_command(program);
     inspect.args(["inspect", "-f", "{{.State.Running}}", id]);
     let output = inspect
         .output()
         .with_context(|| format!("inspect container `{id}`"))?;
     if !output.status.success() {
-        bail!("Container `{id}` not found. Refresh the list and try again.");
+        return Ok(false);
     }
     let running = String::from_utf8_lossy(&output.stdout);
-    if !running.trim().eq_ignore_ascii_case("true") {
-        bail!("Container `{id}` is not running.");
-    }
-    Ok(())
+    Ok(running.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Build a sidebar Profile for local `docker exec` (same shape as WSL Local profiles).
