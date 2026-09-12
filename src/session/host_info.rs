@@ -55,6 +55,27 @@ pub struct ListeningPort {
     pub process: String,
 }
 
+/// Published container port → host binding (Docker Info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerPortMap {
+    /// Host side, e.g. `0.0.0.0:8080`, or empty if not published.
+    pub host: String,
+    /// Container side, e.g. `80/tcp`.
+    pub container: String,
+}
+
+/// Bind / volume / tmpfs mount (Docker Info).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerVolumeMap {
+    /// `bind` / `volume` / `tmpfs` / other.
+    pub kind: String,
+    /// Host path, volume name, or empty for tmpfs.
+    pub source: String,
+    /// Path inside the container.
+    pub destination: String,
+    pub read_only: bool,
+}
+
 /// One-shot host metrics for display (manual refresh only).
 #[derive(Debug, Clone, Default)]
 pub struct HostSnapshot {
@@ -75,6 +96,12 @@ pub struct HostSnapshot {
     pub listening: Vec<ListeningPort>,
     pub load: Option<String>,
     pub uptime_secs: u64,
+    /// When set, Info renders as a Docker container summary (not host metrics).
+    pub is_docker: bool,
+    /// Published ports (Docker only).
+    pub docker_ports: Vec<DockerPortMap>,
+    /// Mounts / volumes (Docker only).
+    pub docker_volumes: Vec<DockerVolumeMap>,
 }
 
 impl HostSnapshot {
@@ -146,6 +173,9 @@ pub fn collect_local() -> Result<HostSnapshot> {
         listening,
         load,
         uptime_secs: System::uptime(),
+        is_docker: false,
+        docker_ports: Vec::new(),
+        docker_volumes: Vec::new(),
     })
 }
 

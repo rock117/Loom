@@ -207,41 +207,13 @@ pub async fn container_snapshot(
     session: &client::Handle<ClientHandler>,
     container: &str,
 ) -> Result<crate::session::host_info::HostSnapshot> {
-    let format = "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}\t{{.Config.Hostname}}";
     let cmd = format!(
-        "docker inspect -f {} {}",
-        shell_single_quote(format),
+        "docker inspect --format {} {}",
+        shell_single_quote("{{json .}}"),
         shell_single_quote(container.trim())
     );
-    let line = remote_exec(session, &cmd).await?;
-    let mut parts = line.trim().split('\t');
-    let name = parts
-        .next()
-        .unwrap_or(container)
-        .trim_start_matches('/')
-        .to_string();
-    let image = parts.next().unwrap_or("").to_string();
-    let status = parts.next().unwrap_or("").to_string();
-    let hostname = parts.next().unwrap_or("").to_string();
-    Ok(crate::session::host_info::HostSnapshot {
-        hostname: if hostname.is_empty() {
-            name.clone()
-        } else {
-            hostname
-        },
-        os: format!("Docker · {status} (SSH host)"),
-        kernel: format!("container {container}"),
-        cpu_model: image,
-        cpu_cores: 0,
-        cpu_usage_pct: None,
-        mem_used: 0,
-        mem_total: 0,
-        disks: Vec::new(),
-        gpus: Vec::new(),
-        listening: Vec::new(),
-        load: Some(name),
-        uptime_secs: 0,
-    })
+    let json = remote_exec(session, &cmd).await?;
+    crate::session::docker::host_snapshot_from_inspect(&json, container, true)
 }
 
 pub async fn mktemp_dir(session: &client::Handle<ClientHandler>) -> Result<String> {
