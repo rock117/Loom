@@ -7,7 +7,10 @@ use gpui::*;
 use portable_pty::ChildKiller;
 use uuid::Uuid;
 
-use crate::model::{AnsiPalette, ConnectionState, PortForwardRule, Profile, ProfileKind, SshAuth};
+use crate::model::{
+    AnsiPalette, ConnectionState, PaneSnapshot, PortForwardRule, Profile, ProfileKind,
+    SavedPaneLayout, SshAuth,
+};
 use crate::platform;
 use crate::session::credentials;
 use crate::session::forward::ForwardHandle;
@@ -115,6 +118,22 @@ pub struct TabManager {
     app_bus: Entity<AppBus>,
 }
 
+/// Result of capturing a Bound tab for explicit **Save**.
+#[derive(Clone, Debug)]
+pub enum TabSaveCapture {
+    /// Single pane → update common cwd only; clear layout/panes.
+    CommonCwd {
+        profile_id: Uuid,
+        cwd: Option<String>,
+    },
+    /// Multi-pane → write layout + pane cwds (common cwd unchanged).
+    TabSnapshot {
+        profile_id: Uuid,
+        layout: SavedPaneLayout,
+        panes: Vec<PaneSnapshot>,
+    },
+}
+
 impl TabManager {
     pub fn new(
         font_size: f32,
@@ -157,8 +176,49 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some((layout, panes)) = profile.saved_tab() {
+            self.open_profile_saved_tab(
+                profile,
+                layout,
+                panes,
+                default_shell,
+                font_family,
+                store,
+                window,
+                cx,
+            );
+            return;
+        }
+        self.open_profile_single(
+            profile,
+            default_shell,
+            font_family,
+            store,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    fn open_profile_single(
+        &mut self,
+        profile: &Profile,
+        default_shell: Option<&str>,
+        font_family: &str,
+        store: &Entity<WorkspaceStore>,
+        cwd_override: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match &profile.kind {
             ProfileKind::Local { .. } if profile.kind.local_has_args() => {
+                let cwd = cwd_override
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| match &profile.kind {
+                        ProfileKind::Local { cwd, .. } => cwd.clone(),
+                        _ => None,
+                    });
                 self.begin_local_async(
                     Some(profile.id),
                     &profile.kind,
@@ -166,11 +226,14 @@ impl TabManager {
                     default_shell,
                     font_family,
                     store,
-                    None,
+                    cwd,
                     cx,
                 );
             }
             ProfileKind::Local { .. } => {
+                let cwd = cwd_override
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from);
                 match self.spawn_local(
                     Some(profile.id),
                     &profile.kind,
@@ -178,7 +241,7 @@ impl TabManager {
                     default_shell,
                     font_family,
                     store,
-                    None,
+                    cwd,
                     window,
                     cx,
                 ) {
@@ -194,10 +257,288 @@ impl TabManager {
                 }
             }
             ProfileKind::Ssh { .. } => match resolve_ssh_auth(profile, None) {
-                Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+                Ok(Some(auth)) => {
+                    let cwd = cwd_override
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| profile.kind.common_cwd());
+                    self.begin_ssh(profile, auth, font_family, cwd, cx);
+                }
                 Ok(None) => self.push_failed(profile, "password required".into(), cx),
                 Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
             },
+        }
+    }
+
+    /// Restore a multi-pane saved tab snapshot.
+    fn open_profile_saved_tab(
+        &mut self,
+        profile: &Profile,
+        layout: &SavedPaneLayout,
+        panes: &[PaneSnapshot],
+        default_shell: Option<&str>,
+        font_family: &str,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let common = profile.kind.common_cwd();
+        let leaf_count = panes.len();
+        if leaf_count == 0 || layout.leaf_count() != leaf_count {
+            self.open_profile_single(
+                profile,
+                default_shell,
+                font_family,
+                store,
+                None,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        match &profile.kind {
+            ProfileKind::Local { .. } if !profile.kind.local_has_args() => {
+                let mut leaf_ids = Vec::with_capacity(leaf_count);
+                let mut pane_map = HashMap::new();
+                for snap in panes {
+                    let cwd = snap
+                        .cwd
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| common.clone())
+                        .map(std::path::PathBuf::from);
+                    match self.spawn_local(
+                        Some(profile.id),
+                        &profile.kind,
+                        &profile.name,
+                        default_shell,
+                        font_family,
+                        store,
+                        cwd,
+                        window,
+                        cx,
+                    ) {
+                        Ok(pane) => {
+                            leaf_ids.push(pane.id);
+                            pane_map.insert(pane.id, pane);
+                        }
+                        Err(err) => {
+                            for mut orphan in pane_map.into_values() {
+                                teardown_pane_io(&mut orphan);
+                                drop(orphan.terminal);
+                            }
+                            self.push_failed(profile, format!("{err:#}"), cx);
+                            return;
+                        }
+                    }
+                }
+                let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
+                    for mut orphan in pane_map.into_values() {
+                        teardown_pane_io(&mut orphan);
+                        drop(orphan.terminal);
+                    }
+                    self.open_profile_single(
+                        profile,
+                        default_shell,
+                        font_family,
+                        store,
+                        None,
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                let focused = tree.first_leaf();
+                let tab = TabSession {
+                    id: Uuid::new_v4(),
+                    title: self.unique_tab_title(&profile.name),
+                    panes: pane_map,
+                    layout: tree,
+                    focused,
+                    zoomed: None,
+                };
+                let id = tab.id;
+                self.tabs.push(tab);
+                self.active = Some(id);
+                cx.notify();
+            }
+            ProfileKind::Local { .. } => {
+                // WSL / Docker-local: placeholder panes + async attach per leaf.
+                let mut leaf_ids = Vec::with_capacity(leaf_count);
+                let mut pane_map = HashMap::new();
+                for snap in panes {
+                    let pane_id = Uuid::new_v4();
+                    let status = if profile.kind.is_wsl_local() {
+                        "starting WSL…".to_string()
+                    } else if profile.kind.is_docker_local() {
+                        "starting Docker…".to_string()
+                    } else {
+                        "starting…".to_string()
+                    };
+                    let pane = PaneSession {
+                        id: pane_id,
+                        profile_id: Some(profile.id),
+                        auth_profile_id: None,
+                        session_password: None,
+                        kind: profile.kind.clone(),
+                        label: profile.name.clone(),
+                        state: ConnectionState::Connecting,
+                        status_message: status,
+                        terminal: None,
+                        pty_master: None,
+                        pty_killer: None,
+                        ssh_shutdown: None,
+                        ssh_sftp: None,
+                        ssh_forwards: None,
+                        local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
+                        _term_subscriptions: Vec::new(),
+                    };
+                    leaf_ids.push(pane_id);
+                    pane_map.insert(pane_id, pane);
+                    let _ = snap; // cwd applied in attach loop below
+                }
+                let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
+                    self.open_profile_single(
+                        profile,
+                        default_shell,
+                        font_family,
+                        store,
+                        None,
+                        window,
+                        cx,
+                    );
+                    return;
+                };
+                let focused = tree.first_leaf();
+                let tab = TabSession {
+                    id: Uuid::new_v4(),
+                    title: self.unique_tab_title(&profile.name),
+                    panes: pane_map,
+                    layout: tree,
+                    focused,
+                    zoomed: None,
+                };
+                let tab_id = tab.id;
+                self.tabs.push(tab);
+                self.active = Some(tab_id);
+                cx.notify();
+
+                for (i, snap) in panes.iter().enumerate() {
+                    let pane_id = leaf_ids[i];
+                    let cwd = snap
+                        .cwd
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| common.clone())
+                        .map(std::path::PathBuf::from);
+                    let post_cd = if profile.kind.is_docker_local() {
+                        snap.cwd
+                            .clone()
+                            .filter(|s| !s.trim().is_empty())
+                            .or_else(|| common.clone())
+                    } else {
+                        None
+                    };
+                    self.spawn_local_async_attach(
+                        tab_id,
+                        pane_id,
+                        profile.kind.clone(),
+                        default_shell.map(str::to_string),
+                        font_family.to_string(),
+                        store,
+                        cwd,
+                        post_cd,
+                        cx,
+                    );
+                }
+            }
+            ProfileKind::Ssh { .. } => match resolve_ssh_auth(profile, None) {
+                Ok(Some(auth)) => {
+                    self.begin_ssh_saved_tab(profile, layout, panes, auth, font_family, cx);
+                }
+                Ok(None) => self.push_failed(profile, "password required".into(), cx),
+                Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+            },
+        }
+    }
+
+    fn begin_ssh_saved_tab(
+        &mut self,
+        profile: &Profile,
+        layout: &SavedPaneLayout,
+        panes: &[PaneSnapshot],
+        auth: SshAuthMaterial,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let common = profile.kind.common_cwd();
+        let leaf_count = panes.len();
+        let mut leaf_ids = Vec::with_capacity(leaf_count);
+        let mut pane_map = HashMap::new();
+        let session_password = session_password_from_auth(&auth);
+        for _ in 0..leaf_count {
+            let pane_id = Uuid::new_v4();
+            let ProfileKind::Ssh {
+                host, port, user, ..
+            } = &profile.kind
+            else {
+                return;
+            };
+            let pane = PaneSession {
+                id: pane_id,
+                profile_id: Some(profile.id),
+                auth_profile_id: None,
+                session_password: session_password.clone(),
+                kind: profile.kind.clone(),
+                label: profile.name.clone(),
+                state: ConnectionState::Connecting,
+                status_message: format!("connecting to {user}@{host}:{port}…"),
+                terminal: None,
+                pty_master: None,
+                pty_killer: None,
+                ssh_shutdown: None,
+                ssh_sftp: None,
+                ssh_forwards: None,
+                local_auto_restarts_left: 0,
+                _term_subscriptions: Vec::new(),
+            };
+            leaf_ids.push(pane_id);
+            pane_map.insert(pane_id, pane);
+        }
+        let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
+            self.begin_ssh(profile, auth, font_family, common, cx);
+            return;
+        };
+        let focused = tree.first_leaf();
+        let tab = TabSession {
+            id: Uuid::new_v4(),
+            title: self.unique_tab_title(&profile.name),
+            panes: pane_map,
+            layout: tree,
+            focused,
+            zoomed: None,
+        };
+        let tab_id = tab.id;
+        self.tabs.push(tab);
+        self.active = Some(tab_id);
+        cx.notify();
+
+        for (i, snap) in panes.iter().enumerate() {
+            let pane_id = leaf_ids[i];
+            let initial_cwd = snap
+                .cwd
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| common.clone());
+            self.spawn_ssh_connect(
+                tab_id,
+                pane_id,
+                profile,
+                auth.clone(),
+                font_family,
+                initial_cwd,
+                cx,
+            );
         }
     }
 
@@ -209,7 +550,7 @@ impl TabManager {
         cx: &mut Context<Self>,
     ) {
         match resolve_ssh_auth(profile, None) {
-            Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+            Ok(Some(auth)) => self.open_ssh_authenticated(profile, auth, font_family, cx),
             Ok(None) => self.push_failed(profile, "password required".into(), cx),
             Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
         }
@@ -223,10 +564,30 @@ impl TabManager {
         cx: &mut Context<Self>,
     ) {
         match resolve_ssh_auth(profile, Some(password)) {
-            Ok(Some(auth)) => self.begin_ssh(profile, auth, font_family, cx),
+            Ok(Some(auth)) => self.open_ssh_authenticated(profile, auth, font_family, cx),
             Ok(None) => self.push_failed(profile, "password required".into(), cx),
             Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
         }
+    }
+
+    fn open_ssh_authenticated(
+        &mut self,
+        profile: &Profile,
+        auth: SshAuthMaterial,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((layout, panes)) = profile.saved_tab() {
+            self.begin_ssh_saved_tab(profile, layout, panes, auth, font_family, cx);
+            return;
+        }
+        self.begin_ssh(
+            profile,
+            auth,
+            font_family,
+            profile.kind.common_cwd(),
+            cx,
+        );
     }
 
     pub fn ssh_needs_password(profile: &Profile) -> bool {
@@ -270,6 +631,7 @@ impl TabManager {
         profile: &Profile,
         auth: SshAuthMaterial,
         font_family: &str,
+        initial_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let ProfileKind::Ssh {
@@ -305,7 +667,15 @@ impl TabManager {
         self.active = Some(tab_id);
         cx.notify();
 
-        self.spawn_ssh_connect(tab_id, pane_id, profile, auth, font_family, cx);
+        self.spawn_ssh_connect(
+            tab_id,
+            pane_id,
+            profile,
+            auth,
+            font_family,
+            initial_cwd,
+            cx,
+        );
     }
 
     fn spawn_ssh_connect(
@@ -315,6 +685,7 @@ impl TabManager {
         profile: &Profile,
         auth: SshAuthMaterial,
         font_family: &str,
+        initial_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let auto_forwards: Vec<_> = profile
@@ -330,6 +701,7 @@ impl TabManager {
             auth,
             auto_forwards,
             font_family,
+            initial_cwd,
             cx,
         );
     }
@@ -342,6 +714,7 @@ impl TabManager {
         auth: SshAuthMaterial,
         auto_forwards: Vec<crate::model::PortForwardRule>,
         font_family: &str,
+        initial_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let ProfileKind::Ssh {
@@ -379,6 +752,7 @@ impl TabManager {
         let ansi_palette = self.ansi_palette;
         let label = format!("{user}@{host}:{port}");
         let is_docker = kind.is_docker_ssh();
+        let cd_after = initial_cwd.filter(|s| !s.trim().is_empty());
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
@@ -410,6 +784,16 @@ impl TabManager {
                             view
                         });
                         let term_subs = wire_terminal_session(&terminal, None, cx);
+                        if let Some(ref cwd) = cd_after {
+                            let cmd = shell_cd_command(cwd);
+                            terminal.update(cx, |view, cx| {
+                                view.set_working_directory(
+                                    Some(std::path::PathBuf::from(cwd)),
+                                    cx,
+                                );
+                                view.paste_text(&cmd, cx);
+                            });
+                        }
                         pane.terminal = Some(terminal);
                         pane._term_subscriptions = term_subs;
                         pane.ssh_shutdown = Some(handles.shutdown);
@@ -576,6 +960,7 @@ impl TabManager {
             font_family.to_string(),
             store,
             cwd_override,
+            None,
             cx,
         );
     }
@@ -589,6 +974,7 @@ impl TabManager {
         font_family: String,
         store: &Entity<WorkspaceStore>,
         cwd_override: Option<std::path::PathBuf>,
+        post_cd: Option<String>,
         cx: &mut Context<Self>,
     ) {
         let ProfileKind::Local {
@@ -622,6 +1008,7 @@ impl TabManager {
         let label_for_status = kind.summary();
         let cwd_for_ui = spawn_cwd.clone();
         let is_docker = kind.is_docker_local();
+        let cd_after = post_cd.filter(|s| !s.trim().is_empty());
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
@@ -682,11 +1069,25 @@ impl TabManager {
                             view
                         });
                         let term_subs = wire_terminal_session(&terminal, working_dir.clone(), cx);
+                        if let Some(ref cwd) = cd_after {
+                            let cmd = shell_cd_command(cwd);
+                            terminal.update(cx, |view, cx| {
+                                view.set_working_directory(
+                                    Some(std::path::PathBuf::from(cwd)),
+                                    cx,
+                                );
+                                view.paste_text(&cmd, cx);
+                            });
+                        }
                         if let ProfileKind::Local {
                             cwd: ref mut c, ..
                         } = pane.kind
                         {
-                            *c = working_dir;
+                            *c = if let Some(ref cwd) = cd_after {
+                                Some(std::path::PathBuf::from(cwd))
+                            } else {
+                                working_dir
+                            };
                         }
                         pane.terminal = Some(terminal);
                         pane.pty_master = Some(master);
@@ -924,6 +1325,8 @@ impl TabManager {
                     name: label.clone(),
                     kind: kind.clone(),
                     forwards: Vec::new(),
+                    layout: None,
+                    panes: None,
                 };
                 // override → source session_password → keyring
                 let effective_password = password.or(source_password);
@@ -961,6 +1364,7 @@ impl TabManager {
                                 auth,
                                 auto_forwards,
                                 &font_family,
+                                None,
                                 cx,
                             );
                         } else {
@@ -1215,6 +1619,7 @@ impl TabManager {
                         font_family.clone(),
                         store,
                         None,
+                        None,
                         cx,
                     );
                 }
@@ -1235,6 +1640,8 @@ impl TabManager {
                         name: label.clone(),
                         kind: kind.clone(),
                         forwards: Vec::new(),
+                        layout: None,
+                        panes: None,
                     };
                     let effective_password = password.clone().or(session_password);
                     match resolve_ssh_auth(&pseudo, effective_password) {
@@ -1255,6 +1662,7 @@ impl TabManager {
                                 auth,
                                 auto_forwards,
                                 &font_family,
+                                None,
                                 cx,
                             );
                         }
@@ -1773,6 +2181,53 @@ impl TabManager {
         cx.notify();
     }
 
+    /// Capture Bound tab for explicit **Save** (`docs/PROFILE_TAB_LAYOUT.md`).
+    /// Focused pane must be Bound. Refreshes Local cwd via `process_cwd` (not on quit).
+    pub fn capture_tab_for_profile_save(
+        &mut self,
+        tab_id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> Option<TabSaveCapture> {
+        let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
+        let focused = tab.focused;
+        let profile_id = tab.panes.get(&focused)?.profile_id?;
+        let leaf_ids = tab.layout.leaf_ids();
+        if leaf_ids.is_empty() {
+            return None;
+        }
+
+        let mut pane_snaps = Vec::with_capacity(leaf_ids.len());
+        for id in &leaf_ids {
+            let pane = tab.panes.get_mut(id)?;
+            let cwd = pane_cwd_for_save(pane, cx);
+            if let Some(ref path) = cwd {
+                match &mut pane.kind {
+                    ProfileKind::Local { cwd: stored, .. } => {
+                        *stored = Some(std::path::PathBuf::from(path));
+                    }
+                    ProfileKind::Ssh { cwd: stored, .. } => {
+                        *stored = Some(path.clone());
+                    }
+                }
+            }
+            pane_snaps.push(PaneSnapshot { cwd });
+        }
+
+        if leaf_ids.len() == 1 {
+            return Some(TabSaveCapture::CommonCwd {
+                profile_id,
+                cwd: pane_snaps[0].cwd.clone(),
+            });
+        }
+
+        let layout = tab.layout.to_saved();
+        Some(TabSaveCapture::TabSnapshot {
+            profile_id,
+            layout,
+            panes: pane_snaps,
+        })
+    }
+
     /// Focused Bound Local pane → `(profile_id, live cwd)` for **Save**.
     /// Refreshes via `process_cwd` (user-initiated; not used on quit).
     pub fn capture_focused_bound_local_cwd_for_save(
@@ -1780,28 +2235,13 @@ impl TabManager {
         tab_id: Uuid,
         cx: &mut Context<Self>,
     ) -> Option<(Uuid, std::path::PathBuf)> {
-        let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
-        let focused = tab.focused;
-        let pane = tab.panes.get_mut(&focused)?;
-        let pid = pane.profile_id?;
-        if !pane.kind.is_local() || pane.kind.is_docker_local() {
-            return None;
+        match self.capture_tab_for_profile_save(tab_id, cx)? {
+            TabSaveCapture::CommonCwd { profile_id, cwd } => {
+                let path = cwd.filter(|s| !s.trim().is_empty()).map(std::path::PathBuf::from)?;
+                Some((profile_id, path))
+            }
+            TabSaveCapture::TabSnapshot { .. } => None,
         }
-        let from_term = pane.terminal.as_ref().and_then(|term| {
-            term.update(cx, |view, cx| {
-                view.refresh_working_directory(cx);
-                view.working_directory()
-            })
-        });
-        let from_pane = match &pane.kind {
-            ProfileKind::Local { cwd, .. } => cwd.clone(),
-            _ => None,
-        };
-        let cwd = from_term.or(from_pane)?;
-        if let ProfileKind::Local { cwd: stored, .. } = &mut pane.kind {
-            *stored = Some(cwd.clone());
-        }
-        Some((pid, cwd))
     }
 
     pub fn snapshot_for_persist(&self) -> (Vec<(Uuid, Option<String>)>, usize) {
@@ -1961,6 +2401,8 @@ impl TabManager {
                     name: label.clone(),
                     kind: kind.clone(),
                     forwards: Vec::new(),
+                    layout: None,
+                    panes: None,
                 };
                 match resolve_ssh_auth(&pseudo, password.or(source_password)) {
                     Ok(Some(auth)) => {
@@ -1996,6 +2438,7 @@ impl TabManager {
                             auth,
                             auto_forwards,
                             &font_family,
+                            None,
                             cx,
                         );
                         SessionOpResult::Done
@@ -2171,6 +2614,33 @@ fn wrap_pane_as_tab(title: String, pane: PaneSession) -> TabSession {
         focused: pane_id,
         zoomed: None,
     }
+}
+
+/// Live pane cwd string for Tab Save. Local (non-Docker) refreshes via `process_cwd`.
+fn pane_cwd_for_save(pane: &mut PaneSession, cx: &mut Context<TabManager>) -> Option<String> {
+    let refresh = pane.kind.is_local() && !pane.kind.is_docker_local();
+    let from_term = pane.terminal.as_ref().and_then(|term| {
+        term.update(cx, |view, cx| {
+            if refresh {
+                view.refresh_working_directory(cx);
+            }
+            view.working_directory()
+        })
+    });
+    let from_kind = match &pane.kind {
+        ProfileKind::Local { cwd, .. } => cwd.as_ref().map(|p| p.display().to_string()),
+        ProfileKind::Ssh { cwd, .. } => cwd.clone(),
+    };
+    from_term
+        .map(|p| p.display().to_string())
+        .or(from_kind)
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// Best-effort `cd` for SSH / Docker shells (POSIX quoting).
+fn shell_cd_command(path: &str) -> String {
+    let escaped = path.replace('\'', "'\\''");
+    format!("cd '{escaped}'\n")
 }
 
 fn teardown_pane_io(pane: &mut PaneSession) {

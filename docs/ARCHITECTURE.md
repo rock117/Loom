@@ -22,6 +22,7 @@ For **终端 ANSI 配色预设**（已实现；默认 Default 不变）, see [TE
 For **终端反色 / 光标可见性（Agent CLI 等）**（已修复，中文说明）, see [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md).  
 For **Local shell 代理（env 注入 / 系统代理侦测）**, see [LOCAL_PROXY.md](./LOCAL_PROXY.md).  
 For **Session / Profile / Group IA（根级 Profile、嵌套 Group、临时 Tab）**, see [SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md).  
+For **Profile Tab 布局保存（layout + panes）**, see [PROFILE_TAB_LAYOUT.md](./PROFILE_TAB_LAYOUT.md).  
 For **持久化事件（AppBus / Persistence / WillQuit）**, see [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md).  
 For **长会话点 X 窗口不消失（原因分析）**, see [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md).  
 For **日志设计（对齐 Zed，分阶段）**, see [LOGGING.md](./LOGGING.md).  

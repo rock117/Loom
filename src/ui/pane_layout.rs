@@ -2,6 +2,8 @@
 
 use uuid::Uuid;
 
+use crate::model::{SavedPaneLayout, SavedSplitAxis};
+
 /// Side-by-side vs stacked children (matches Zed horizontal / vertical splits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitAxis {
@@ -84,6 +86,80 @@ impl PaneLayout {
         match self {
             Self::Leaf(_) => 1,
             Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
+    /// Depth-first leaf ids (pre-order: first, then second).
+    pub fn leaf_ids(&self) -> Vec<Uuid> {
+        let mut out = Vec::with_capacity(self.leaf_count());
+        self.collect_leaf_ids(&mut out);
+        out
+    }
+
+    fn collect_leaf_ids(&self, out: &mut Vec<Uuid>) {
+        match self {
+            Self::Leaf(id) => out.push(*id),
+            Self::Split { first, second, .. } => {
+                first.collect_leaf_ids(out);
+                second.collect_leaf_ids(out);
+            }
+        }
+    }
+
+    /// Persist structure only (ratios discarded). Leaf indices match [`Self::leaf_ids`] order.
+    pub fn to_saved(&self) -> SavedPaneLayout {
+        self.to_saved_from(0).0
+    }
+
+    fn to_saved_from(&self, next: u32) -> (SavedPaneLayout, u32) {
+        match self {
+            Self::Leaf(_) => (SavedPaneLayout::Leaf { pane: next }, next + 1),
+            Self::Split { axis, first, second, .. } => {
+                let (first_saved, after_first) = first.to_saved_from(next);
+                let (second_saved, after_second) = second.to_saved_from(after_first);
+                (
+                    SavedPaneLayout::Split {
+                        axis: match axis {
+                            SplitAxis::Horizontal => SavedSplitAxis::Horizontal,
+                            SplitAxis::Vertical => SavedSplitAxis::Vertical,
+                        },
+                        first: Box::new(first_saved),
+                        second: Box::new(second_saved),
+                    },
+                    after_second,
+                )
+            }
+        }
+    }
+
+    /// Restore from snapshot; every split uses ratio `0.5`. `leaf_ids.len()` must match leaf count.
+    pub fn from_saved(saved: &SavedPaneLayout, leaf_ids: &[Uuid]) -> Option<Self> {
+        if saved.leaf_count() != leaf_ids.len() {
+            return None;
+        }
+        Self::from_saved_inner(saved, leaf_ids)
+    }
+
+    fn from_saved_inner(saved: &SavedPaneLayout, leaf_ids: &[Uuid]) -> Option<Self> {
+        match saved {
+            SavedPaneLayout::Leaf { pane } => {
+                let id = *leaf_ids.get(*pane as usize)?;
+                Some(Self::Leaf(id))
+            }
+            SavedPaneLayout::Split {
+                axis,
+                first,
+                second,
+            } => Some(Self::Split {
+                id: Uuid::new_v4(),
+                axis: match axis {
+                    SavedSplitAxis::Horizontal => SplitAxis::Horizontal,
+                    SavedSplitAxis::Vertical => SplitAxis::Vertical,
+                },
+                ratio: 0.5,
+                first: Box::new(Self::from_saved_inner(first, leaf_ids)?),
+                second: Box::new(Self::from_saved_inner(second, leaf_ids)?),
+            }),
         }
     }
 
@@ -278,4 +354,47 @@ pub enum RemoveResult {
     NotFound,
     RemovedRoot,
     Collapsed { focus: Uuid },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_roundtrip_equal_ratios() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let mut layout = PaneLayout::leaf(a);
+        assert!(layout.split(a, SplitDirection::Right, b));
+        assert!(layout.split(b, SplitDirection::Down, c));
+        let saved = layout.to_saved();
+        assert_eq!(saved.leaf_count(), 3);
+        let ids = layout.leaf_ids();
+        let restored = PaneLayout::from_saved(&saved, &ids).expect("restore");
+        assert_eq!(restored.leaf_ids(), ids);
+        match &restored {
+            PaneLayout::Split {
+                ratio,
+                axis,
+                second,
+                ..
+            } => {
+                assert!((*ratio - 0.5).abs() < f32::EPSILON);
+                assert_eq!(*axis, SplitAxis::Horizontal);
+                match second.as_ref() {
+                    PaneLayout::Split {
+                        ratio,
+                        axis,
+                        ..
+                    } => {
+                        assert!((*ratio - 0.5).abs() < f32::EPSILON);
+                        assert_eq!(*axis, SplitAxis::Vertical);
+                    }
+                    _ => panic!("expected nested vertical"),
+                }
+            }
+            _ => panic!("expected root split"),
+        }
+    }
 }

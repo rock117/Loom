@@ -42,6 +42,8 @@ pub struct SshForm {
     host: RenameEdit,
     port: RenameEdit,
     user: RenameEdit,
+    /// Optional remote (or container) default cwd.
+    remote_cwd: RenameEdit,
     password: RenameEdit,
     key_path: RenameEdit,
     use_private_key: bool,
@@ -58,11 +60,13 @@ pub struct SshForm {
     /// Brief "Copied" label flash after clipboard write.
     fwd_copy_flash: Option<FwdCopyFlash>,
     _fwd_copy_flash_task: Option<Task<()>>,
+    /// Saved tab pane count when editing (None = create / no snapshot).
+    saved_pane_count: Option<usize>,
     error: Option<String>,
     field: Field,
     /// Mouse-drag text selection in the active field.
     selecting: bool,
-    field_bounds: [Option<Bounds<Pixels>>; 6],
+    field_bounds: [Option<Bounds<Pixels>>; 7],
     /// Bounds of the focused port-forward inline field (IME candidate window).
     forward_ime_bounds: Option<Bounds<Pixels>>,
     _caret_blink: Option<Task<()>>,
@@ -96,6 +100,7 @@ enum Field {
     Host,
     Port,
     User,
+    RemoteCwd,
     Password,
     KeyPath,
 }
@@ -110,6 +115,7 @@ impl SshForm {
             host: field_edit(""),
             port: field_edit("22"),
             user: field_edit(whoami_user()),
+            remote_cwd: field_edit(""),
             password: field_edit(""),
             key_path: field_edit(""),
             use_private_key: false,
@@ -121,10 +127,11 @@ impl SshForm {
             forward_edit: None,
             fwd_copy_flash: None,
             _fwd_copy_flash_task: None,
+            saved_pane_count: None,
             error: None,
             field: Field::Host,
             selecting: false,
-            field_bounds: [None; 6],
+            field_bounds: [None; 7],
             forward_ime_bounds: None,
             _caret_blink: None,
         };
@@ -139,6 +146,7 @@ impl SshForm {
         self.host = field_edit("");
         self.port = field_edit("22");
         self.user = field_edit(whoami_user());
+        self.remote_cwd = field_edit("");
         self.password = field_edit("");
         self.key_path = field_edit("");
         self.use_private_key = false;
@@ -150,6 +158,7 @@ impl SshForm {
         self.forward_edit = None;
         self.fwd_copy_flash = None;
         self._fwd_copy_flash_task = None;
+        self.saved_pane_count = None;
         self.error = None;
         self.field = Field::Host;
         self.selecting = false;
@@ -170,11 +179,13 @@ impl SshForm {
             cx.notify();
             return;
         };
+        self.saved_pane_count = profile.saved_tab().map(|(_, panes)| panes.len());
         let ProfileKind::Ssh {
             host,
             port,
             user,
             auth,
+            cwd,
             ..
         } = profile.kind
         else {
@@ -188,6 +199,7 @@ impl SshForm {
         self.host = field_edit(host);
         self.port = field_edit(port.to_string());
         self.user = field_edit(user);
+        self.remote_cwd = field_edit(cwd.unwrap_or_default());
         self.password = field_edit("");
         self.forwards = profile.forwards.clone();
         self.forwards_open = !self.forwards.is_empty();
@@ -386,6 +398,7 @@ impl SshForm {
             Field::Host => &self.host,
             Field::Port => &self.port,
             Field::User => &self.user,
+            Field::RemoteCwd => &self.remote_cwd,
             Field::Password => &self.password,
             Field::KeyPath => &self.key_path,
         }
@@ -406,6 +419,7 @@ impl SshForm {
             Field::Host => &mut self.host,
             Field::Port => &mut self.port,
             Field::User => &mut self.user,
+            Field::RemoteCwd => &mut self.remote_cwd,
             Field::Password => &mut self.password,
             Field::KeyPath => &mut self.key_path,
         }
@@ -426,6 +440,7 @@ impl SshForm {
             Field::Host => &self.host,
             Field::Port => &self.port,
             Field::User => &self.user,
+            Field::RemoteCwd => &self.remote_cwd,
             Field::Password => &self.password,
             Field::KeyPath => &self.key_path,
         }
@@ -527,7 +542,8 @@ impl SshForm {
                 Field::Name => Field::Host,
                 Field::Host => Field::Port,
                 Field::Port => Field::User,
-                Field::User => Field::KeyPath,
+                Field::User => Field::RemoteCwd,
+                Field::RemoteCwd => Field::KeyPath,
                 Field::KeyPath | Field::Password => Field::Name,
             }
         } else {
@@ -535,7 +551,8 @@ impl SshForm {
                 Field::Name => Field::Host,
                 Field::Host => Field::Port,
                 Field::Port => Field::User,
-                Field::User => Field::Password,
+                Field::User => Field::RemoteCwd,
+                Field::RemoteCwd => Field::Password,
                 Field::Password | Field::KeyPath => Field::Name,
             }
         };
@@ -629,6 +646,15 @@ impl SshForm {
             )
         };
 
+        let remote_cwd = {
+            let t = self.remote_cwd.text.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+
         let ok = if creating {
             let profile = Profile {
                 id,
@@ -639,8 +665,11 @@ impl SshForm {
                     user,
                     auth,
                     docker_container: None,
+                    cwd: remote_cwd,
                 },
                 forwards: self.forwards.clone(),
+                layout: None,
+                panes: None,
             };
             let ok = self.store.update(cx, |s, cx| s.add_ssh_profile(profile, cx));
             if !ok && self.remember && !self.use_private_key {
@@ -649,7 +678,17 @@ impl SshForm {
             ok
         } else {
             self.store.update(cx, |s, cx| {
-                s.update_ssh_profile(id, name, host, port, user, auth, self.forwards.clone(), cx)
+                s.update_ssh_profile(
+                    id,
+                    name,
+                    host,
+                    port,
+                    user,
+                    auth,
+                    self.forwards.clone(),
+                    remote_cwd,
+                    cx,
+                )
             })
         };
 
@@ -668,6 +707,16 @@ impl SshForm {
             connect,
             oneshot_password: oneshot,
         });
+    }
+
+    fn clear_saved_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(pid) = self.editing else {
+            return;
+        };
+        if self.store.update(cx, |s, cx| s.clear_profile_saved_tab(pid, cx)) {
+            self.saved_pane_count = None;
+            cx.notify();
+        }
     }
 
     fn begin_add_forward(&mut self, cx: &mut Context<Self>) {
@@ -1629,8 +1678,9 @@ fn field_idx(field: Field) -> usize {
         Field::Host => 1,
         Field::Port => 2,
         Field::User => 3,
-        Field::Password => 4,
-        Field::KeyPath => 5,
+        Field::RemoteCwd => 4,
+        Field::Password => 5,
+        Field::KeyPath => 6,
     }
 }
 
@@ -1775,6 +1825,7 @@ impl Render for SshForm {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let err = self.error.clone();
         let editing = self.editing.is_some();
+        let saved_panes = self.saved_pane_count;
         let title = if editing {
             "SSH profile settings"
         } else {
@@ -1954,6 +2005,64 @@ impl Render for SshForm {
                                     )),
                             ),
                     )
+                    .child(self.field_row(
+                        "ssh-cwd",
+                        "Start directory (remote)",
+                        Field::RemoteCwd,
+                        &self.remote_cwd,
+                        self.field == Field::RemoteCwd,
+                        false,
+                        "optional",
+                        cx,
+                    ))
+                    .when_some(saved_panes, |d, n| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child("Saved tab"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(theme::SPACE_2))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(theme::TEXT)
+                                                .child(format!("Panes: {n}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("ssh-clear-saved-tab")
+                                                .px(px(theme::SPACE_2))
+                                                .py(px(theme::SPACE_1))
+                                                .rounded(px(theme::RADIUS_SM))
+                                                .border_1()
+                                                .border_color(theme::BORDER)
+                                                .text_xs()
+                                                .text_color(theme::TEXT)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme::HOVER))
+                                                .child("Clear saved tab")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.clear_saved_tab(cx);
+                                                        cx.stop_propagation();
+                                                    }),
+                                                ),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(self.auth_mode_section(cx))
                     .when(!self.use_private_key, |d| {
                         d.child(self.password_field_row(

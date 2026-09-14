@@ -896,20 +896,53 @@ impl WorkspaceView {
         });
     }
 
-    /// Explicitly write focused Bound Local pane cwd into the profile start directory.
+    /// Explicit Tab **Save**: single pane → common cwd; multi-pane → layout+panes.
     fn save_cwd_to_profile(&mut self, tab_id: uuid::Uuid, cx: &mut Context<Self>) {
-        let Some((pid, cwd)) = self.tabs.update(cx, |m, cx| {
-            m.capture_focused_bound_local_cwd_for_save(tab_id, cx)
+        use crate::ui::tab_manager::TabSaveCapture;
+
+        let Some(capture) = self.tabs.update(cx, |m, cx| {
+            m.capture_tab_for_profile_save(tab_id, cx)
         }) else {
-            self.set_toast("No Bound Local cwd to save", cx);
+            self.set_toast("Nothing to save", cx);
             return;
         };
-        let path_label = cwd.display().to_string();
-        self.store.update(cx, |s, cx| {
-            s.update_local_profile_cwd(pid, cwd, cx);
-            s.persist_now();
-        });
-        self.set_toast(format!("Saved successfully · {path_label}"), cx);
+
+        match capture {
+            TabSaveCapture::CommonCwd { profile_id, cwd } => {
+                let label = cwd.clone().unwrap_or_else(|| "(default)".into());
+                let ok = self.store.update(cx, |s, cx| {
+                    let ok = s.update_profile_common_cwd(profile_id, cwd, cx);
+                    if ok {
+                        // Single-pane Save clears any previous multi-pane snapshot.
+                        if let Some(p) = s.workspace.find_profile_mut(profile_id) {
+                            p.clear_saved_tab();
+                        }
+                        s.persist_now();
+                    }
+                    ok
+                });
+                if ok {
+                    self.set_toast(format!("Saved successfully · {label}"), cx);
+                } else {
+                    self.set_toast("Could not save profile", cx);
+                }
+            }
+            TabSaveCapture::TabSnapshot {
+                profile_id,
+                layout,
+                panes,
+            } => {
+                let n = panes.len();
+                let ok = self.store.update(cx, |s, cx| {
+                    s.set_profile_saved_tab(profile_id, layout, panes, cx)
+                });
+                if ok {
+                    self.set_toast(format!("Saved successfully · {n} panes"), cx);
+                } else {
+                    self.set_toast("Could not save tab layout", cx);
+                }
+            }
+        }
     }
 
     /// Open New-style dialog for Save As… (Local form or SSH form).
@@ -1003,6 +1036,24 @@ impl WorkspaceView {
                 m.bind_ephemeral_panes_in_tab(tab_id, profile_id, name.clone(), cx);
             }
         });
+
+        // Copy multi-pane snapshot onto the new profile (single pane already has form cwd).
+        if let Some(capture) = self.tabs.update(cx, |m, cx| {
+            m.capture_tab_for_profile_save(tab_id, cx)
+        }) {
+            use crate::ui::tab_manager::TabSaveCapture;
+            match capture {
+                TabSaveCapture::TabSnapshot {
+                    layout, panes, ..
+                } => {
+                    self.store.update(cx, |s, cx| {
+                        s.set_profile_saved_tab(profile_id, layout, panes, cx);
+                    });
+                }
+                TabSaveCapture::CommonCwd { .. } => {}
+            }
+        }
+
         self.persist_tabs(cx);
         self.set_toast("Saved successfully", cx);
         true

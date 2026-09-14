@@ -218,6 +218,7 @@ impl WorkspaceStore {
         user: String,
         auth: crate::model::SshAuth,
         forwards: Vec<crate::model::PortForwardRule>,
+        cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(profile) = self.workspace.find_profile_mut(id) else {
@@ -239,6 +240,7 @@ impl WorkspaceStore {
             user,
             auth,
             docker_container,
+            cwd: cwd.filter(|s| !s.trim().is_empty()),
         };
         profile.forwards = forwards;
         self.selection = Selection::Profile(id);
@@ -538,6 +540,54 @@ impl WorkspaceStore {
         *stored = Some(cwd);
         self.mark_dirty();
         cx.notify();
+    }
+
+    /// Update profile-level default cwd (Local path or SSH remote string).
+    pub fn update_profile_common_cwd(
+        &mut self,
+        profile_id: Uuid,
+        cwd: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(profile_id) else {
+            return false;
+        };
+        profile.kind.set_common_cwd(cwd);
+        self.mark_dirty();
+        cx.notify();
+        true
+    }
+
+    /// Write or clear a saved tab snapshot (`docs/PROFILE_TAB_LAYOUT.md`).
+    pub fn set_profile_saved_tab(
+        &mut self,
+        profile_id: Uuid,
+        layout: crate::model::SavedPaneLayout,
+        panes: Vec<crate::model::PaneSnapshot>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(profile_id) else {
+            return false;
+        };
+        profile.set_saved_tab(layout, panes);
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
+    }
+
+    pub fn clear_profile_saved_tab(&mut self, profile_id: Uuid, cx: &mut Context<Self>) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(profile_id) else {
+            return false;
+        };
+        if profile.layout.is_none() && profile.panes.is_none() {
+            return true;
+        }
+        profile.clear_saved_tab();
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
     }
 
     /// Update Local / WSL profile name and optional start directory.

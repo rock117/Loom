@@ -39,6 +39,8 @@ pub struct LocalForm {
     cwd: RenameEdit,
     /// True when profile is WSL (`wsl.exe` + args) — footnote for cwd semantics.
     is_wsl: bool,
+    /// Saved tab pane count when editing (None = Save As / no snapshot UI).
+    saved_pane_count: Option<usize>,
     error: Option<String>,
     field: Field,
     selecting: bool,
@@ -56,6 +58,7 @@ impl LocalForm {
             name: field_edit(""),
             cwd: field_edit(""),
             is_wsl: false,
+            saved_pane_count: None,
             error: None,
             field: Field::Name,
             selecting: false,
@@ -86,6 +89,9 @@ impl LocalForm {
 
         self.mode = FormMode::Edit;
         self.editing = Some(profile_id);
+        self.saved_pane_count = profile
+            .saved_tab()
+            .map(|(_, panes)| panes.len());
         self.name = field_edit(profile.name);
         self.cwd = field_edit(
             cwd.as_ref()
@@ -128,6 +134,7 @@ impl LocalForm {
                 .unwrap_or_default(),
         );
         self.is_wsl = kind.is_wsl_local();
+        self.saved_pane_count = None;
         self.error = None;
         self.field = Field::Name;
         self.selecting = false;
@@ -216,6 +223,8 @@ impl LocalForm {
                     name,
                     kind,
                     forwards: Vec::new(),
+                    layout: None,
+                    panes: None,
                 };
                 let pid = self.store.update(cx, |s, cx| {
                     let target = s.insert_target();
@@ -223,6 +232,16 @@ impl LocalForm {
                 });
                 cx.emit(LocalFormEvent::Saved { profile_id: pid });
             }
+        }
+    }
+
+    fn clear_saved_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(pid) = self.editing else {
+            return;
+        };
+        if self.store.update(cx, |s, cx| s.clear_profile_saved_tab(pid, cx)) {
+            self.saved_pane_count = None;
+            cx.notify();
         }
     }
 
@@ -505,6 +524,7 @@ impl Render for LocalForm {
         let name_edit = self.name.clone();
         let cwd_edit = self.cwd.clone();
         let is_wsl = self.is_wsl;
+        let saved_panes = self.saved_pane_count;
         let error = self.error.clone();
         let is_save_as = matches!(self.mode, FormMode::SaveAs { .. });
         let title = if is_save_as {
@@ -729,6 +749,64 @@ impl Render for LocalForm {
                                 )
                             }),
                     )
+                    .when_some(saved_panes, |d, n| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .pt_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child("Saved tab"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(theme::SPACE_2))
+                                        .child(
+                                            div()
+                                                .text_sm()
+                                                .text_color(theme::TEXT)
+                                                .child(format!("Panes: {n}")),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("local-clear-saved-tab")
+                                                .px(px(theme::SPACE_2))
+                                                .py(px(theme::SPACE_1))
+                                                .rounded(px(theme::RADIUS_SM))
+                                                .border_1()
+                                                .border_color(theme::BORDER)
+                                                .text_xs()
+                                                .text_color(theme::TEXT)
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(theme::HOVER))
+                                                .child("Clear saved tab")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.clear_saved_tab(cx);
+                                                        cx.stop_propagation();
+                                                    }),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child(
+                                            "Opening this profile restores the saved split. \
+                                             Clear to open as a single pane.",
+                                        ),
+                                ),
+                        )
+                    })
                     .when_some(error, |d, msg| {
                         d.child(
                             div()
