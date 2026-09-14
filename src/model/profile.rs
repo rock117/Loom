@@ -21,6 +21,47 @@ fn default_true() -> bool {
     true
 }
 
+/// One leaf in a saved Tab snapshot (see `docs/PROFILE_TAB_LAYOUT.md`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PaneSnapshot {
+    /// Working directory for this pane (host or remote path). Empty → use profile default cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// Persisted split tree: structure only — ratios are always 0.5 on restore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SavedPaneLayout {
+    Leaf {
+        /// Index into [`Profile::panes`].
+        pane: u32,
+    },
+    Split {
+        axis: SavedSplitAxis,
+        first: Box<SavedPaneLayout>,
+        second: Box<SavedPaneLayout>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedSplitAxis {
+    /// Left | Right
+    Horizontal,
+    /// Top / Bottom
+    Vertical,
+}
+
+impl SavedPaneLayout {
+    pub fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf { .. } => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProfileKind {
@@ -42,6 +83,9 @@ pub enum ProfileKind {
         /// on the SSH host (Docker-over-SSH profiles). Older workspace files omit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         docker_container: Option<String>,
+        /// Default remote (or container) cwd when no per-pane snapshot cwd is set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
 }
 
@@ -52,6 +96,25 @@ impl ProfileKind {
             cwd: None,
             env: Vec::new(),
             args: Vec::new(),
+        }
+    }
+
+    /// Profile-level default cwd (host path for Local, remote string for SSH).
+    pub fn common_cwd(&self) -> Option<String> {
+        match self {
+            Self::Local { cwd, .. } => cwd.as_ref().map(|p| p.display().to_string()),
+            Self::Ssh { cwd, .. } => cwd.clone(),
+        }
+    }
+
+    pub fn set_common_cwd(&mut self, cwd: Option<String>) {
+        match self {
+            Self::Local { cwd: stored, .. } => {
+                *stored = cwd.filter(|s| !s.trim().is_empty()).map(PathBuf::from);
+            }
+            Self::Ssh { cwd: stored, .. } => {
+                *stored = cwd.filter(|s| !s.trim().is_empty());
+            }
         }
     }
 
@@ -188,10 +251,17 @@ fn is_docker_shell(shell: &str) -> bool {
 pub struct Profile {
     pub id: Uuid,
     pub name: String,
+    /// Connection settings (product name: connection).
     pub kind: ProfileKind,
     /// SSH Local forwards (ignored for Local profiles). Empty by default for older files.
     #[serde(default)]
     pub forwards: Vec<PortForwardRule>,
+    /// Saved tab split tree; paired with [`Self::panes`]. See PROFILE_TAB_LAYOUT.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<SavedPaneLayout>,
+    /// Saved tab pane snapshots; paired with [`Self::layout`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panes: Option<Vec<PaneSnapshot>>,
 }
 
 impl Profile {
@@ -201,6 +271,8 @@ impl Profile {
             name: name.into(),
             kind: ProfileKind::local_default(),
             forwards: Vec::new(),
+            layout: None,
+            panes: None,
         }
     }
 
@@ -216,6 +288,8 @@ impl Profile {
                 args: vec!["-d".into(), distro.to_string()],
             },
             forwards: Vec::new(),
+            layout: None,
+            panes: None,
         }
     }
 
@@ -229,8 +303,11 @@ impl Profile {
                 user,
                 auth: SshAuth::Password { remember: true },
                 docker_container: None,
+                cwd: None,
             },
             forwards: Vec::new(),
+            layout: None,
+            panes: None,
         }
     }
 
@@ -240,6 +317,8 @@ impl Profile {
             name: format!("{} (copy)", self.name),
             kind: self.kind.clone(),
             forwards: self.forwards.iter().map(|f| f.duplicate()).collect(),
+            layout: self.layout.clone(),
+            panes: self.panes.clone(),
         }
     }
 
@@ -249,6 +328,42 @@ impl Profile {
         } else {
             &self.forwards
         }
+    }
+
+    /// Valid saved tab snapshot, if present.
+    pub fn saved_tab(&self) -> Option<(&SavedPaneLayout, &[PaneSnapshot])> {
+        let layout = self.layout.as_ref()?;
+        let panes = self.panes.as_deref()?;
+        if panes.is_empty() || layout.leaf_count() != panes.len() {
+            return None;
+        }
+        Some((layout, panes))
+    }
+
+    /// Pane count for settings UI (1 when no snapshot).
+    pub fn saved_pane_count(&self) -> usize {
+        self.saved_tab()
+            .map(|(_, panes)| panes.len())
+            .unwrap_or(1)
+    }
+
+    pub fn clear_saved_tab(&mut self) {
+        self.layout = None;
+        self.panes = None;
+    }
+
+    /// Store a tab snapshot. Single pane → clear layout/panes (caller updates common cwd).
+    pub fn set_saved_tab(&mut self, layout: SavedPaneLayout, panes: Vec<PaneSnapshot>) {
+        if panes.len() <= 1 {
+            self.clear_saved_tab();
+            return;
+        }
+        if layout.leaf_count() != panes.len() {
+            self.clear_saved_tab();
+            return;
+        }
+        self.layout = Some(layout);
+        self.panes = Some(panes);
     }
 }
 

@@ -1,6 +1,6 @@
 # Session / Profile / Group IA
 
-相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)。
+相关文档：[ARCHITECTURE.md](./ARCHITECTURE.md)、[DECISIONS.md](./DECISIONS.md)、**[PROFILE_TAB_LAYOUT.md](./PROFILE_TAB_LAYOUT.md)**（Tab Save 多 Pane）。
 
 > **状态**：实施中。  
 > **文档约定**：新增规格默认中文。
@@ -83,8 +83,9 @@ PaneSession {
 5. **工作区再开为临时**：Ctrl+T、Tab/终端 Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。
 6. **点侧栏 Profile → Bound Session**（可持久恢复）。
 7. **Tab 右键 Save / Save As…**（文件隐喻）：
-   - **Bound**（已有 Profile）→ **Save**（仅 Bound Local：写回 start dir）+ **Save As…**（单一菜单；弹出与新建相同的表单，确认后建新 Profile 并绑定当前会话）。
+   - **Bound**（已有 Profile）→ **Save**（单 Pane：写公共 cwd；多 Pane：写 `layout`+`panes`，见 [PROFILE_TAB_LAYOUT.md](./PROFILE_TAB_LAYOUT.md)）+ **Save As…**（弹框建新 Profile 并绑定；多 Pane 时快照一并写入）。
    - **Ephemeral** → 仅 **Save As…**（同上弹框）。
+   - 关应用 **不** 自动写回 layout；侧栏不加 dirty / open 圆点。
 8. **重启不恢复临时 tab**；`open_tabs` 只写 Bound Tab。
 9. **Bound Local start directory**：打开 Profile 时用 Profile 里存的 start dir；会话内 `cd` **只**更新该 Pane 内存 cwd（Files 等），**不**静默写回 Profile。写回仅通过 **Edit Local…** / 状态栏，或 Tab 右键 **Save**。Save / Save As 成功后 toast **Saved successfully**。
    - **cwd 两套时钟：** OSC / 缓存的 `working_directory` 常因 shell 未上报而过期；凡用户动作要「当前真实目录」（**Save**、Copy Path、Reveal）必须先 `refresh_working_directory()`（`process_cwd`）。关窗 / flush **禁止** `process_cwd`（见 [WINDOW_CLOSE_HANG.md](./WINDOW_CLOSE_HANG.md)）。
@@ -103,7 +104,7 @@ PaneSession {
 | Tab / 终端 / Ctrl+Shift+D Duplicate | 否 | **是** | 是（1） | Ephemeral（SSH 带 `auth_profile_id`） |
 | Split | 否 | 否 | **是** | Ephemeral（SSH 带 `auth_profile_id`） |
 | Ctrl+T | 否 | **是** | 是（1） | Ephemeral Local |
-| Save（Bound Local） | 否（写回 start dir） | 否 | 否 | — |
+| Save（Bound） | 否（单 Pane 写公共 cwd；多 Pane 写 layout） | 否 | 否 | — |
 | Save As… | **是**（弹框确认） | 否 | 否 | 绑定当前会话到新 Profile |
 
 ## Session 来源（Pane 级）

@@ -266,6 +266,8 @@ pub fn new_profile(name: impl Into<String>, container_id: &str) -> Profile {
         name: name.into(),
         kind: exec_profile_kind(container_id),
         forwards: Vec::new(),
+        layout: None,
+        panes: None,
     }
 }
 
@@ -287,8 +289,11 @@ pub fn new_ssh_docker_profile(
             user,
             auth,
             docker_container: Some(container_id.trim().to_string()),
+            cwd: None,
         },
         forwards: Vec::new(),
+        layout: None,
+        panes: None,
     }
 }
 
