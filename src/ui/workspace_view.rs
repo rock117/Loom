@@ -909,9 +909,13 @@ impl WorkspaceView {
 
         match capture {
             TabSaveCapture::CommonCwd { profile_id, cwd } => {
-                let label = cwd.clone().unwrap_or_else(|| "(default)".into());
+                let Some(cwd) = cwd.filter(|s| !s.trim().is_empty()) else {
+                    self.set_toast("No cwd to save", cx);
+                    return;
+                };
+                let path_label = cwd.clone();
                 let ok = self.store.update(cx, |s, cx| {
-                    let ok = s.update_profile_common_cwd(profile_id, cwd, cx);
+                    let ok = s.update_profile_common_cwd(profile_id, Some(cwd), cx);
                     if ok {
                         // Single-pane Save clears any previous multi-pane snapshot.
                         if let Some(p) = s.workspace.find_profile_mut(profile_id) {
@@ -922,7 +926,7 @@ impl WorkspaceView {
                     ok
                 });
                 if ok {
-                    self.set_toast(format!("Saved successfully · {label}"), cx);
+                    self.set_toast(format!("Saved successfully · {path_label}"), cx);
                 } else {
                     self.set_toast("Could not save profile", cx);
                 }

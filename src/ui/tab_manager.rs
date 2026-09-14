@@ -297,76 +297,12 @@ impl TabManager {
         }
 
         match &profile.kind {
-            ProfileKind::Local { .. } if !profile.kind.local_has_args() => {
-                let mut leaf_ids = Vec::with_capacity(leaf_count);
-                let mut pane_map = HashMap::new();
-                for snap in panes {
-                    let cwd = snap
-                        .cwd
-                        .clone()
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| common.clone())
-                        .map(std::path::PathBuf::from);
-                    match self.spawn_local(
-                        Some(profile.id),
-                        &profile.kind,
-                        &profile.name,
-                        default_shell,
-                        font_family,
-                        store,
-                        cwd,
-                        window,
-                        cx,
-                    ) {
-                        Ok(pane) => {
-                            leaf_ids.push(pane.id);
-                            pane_map.insert(pane.id, pane);
-                        }
-                        Err(err) => {
-                            for mut orphan in pane_map.into_values() {
-                                teardown_pane_io(&mut orphan);
-                                drop(orphan.terminal);
-                            }
-                            self.push_failed(profile, format!("{err:#}"), cx);
-                            return;
-                        }
-                    }
-                }
-                let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
-                    for mut orphan in pane_map.into_values() {
-                        teardown_pane_io(&mut orphan);
-                        drop(orphan.terminal);
-                    }
-                    self.open_profile_single(
-                        profile,
-                        default_shell,
-                        font_family,
-                        store,
-                        None,
-                        window,
-                        cx,
-                    );
-                    return;
-                };
-                let focused = tree.first_leaf();
-                let tab = TabSession {
-                    id: Uuid::new_v4(),
-                    title: self.unique_tab_title(&profile.name),
-                    panes: pane_map,
-                    layout: tree,
-                    focused,
-                    zoomed: None,
-                };
-                let id = tab.id;
-                self.tabs.push(tab);
-                self.active = Some(id);
-                cx.notify();
-            }
             ProfileKind::Local { .. } => {
-                // WSL / Docker-local: placeholder panes + async attach per leaf.
+                // All Local (plain / WSL / Docker): placeholders + async attach so the UI
+                // thread is not blocked by N× CreateProcess (see HARD_PROBLEMS.md).
                 let mut leaf_ids = Vec::with_capacity(leaf_count);
                 let mut pane_map = HashMap::new();
-                for snap in panes {
+                for _ in panes {
                     let pane_id = Uuid::new_v4();
                     let status = if profile.kind.is_wsl_local() {
                         "starting WSL…".to_string()
@@ -395,7 +331,6 @@ impl TabManager {
                     };
                     leaf_ids.push(pane_id);
                     pane_map.insert(pane_id, pane);
-                    let _ = snap; // cwd applied in attach loop below
                 }
                 let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
                     self.open_profile_single(
@@ -431,6 +366,7 @@ impl TabManager {
                         .filter(|s| !s.trim().is_empty())
                         .or_else(|| common.clone())
                         .map(std::path::PathBuf::from);
+                    // Docker: host spawn ignores container paths; cd after attach.
                     let post_cd = if profile.kind.is_docker_local() {
                         snap.cwd
                             .clone()
@@ -530,6 +466,8 @@ impl TabManager {
                 .clone()
                 .filter(|s| !s.trim().is_empty())
                 .or_else(|| common.clone());
+            // Only the first leaf starts Profile Local forwards — otherwise N panes
+            // fight for the same bind ports.
             self.spawn_ssh_connect(
                 tab_id,
                 pane_id,
@@ -537,6 +475,7 @@ impl TabManager {
                 auth.clone(),
                 font_family,
                 initial_cwd,
+                i == 0,
                 cx,
             );
         }
@@ -674,6 +613,7 @@ impl TabManager {
             auth,
             font_family,
             initial_cwd,
+            true,
             cx,
         );
     }
@@ -686,14 +626,19 @@ impl TabManager {
         auth: SshAuthMaterial,
         font_family: &str,
         initial_cwd: Option<String>,
+        start_profile_forwards: bool,
         cx: &mut Context<Self>,
     ) {
-        let auto_forwards: Vec<_> = profile
-            .forwards
-            .iter()
-            .filter(|f| f.enabled)
-            .cloned()
-            .collect();
+        let auto_forwards: Vec<_> = if start_profile_forwards {
+            profile
+                .forwards
+                .iter()
+                .filter(|f| f.enabled)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.spawn_ssh_connect_kind(
             tab_id,
             pane_id,
@@ -2214,9 +2159,11 @@ impl TabManager {
         }
 
         if leaf_ids.len() == 1 {
+            // Match pre-layout Save: no known cwd → fail capture (do not clear profile cwd).
+            let cwd = pane_snaps[0].cwd.clone().filter(|s| !s.trim().is_empty())?;
             return Some(TabSaveCapture::CommonCwd {
                 profile_id,
-                cwd: pane_snaps[0].cwd.clone(),
+                cwd: Some(cwd),
             });
         }
 
