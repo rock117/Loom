@@ -2129,6 +2129,7 @@ impl TabManager {
     /// Capture Bound tab for explicit **Save** (`docs/PROFILE_TAB_LAYOUT.md`).
     /// Tab must have a Bound profile (focused may be Ephemeral after Split).
     /// Refreshes Local cwd via `process_cwd` (not on quit).
+
     pub fn capture_tab_for_profile_save(
         &mut self,
         tab_id: Uuid,
