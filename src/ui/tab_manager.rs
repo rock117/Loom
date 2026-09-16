@@ -2127,15 +2127,15 @@ impl TabManager {
     }
 
     /// Capture Bound tab for explicit **Save** (`docs/PROFILE_TAB_LAYOUT.md`).
-    /// Focused pane must be Bound. Refreshes Local cwd via `process_cwd` (not on quit).
+    /// Tab must have a Bound profile (focused may be Ephemeral after Split).
+    /// Refreshes Local cwd via `process_cwd` (not on quit).
     pub fn capture_tab_for_profile_save(
         &mut self,
         tab_id: Uuid,
         cx: &mut Context<Self>,
     ) -> Option<TabSaveCapture> {
         let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
-        let focused = tab.focused;
-        let profile_id = tab.panes.get(&focused)?.profile_id?;
+        let profile_id = tab.bound_profile_id()?;
         let leaf_ids = tab.layout.leaf_ids();
         if leaf_ids.is_empty() {
             return None;

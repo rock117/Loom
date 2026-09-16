@@ -309,7 +309,9 @@ impl TabBar {
             .find(|t| t.id == tab_id)
             .and_then(|t| t.focused_pane())
             .is_some_and(|p| p.profile_id.is_some());
-        let can_save_tab = focused_bound;
+        // Save writes to a Bound Profile: allow when the tab has any Bound leaf
+        // (Split focuses the new Ephemeral pane — still need Save for layout).
+        let can_save_tab = profile_id.is_some();
         let current_group = profile_id.and_then(|pid| {
             self.store
                 .read(cx)
