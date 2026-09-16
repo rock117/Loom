@@ -8,6 +8,7 @@ authors = ["Loom"]
 
 [dependencies]
 alacritty_terminal = "0.25.1"
+log = "0.4"
 anyhow = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"

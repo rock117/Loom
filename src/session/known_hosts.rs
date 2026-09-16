@@ -32,7 +32,10 @@ fn load() -> KnownHostsFile {
     }) {
         Ok(v) => v,
         Err(err) => {
-            eprintln!("loom: known_hosts load failed ({err}); starting empty");
+            log::warn!(
+                target: "loom::ssh.connect",
+                "known_hosts load failed ({err}); starting empty"
+            );
             KnownHostsFile {
                 version: 1,
                 hosts: HashMap::new(),

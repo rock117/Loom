@@ -132,7 +132,10 @@ impl WorkspaceView {
         let persistence_for_close = persistence.clone();
         window.on_window_should_close(cx, move |_window, cx| {
             if !persistence_for_close.read(cx).allow_window_close() {
+                crate::shared::logging::quit_trace("quit: should_close allow=false");
                 persistence_for_close.update(cx, |p, cx| p.prepare_window_close(cx));
+            } else {
+                crate::shared::logging::quit_trace("quit: should_close allow=true");
             }
             true
         });

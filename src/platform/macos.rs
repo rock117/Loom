@@ -6,6 +6,14 @@ pub fn native_config_dir() -> PathBuf {
         .join("Loom")
 }
 
+pub fn native_logs_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library")
+        .join("Logs")
+        .join("Loom")
+}
+
 pub fn native_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
 }

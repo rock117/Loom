@@ -290,6 +290,10 @@ pub async fn run_forward_worker(
                 temporary,
                 reply,
             } => {
+                let label = format!(
+                    "{}:{} → {}:{}",
+                    rule.bind_host, rule.bind_port, rule.target_host, rule.target_port
+                );
                 let result = start_local(
                     Arc::clone(&session),
                     Arc::clone(&state),
@@ -298,6 +302,12 @@ pub async fn run_forward_worker(
                     temporary,
                 )
                 .await;
+                match &result {
+                    Ok(()) => log::info!(target: "loom::ssh.forward", "start ok {label}"),
+                    Err(err) => {
+                        log::warn!(target: "loom::ssh.forward", "start fail {label}: {err:#}")
+                    }
+                }
                 let _ = reply.send(result);
             }
             ForwardCmd::Stop { id, reply } => {
@@ -305,6 +315,7 @@ pub async fn run_forward_worker(
                     let _ = tx.send(());
                 }
                 state.remove_row(id);
+                log::info!(target: "loom::ssh.forward", "stop id={id}");
                 let _ = reply.send(Ok(()));
             }
             ForwardCmd::Retry { id, reply } => {
@@ -402,6 +413,7 @@ async fn start_local(
             state.update_row(rule.id, |r| {
                 r.status = ForwardStatus::Error(msg.clone());
             });
+            log::warn!(target: "loom::ssh.forward", "bind fail {bind_addr}: {msg}");
             bail!("{msg}");
         }
     };
@@ -413,6 +425,12 @@ async fn start_local(
         r.status = ForwardStatus::Listening;
         r.last_dial_error = None;
     });
+    log::debug!(
+        target: "loom::ssh.forward",
+        "listening {bind_addr} → {}:{}",
+        rule.target_host,
+        rule.target_port
+    );
 
     let target_host = rule.target_host.clone();
     let target_port = rule.target_port;
@@ -466,6 +484,15 @@ async fn accept_loop(
                                 let msg = format_bridge_error(&err);
                                 if is_forwarding_denied(&err) {
                                     state.set_forwarding_denied(true);
+                                    log::warn!(
+                                        target: "loom::ssh.forward",
+                                        "server disabled TCP forwarding"
+                                    );
+                                } else {
+                                    log::debug!(
+                                        target: "loom::ssh.forward",
+                                        "bridge error rule={rule_id}: {msg}"
+                                    );
                                 }
                                 state.update_row(rule_id, |r| {
                                     r.last_dial_error = Some(msg);

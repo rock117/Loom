@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use super::profile::{Profile, ProfileKind};
@@ -718,6 +719,84 @@ pub struct SettingsFile {
     /// Optional `NO_PROXY` when Auto or Manual.
     #[serde(default)]
     pub local_proxy_no_proxy: Option<String>,
+    /// File logging (`docs/LOGGING.md`). Omitted in older settings.json.
+    #[serde(default)]
+    pub logging: LoggingSettings,
+}
+
+/// Settings for application file / stderr logging.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoggingSettings {
+    #[serde(default = "default_logging_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub level: LogLevelSetting,
+    /// Empty / None → platform default (`platform::logs_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<PathBuf>,
+    /// Rotate to `Loom.log.old` when the active file exceeds this size.
+    #[serde(default = "default_logging_max_bytes")]
+    pub max_bytes: u64,
+}
+
+fn default_logging_enabled() -> bool {
+    true
+}
+
+fn default_logging_max_bytes() -> u64 {
+    1024 * 1024
+}
+
+impl Default for LoggingSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: LogLevelSetting::Info,
+            dir: None,
+            max_bytes: default_logging_max_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevelSetting {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevelSetting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+
+    pub const ALL: [LogLevelSetting; 5] = [
+        LogLevelSetting::Error,
+        LogLevelSetting::Warn,
+        LogLevelSetting::Info,
+        LogLevelSetting::Debug,
+        LogLevelSetting::Trace,
+    ];
+
+    pub fn to_filter(self) -> log::LevelFilter {
+        match self {
+            Self::Error => log::LevelFilter::Error,
+            Self::Warn => log::LevelFilter::Warn,
+            Self::Info => log::LevelFilter::Info,
+            Self::Debug => log::LevelFilter::Debug,
+            Self::Trace => log::LevelFilter::Trace,
+        }
+    }
 }
 
 fn default_show_line_numbers() -> bool {
@@ -764,6 +843,7 @@ impl Default for SettingsFile {
             local_proxy_mode: LocalProxyMode::Off,
             local_proxy_url: None,
             local_proxy_no_proxy: None,
+            logging: LoggingSettings::default(),
         }
     }
 }

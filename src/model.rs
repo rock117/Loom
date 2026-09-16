@@ -19,6 +19,6 @@ pub use profile::{
 };
 pub use snippets::{Snippet, SnippetsFile};
 pub use workspace::{
-    AnsiPalette, Group, OpenTabRef, OrderKey, SettingsFile, SidebarEntry, SidebarProfileKind,
-    UiStateFile, WorkspaceFile,
+    AnsiPalette, Group, LogLevelSetting, LoggingSettings, OpenTabRef, OrderKey, SettingsFile,
+    SidebarEntry, SidebarProfileKind, UiStateFile, WorkspaceFile,
 };

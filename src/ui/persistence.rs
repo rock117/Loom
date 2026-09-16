@@ -65,7 +65,9 @@ impl Persistence {
 
     /// Title-bar X: sync flush without `process_cwd`, mark ready (caller returns true to destroy).
     pub fn prepare_window_close(&mut self, cx: &mut Context<Self>) {
+        crate::shared::logging::quit_trace("quit: prepare_window_close");
         if self.flushed_for_quit {
+            crate::shared::logging::quit_trace("quit: prepare_window_close already_flushed");
             return;
         }
         self.flush_for_quit(cx);
@@ -73,6 +75,8 @@ impl Persistence {
 
     /// Quit path flush: cached cwd only — never block WM_CLOSE on sysinfo PEB reads.
     fn flush_for_quit(&mut self, cx: &mut Context<Self>) {
+        crate::shared::logging::quit_trace("quit: flush begin");
+        let started = std::time::Instant::now();
         self.debounce_generation = self.debounce_generation.wrapping_add(1);
         self._debounce = None;
         if let Some(workspace) = self.workspace.upgrade() {
@@ -81,12 +85,18 @@ impl Persistence {
             self.store.update(cx, |s, _| s.persist_if_dirty());
         }
         self.flushed_for_quit = true;
+        crate::shared::logging::quit_trace(&format!(
+            "quit: flush ok elapsed_ms={}",
+            started.elapsed().as_millis()
+        ));
     }
 
     fn on_will_quit(&mut self, cx: &mut Context<Self>) {
+        crate::shared::logging::quit_trace("quit: will_quit begin");
         if !self.flushed_for_quit {
             self.flush_for_quit(cx);
         }
+        crate::shared::logging::quit_trace("quit: cx.quit");
         cx.quit();
     }
 

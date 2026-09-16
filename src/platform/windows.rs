@@ -10,6 +10,13 @@ pub fn native_config_dir() -> PathBuf {
         .join("Loom")
 }
 
+pub fn native_logs_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Loom")
+        .join("logs")
+}
+
 pub fn native_default_shell() -> String {
     DEFAULT_SHELL.clone()
 }

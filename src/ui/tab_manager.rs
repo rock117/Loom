@@ -746,9 +746,11 @@ impl TabManager {
                         let forwards = handles.forwards;
                         for rule in &auto_forwards {
                             if let Err(err) = forwards.start(rule.clone(), false) {
-                                eprintln!(
-                                    "loom: start forward {}:{}: {err:#}",
-                                    rule.bind_host, rule.bind_port
+                                log::warn!(
+                                    target: "loom::ssh.forward",
+                                    "auto-start {}:{}: {err:#}",
+                                    rule.bind_host,
+                                    rule.bind_port
                                 );
                             }
                         }
@@ -2251,7 +2253,7 @@ impl TabManager {
                 cx.notify();
             }
             Err(err) => {
-                eprintln!("loom: ephemeral local failed: {err:#}");
+                log::warn!(target: "loom::session", "ephemeral local failed: {err:#}");
             }
         }
     }
@@ -2336,7 +2338,9 @@ impl TabManager {
                         self.active = Some(id);
                         cx.notify();
                     }
-                    Err(err) => eprintln!("loom: duplicate local failed: {err:#}"),
+                    Err(err) => {
+                        log::warn!(target: "loom::session", "duplicate local failed: {err:#}")
+                    }
                 }
                 SessionOpResult::Done
             }
@@ -2409,7 +2413,7 @@ impl TabManager {
                         }
                     }
                     Err(err) => {
-                        eprintln!("loom: duplicate SSH failed: {err:#}");
+                        log::warn!(target: "loom::session", "duplicate SSH failed: {err:#}");
                         SessionOpResult::Done
                     }
                 }

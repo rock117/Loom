@@ -3,7 +3,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::model::AnsiPalette;
+use crate::model::{AnsiPalette, LogLevelSetting};
 use crate::session::local_proxy::{self, LocalProxyMode};
 use crate::shared::theme;
 use crate::ui::workspace_store::WorkspaceStore;
@@ -895,6 +895,8 @@ impl Render for SettingsPanel {
                                     ),
                             ),
                     )
+                    // Logging
+                    .child(self.logging_section(cx))
                     // Workspace
                     .child(
                         div()
@@ -930,6 +932,220 @@ impl Render for SettingsPanel {
                             ),
                     ),
             )
+    }
+}
+
+impl SettingsPanel {
+    fn logging_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let logging = self.store.read(cx).settings.logging.clone();
+        let enabled = logging.enabled;
+        let level = logging.level;
+        let dir_display = logging
+            .dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| {
+                crate::shared::logging::current_log_dir().display().to_string()
+            });
+        let using_default_dir = logging.dir.is_none();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(Self::section_title("LOGGING"))
+            .child(
+                div()
+                    .id("settings-log-enabled")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::TEXT)
+                            .child(if enabled {
+                                "☑ Write log file"
+                            } else {
+                                "☐ Write log file"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.store.update(cx, |s, _| {
+                            s.settings.logging.enabled = !s.settings.logging.enabled;
+                            s.persist_logging_settings();
+                        });
+                        cx.notify();
+                    })),
+            )
+            .child(Self::field_label("Level"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(LogLevelSetting::ALL.into_iter().map(|lv| {
+                        let selected = lv == level;
+                        let label = lv.as_str().to_string();
+                        div()
+                            .id(SharedString::from(format!("log-level-{label}")))
+                            .px_2()
+                            .py_1()
+                            .rounded(px(theme::RADIUS_SM))
+                            .bg(if selected {
+                                theme::SELECTION
+                            } else {
+                                theme::BG
+                            })
+                            .border_1()
+                            .border_color(if selected {
+                                theme::ACCENT
+                            } else {
+                                theme::BORDER
+                            })
+                            .text_xs()
+                            .text_color(if selected {
+                                theme::TEXT
+                            } else {
+                                theme::TEXT_MUTED
+                            })
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.store.update(cx, |s, _| {
+                                    s.settings.logging.level = lv;
+                                    s.persist_logging_settings();
+                                });
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(Self::field_label("Log folder"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("settings-log-dir")
+                            .flex_1()
+                            .min_w_0()
+                            .px_3()
+                            .py_2()
+                            .rounded(px(theme::RADIUS_SM))
+                            .bg(theme::BG)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .text_xs()
+                            .text_color(if using_default_dir {
+                                theme::TEXT_MUTED
+                            } else {
+                                theme::TEXT
+                            })
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(if using_default_dir {
+                                format!("Default · {dir_display}")
+                            } else {
+                                dir_display.clone()
+                            }),
+                    )
+                    .child(Self::secondary_btn(
+                        "btn-log-browse",
+                        "Browse…",
+                        cx,
+                        |this, _, cx| this.pick_log_dir(cx),
+                    ))
+                    .when(!using_default_dir, |d| {
+                        d.child(Self::secondary_btn(
+                            "btn-log-reset-dir",
+                            "Default",
+                            cx,
+                            |this, _, cx| {
+                                this.store.update(cx, |s, _| {
+                                    s.settings.logging.dir = None;
+                                    s.persist_logging_settings();
+                                });
+                                cx.notify();
+                            },
+                        ))
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(Self::secondary_btn(
+                        "btn-open-log",
+                        "Open log",
+                        cx,
+                        |_, _, cx| {
+                            match crate::shared::logging::ensure_log_file() {
+                                Ok(path) => crate::platform::open_path_detached(path),
+                                Err(err) => {
+                                    log::warn!(target: "loom", "open log failed: {err}");
+                                }
+                            }
+                            cx.notify();
+                        },
+                    ))
+                    .child(Self::secondary_btn(
+                        "btn-reveal-log",
+                        "Reveal in Explorer",
+                        cx,
+                        |_, _, cx| {
+                            let path = crate::shared::logging::current_log_path();
+                            let target = if path.exists() {
+                                path
+                            } else {
+                                crate::shared::logging::current_log_dir()
+                            };
+                            let _ = crate::platform::reveal_in_file_manager(&target);
+                            cx.notify();
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::TEXT_MUTED)
+                    .child(
+                        "LOOM_LOG / LOOM_LOG_DIR override Settings for this process. \
+                         LOOM_QUIT_TRACE=1 adds detailed quit stages.",
+                    ),
+            )
+    }
+
+    fn pick_log_dir(&mut self, cx: &mut Context<Self>) {
+        let start = self
+            .store
+            .read(cx)
+            .settings
+            .logging
+            .dir
+            .clone()
+            .unwrap_or_else(crate::shared::logging::current_log_dir);
+        cx.spawn(async move |this, cx| {
+            let mut dialog = rfd::AsyncFileDialog::new().set_title("Log folder");
+            if start.is_dir() {
+                dialog = dialog.set_directory(&start);
+            }
+            let Some(handle) = dialog.pick_folder().await else {
+                return;
+            };
+            let path = handle.path().to_path_buf();
+            this.update(cx, |this, cx| {
+                this.store.update(cx, |s, _| {
+                    s.settings.logging.dir = Some(path);
+                    s.persist_logging_settings();
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 }
 

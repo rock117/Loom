@@ -435,6 +435,10 @@ async fn ensure_session(
             LaneKind::Browse => "browse",
             LaneKind::Transfer => "transfer",
         };
+        log::warn!(
+            target: "loom::sftp",
+            "channel budget exhausted lane={label} max={GLOBAL_SFTP_CHANNEL_BUDGET}"
+        );
         bail!(
             "SFTP {label} unavailable: too many open SFTP channels (max {GLOBAL_SFTP_CHANNEL_BUDGET})"
         );
@@ -442,10 +446,20 @@ async fn ensure_session(
     let guard = ChannelBudgetGuard;
     match open_sftp(session).await {
         Ok(s) => {
+            let label = match kind {
+                LaneKind::Browse => "browse",
+                LaneKind::Transfer => "transfer",
+            };
+            log::debug!(target: "loom::sftp", "session open lane={label}");
             *sftp = Some((s, guard));
             Ok(())
         }
         Err(err) => {
+            let label = match kind {
+                LaneKind::Browse => "browse",
+                LaneKind::Transfer => "transfer",
+            };
+            log::warn!(target: "loom::sftp", "session open fail lane={label}: {err:#}");
             drop(guard);
             Err(err)
         }
@@ -477,10 +491,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
-                    .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "download begin id={id} remote={remote} local={} compress={}",
+                local.display(),
+                options.compress
             );
+            let started = std::time::Instant::now();
+            let result =
+                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
+                    .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "download ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "download fail id={id} remote={remote}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::Upload {
             id,
@@ -491,9 +525,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "upload begin id={id} local={} remote_dir={remote_dir} compress={}",
+                local.display(),
+                options.compress
             );
+            let started = std::time::Instant::now();
+            let result =
+                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "upload ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "upload fail id={id} local={}: {err:#}",
+                    local.display()
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::Mkdir { path, reply } => {
             let _ = reply.send(
@@ -533,12 +588,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                docker_download_staged(
-                    session, sftp, id, &container, &remote, &local, progress, cancel,
-                )
-                .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "docker download begin id={id} container={container} remote={remote} local={}",
+                local.display()
             );
+            let started = std::time::Instant::now();
+            let result = docker_download_staged(
+                session, sftp, id, &container, &remote, &local, progress, cancel,
+            )
+            .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "docker download ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "docker download fail id={id}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::DockerUpload {
             id,
@@ -549,12 +622,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                docker_upload_staged(
-                    session, sftp, id, &container, &local, &remote_dir, progress, cancel,
-                )
-                .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "docker upload begin id={id} container={container} local={} remote_dir={remote_dir}",
+                local.display()
             );
+            let started = std::time::Instant::now();
+            let result = docker_upload_staged(
+                session, sftp, id, &container, &local, &remote_dir, progress, cancel,
+            )
+            .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "docker upload ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "docker upload fail id={id}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::DockerHome { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(

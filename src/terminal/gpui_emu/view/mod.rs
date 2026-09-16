@@ -1191,7 +1191,7 @@ impl TerminalView {
             return false;
         }
         if let Err(err) = platform::open_url(&url) {
-            eprintln!("loom: failed to open URL {url}: {err}");
+            log::warn!(target: "loom", "failed to open URL {url}: {err}");
         }
         // Consume the click either way so we don't start a selection mid-Ctrl.
         true
