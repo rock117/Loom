@@ -444,6 +444,9 @@ pub struct TerminalView {
     /// Grid line + exclusive column range of the hovered URL (for paint).
     hover_url_span: Option<(alacritty_terminal::index::Line, usize, usize)>,
 
+    /// Pointer is over the overlay scrollbar track (Arrow cursor, not IBeam).
+    hover_scrollbar: bool,
+
     /// Last painted terminal bounds (window space) for hit-testing.
     last_bounds: Bounds<Pixels>,
 
@@ -642,6 +645,7 @@ impl TerminalView {
             hyperlink_mods: false,
             hover_hyperlink: false,
             hover_url_span: None,
+            hover_scrollbar: false,
             last_bounds: Bounds::default(),
             scrollbar_drag: None,
             find: None,
@@ -1102,7 +1106,24 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if self.scrollbar_drag.is_some() {
+            if !self.hover_scrollbar {
+                self.hover_scrollbar = true;
+                cx.notify();
+            }
             self.update_scrollbar_drag(event.position.y, cx);
+            return;
+        }
+
+        let over_scrollbar = self.pointer_over_scrollbar(event.position);
+        if over_scrollbar != self.hover_scrollbar {
+            self.hover_scrollbar = over_scrollbar;
+            if over_scrollbar {
+                self.hover_hyperlink = false;
+                self.hover_url_span = None;
+            }
+            cx.notify();
+        }
+        if over_scrollbar {
             return;
         }
 
@@ -1408,6 +1429,16 @@ impl TerminalView {
         }
     }
 
+    fn pointer_over_scrollbar(&self, position: Point<Pixels>) -> bool {
+        let Some(metrics) = self.scroll_metrics() else {
+            return false;
+        };
+        let Some(geo) = self.scrollbar_geometry(&metrics) else {
+            return false;
+        };
+        geo.track.contains(&position)
+    }
+
     fn handle_scrollbar_mouse_down(
         &mut self,
         position: Point<Pixels>,
@@ -1422,6 +1453,7 @@ impl TerminalView {
         if !geo.track.contains(&position) {
             return false;
         }
+        self.hover_scrollbar = true;
 
         let thumb_top = geo.track.origin.y + geo.thumb_y;
         let thumb_bottom = thumb_top + geo.thumb_h;
@@ -1999,18 +2031,20 @@ impl Render for TerminalView {
         let padding = self.config.padding;
         let view = cx.entity();
         let view_paint = view.clone();
+        let cursor = if self.hover_scrollbar || self.scrollbar_drag.is_some() {
+            CursorStyle::Arrow
+        } else if self.hyperlink_mods && self.hover_hyperlink {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::IBeam
+        };
 
         div()
             .relative()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
-            .when(self.hyperlink_mods && self.hover_hyperlink, |d| {
-                d.cursor(CursorStyle::PointingHand)
-            })
-            .when(!(self.hyperlink_mods && self.hover_hyperlink), |d| {
-                d.cursor(CursorStyle::IBeam)
-            })
+            .cursor(cursor)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
