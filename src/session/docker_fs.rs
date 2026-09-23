@@ -5,12 +5,14 @@
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use flume::Sender;
 
+use super::dir_size_progress::Throttle;
 use super::docker::{container_id_from_args, docker_program};
 use super::sftp::{RemoteEntry, TransferCancel, TransferOutcome, TransferProgress};
 use crate::model::ProfileKind;
@@ -79,6 +81,44 @@ pub fn parent_path(path: &str) -> Option<String> {
         Some(i) => Some(p[..i].to_string()),
         None => None,
     }
+}
+
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+/// Recursive byte size via layered `list_dir` (`docker exec` per directory level).
+pub fn dir_size(
+    container: &str,
+    path: &str,
+    cancel: &AtomicBool,
+    progress: &Sender<u64>,
+) -> Result<u64> {
+    let root = normalize_path(path);
+    ensure_not_cancelled(cancel)?;
+    let mut stack = vec![root];
+    let mut total = 0u64;
+    let mut steps = 0u32;
+    let mut throttle = Throttle::new();
+    while let Some(dir) = stack.pop() {
+        steps = steps.wrapping_add(1);
+        if steps % 16 == 0 {
+            ensure_not_cancelled(cancel)?;
+        }
+        for entry in list_dir(container, &dir)? {
+            if entry.is_dir {
+                stack.push(entry.path);
+            } else {
+                total = total.saturating_add(entry.size);
+                throttle.maybe_send(total, progress);
+            }
+        }
+    }
+    throttle.flush(total, progress);
+    Ok(total)
 }
 
 pub fn join_child(parent: &str, name: &str) -> String {

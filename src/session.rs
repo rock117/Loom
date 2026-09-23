@@ -1,6 +1,7 @@
 //! Local PTY and SSH session backends.
 
 pub mod credentials;
+pub mod dir_size_progress;
 pub mod docker;
 pub mod docker_fs;
 pub mod docker_ssh;

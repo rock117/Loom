@@ -4,9 +4,12 @@
 //! without a Tokio reactor.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
+use flume::Sender;
 
+use super::dir_size_progress::Throttle;
 use super::sftp::RemoteEntry;
 
 /// List a local directory as [`RemoteEntry`] rows (unsorted; UI applies sort).
@@ -114,6 +117,74 @@ pub fn chmod(path: &Path, mode: u32) -> Result<()> {
 
 pub fn join_child(parent: &str, name: &str) -> PathBuf {
     Path::new(parent).join(name)
+}
+
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+/// Recursive byte size of a directory tree (does not follow symlinks).
+/// Poll `cancel` periodically so navigation can abort the walk off the UI thread.
+pub fn dir_size(path: &Path, cancel: &AtomicBool, progress: &Sender<u64>) -> Result<u64> {
+    ensure_not_cancelled(cancel)?;
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if meta.is_file() {
+        let n = meta.len();
+        let _ = progress.send(n);
+        return Ok(n);
+    }
+    if !meta.is_dir() {
+        bail!("not a directory");
+    }
+    let mut total = 0u64;
+    let mut steps = 0u32;
+    let mut throttle = Throttle::new();
+    walk_dir_size(
+        path,
+        &mut total,
+        cancel,
+        &mut steps,
+        progress,
+        &mut throttle,
+    )?;
+    throttle.flush(total, progress);
+    Ok(total)
+}
+
+fn walk_dir_size(
+    path: &Path,
+    total: &mut u64,
+    cancel: &AtomicBool,
+    steps: &mut u32,
+    progress: &Sender<u64>,
+    throttle: &mut Throttle,
+) -> Result<()> {
+    *steps = steps.wrapping_add(1);
+    if *steps % 256 == 0 {
+        ensure_not_cancelled(cancel)?;
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
+        *total = total.saturating_add(meta.len());
+        throttle.maybe_send(*total, progress);
+        return Ok(());
+    }
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).with_context(|| format!("read_dir {}", path.display()))? {
+        let entry = entry?;
+        walk_dir_size(&entry.path(), total, cancel, steps, progress, throttle)?;
+    }
+    Ok(())
 }
 
 pub fn parse_mode(text: &str) -> Result<u32> {

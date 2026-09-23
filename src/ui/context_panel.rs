@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use gpui::prelude::*;
 use gpui::*;
@@ -119,6 +121,17 @@ struct EntryMenu {
     position: Point<Pixels>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirSizeState {
+    Pending(u64),
+    Done(u64),
+    Failed,
+}
+
+struct DirSizeJob {
+    cancel: TransferCancel,
+}
+
 enum FilesPrompt {
     NewFolder {
         edit: RenameEdit,
@@ -187,6 +200,11 @@ pub struct ContextPanel {
     bound_sftp_alive: bool,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
+    /// On-demand directory sizes (right-click → Calculate size).
+    dir_sizes: HashMap<String, DirSizeState>,
+    dir_size_jobs: HashMap<String, DirSizeJob>,
+    /// Bumps when navigation cancels in-flight dir-size jobs.
+    dir_size_gen: u64,
     /// Transfers keyed by SSH pane id (not shared across servers/tabs).
     transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
     transfer_menu: Option<TransferMenu>,
@@ -265,6 +283,9 @@ impl ContextPanel {
             files_kind: None,
             bound_sftp_alive: false,
             list_gen: 0,
+            dir_sizes: HashMap::new(),
+            dir_size_jobs: HashMap::new(),
+            dir_size_gen: 0,
             transfers_by_pane: HashMap::new(),
             transfer_menu: None,
             entry_menu: None,
@@ -356,8 +377,255 @@ impl ContextPanel {
         )
     }
 
+    fn cancel_all_dir_size_jobs(&mut self) {
+        self.dir_size_gen = self.dir_size_gen.wrapping_add(1);
+        for (_, job) in self.dir_size_jobs.drain() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.dir_sizes.clear();
+    }
+
+    fn finish_dir_size(
+        &mut self,
+        size_gen: u64,
+        path: String,
+        bytes: Option<u64>,
+        cancelled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if size_gen != self.dir_size_gen {
+            return;
+        }
+        self.dir_size_jobs.remove(&path);
+        if cancelled {
+            self.dir_sizes.remove(&path);
+        } else if let Some(n) = bytes {
+            self.dir_sizes.insert(path, DirSizeState::Done(n));
+        } else {
+            self.dir_sizes.insert(path, DirSizeState::Failed);
+        }
+        cx.notify();
+    }
+
+    fn apply_dir_size_progress(
+        &mut self,
+        size_gen: u64,
+        path: &str,
+        bytes: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if size_gen != self.dir_size_gen || !self.dir_size_jobs.contains_key(path) {
+            return;
+        }
+        if matches!(self.dir_sizes.get(path), Some(DirSizeState::Pending(prev)) if *prev == bytes)
+        {
+            return;
+        }
+        self.dir_sizes
+            .insert(path.to_string(), DirSizeState::Pending(bytes));
+        cx.notify();
+    }
+
+    fn spawn_dir_size_progress_listener(
+        &self,
+        size_gen: u64,
+        path: String,
+        progress_rx: flume::Receiver<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(bytes) = progress_rx.recv_async().await {
+                this.update(cx, |this, cx| {
+                    this.apply_dir_size_progress(size_gen, &path, bytes, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Size column text and whether a dir-size job is still running.
+    fn entry_size_display(&self, entry: &RemoteEntry) -> (String, bool) {
+        if entry.is_dir {
+            match self.dir_sizes.get(&entry.path) {
+                Some(DirSizeState::Pending(n)) => (format!("{}+", format_size(*n)), true),
+                Some(DirSizeState::Done(n)) => (format_size(*n), false),
+                Some(DirSizeState::Failed) => ("—".into(), false),
+                None => (String::new(), false),
+            }
+        } else {
+            (format_size(entry.size), false)
+        }
+    }
+
+    fn begin_dir_size(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self
+            .entries
+            .iter()
+            .any(|e| e.path == path && e.is_dir)
+        {
+            return;
+        }
+        if let Some(old) = self.dir_size_jobs.remove(&path) {
+            old.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = transfer_cancel_flag();
+        self.dir_size_jobs.insert(
+            path.clone(),
+            DirSizeJob {
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        self.dir_sizes.insert(path.clone(), DirSizeState::Pending(0));
+        self.entry_menu = None;
+        let size_gen = self.dir_size_gen;
+        let (progress_tx, progress_rx) = flume::unbounded();
+        self.spawn_dir_size_progress_listener(size_gen, path.clone(), progress_rx, cx);
+        cx.notify();
+
+        match self.files_kind {
+            Some(FilesKind::Local) => {
+                let path_buf = PathBuf::from(&path);
+                let progress = progress_tx.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            local_fs::dir_size(&path_buf, cancel.as_ref(), &progress)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(n) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                            Err(err) => {
+                                let cancelled = format!("{err:#}").contains("cancelled");
+                                this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                let progress_for_sftp = progress_tx.clone();
+                if sftp
+                    .request(SftpRequest::DirSize {
+                        path: path.clone(),
+                        cancel,
+                        progress: progress_for_sftp,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(n)) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                            Ok(Err(err)) => {
+                                let cancelled = format!("{err:#}").contains("cancelled");
+                                this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                            }
+                            Err(_) => this.finish_dir_size(size_gen, path, None, true, cx),
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Docker) => {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    let progress_for_docker = progress_tx.clone();
+                    if sftp
+                        .request(SftpRequest::DockerDirSize {
+                            container,
+                            path: path.clone(),
+                            cancel,
+                            progress: progress_for_docker,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.dir_size_jobs.remove(&path);
+                        self.dir_sizes.insert(path, DirSizeState::Failed);
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(n)) => {
+                                    this.finish_dir_size(size_gen, path, Some(n), false, cx)
+                                }
+                                Ok(Err(err)) => {
+                                    let cancelled = format!("{err:#}").contains("cancelled");
+                                    this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                                }
+                                Err(_) => this.finish_dir_size(size_gen, path, None, true, cx),
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                } else {
+                    let path_for_size = path.clone();
+                    let progress = progress_tx.clone();
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                docker_fs::dir_size(
+                                    &container,
+                                    &path_for_size,
+                                    cancel.as_ref(),
+                                    &progress,
+                                )
+                            })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(n) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                                Err(err) => {
+                                    let cancelled = format!("{err:#}").contains("cancelled");
+                                    this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                                }
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            }
+            None => {
+                self.dir_size_jobs.remove(&path);
+                self.dir_sizes.remove(&path);
+                cx.notify();
+            }
+        }
+    }
+
     fn reset_files_state(&mut self) {
         self.list_gen = self.list_gen.wrapping_add(1);
+        self.cancel_all_dir_size_jobs();
         self.cwd = None;
         self.home = None;
         self.entries.clear();
@@ -603,6 +871,7 @@ impl ContextPanel {
     }
 
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        self.cancel_all_dir_size_jobs();
         match self.files_kind {
             Some(FilesKind::Sftp) => self.load_dir_sftp(path, cx),
             Some(FilesKind::Docker) => self.load_dir_docker(path, cx),
@@ -4192,11 +4461,7 @@ impl ContextPanel {
                                 let path = entry.path.clone();
                                 let is_sel = selected.as_deref() == Some(path.as_str());
                                 let icon = file_icon::entry_icon(&entry.name, entry.is_dir);
-                                let size = if entry.is_dir {
-                                    String::new()
-                                } else {
-                                    format_size(entry.size)
-                                };
+                                let (size, size_calculating) = self.entry_size_display(&entry);
                                 let mtime = format_mtime(entry.mtime);
                                 let kind = entry_kind_label(&entry);
                                 let ext = if entry.is_dir {
@@ -4259,7 +4524,11 @@ impl ContextPanel {
                                             .w(px(column_width(SortField::Size)))
                                             .flex_shrink_0()
                                             .text_xs()
-                                            .text_color(theme::TEXT_MUTED)
+                                            .text_color(if size_calculating {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
                                             .child(size),
                                     )
                                     .on_mouse_down(
@@ -4591,6 +4860,7 @@ impl ContextPanel {
         let path = menu.path.clone();
         let path_for_copy = path.clone();
         let path_for_reveal = path.clone();
+        let path_for_size = path.clone();
         let position = menu.position;
         let entry = self.entries.iter().find(|e| e.path == path)?;
         let is_dir = entry.is_dir;
@@ -4630,6 +4900,17 @@ impl ContextPanel {
                                     this.entry_menu = None;
                                 },
                             ))
+                            .when(is_dir, |d| {
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-dir-size",
+                                    "Calculate size",
+                                    true,
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.begin_dir_size(path_for_size.clone(), cx);
+                                    },
+                                ))
+                            })
                             .when(!is_dir, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-open",
