@@ -448,7 +448,7 @@ impl ContextPanel {
     fn entry_size_display(&self, entry: &RemoteEntry) -> (String, bool) {
         if entry.is_dir {
             match self.dir_sizes.get(&entry.path) {
-                Some(DirSizeState::Pending(n)) => (format!("{}+", format_size(*n)), true),
+                Some(DirSizeState::Pending(n)) => (format_size(*n), true),
                 Some(DirSizeState::Done(n)) => (format_size(*n), false),
                 Some(DirSizeState::Failed) => ("—".into(), false),
                 None => (String::new(), false),
@@ -4524,6 +4524,8 @@ impl ContextPanel {
                                             .w(px(column_width(SortField::Size)))
                                             .flex_shrink_0()
                                             .text_xs()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
                                             .text_color(if size_calculating {
                                                 theme::ACCENT
                                             } else {
