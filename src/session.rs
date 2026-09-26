@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod dir_size_progress;
 pub mod docker;
 pub mod docker_fs;
+pub mod fs_names;
 pub mod docker_ssh;
 pub mod forward;
 pub mod known_hosts;

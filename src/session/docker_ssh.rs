@@ -154,6 +154,95 @@ pub async fn dir_size(
     Ok(total)
 }
 
+async fn remote_test(session: &client::Handle<ClientHandler>, container: &str, script: &str) -> bool {
+    let cmd = format!(
+        "docker exec {} sh -c {}",
+        shell_single_quote(container.trim()),
+        shell_single_quote(script)
+    );
+    remote_exec(session, &cmd).await.is_ok()
+}
+
+/// Copy (`cp -a`) or move (`mv`) inside the container over SSH.
+pub async fn paste(
+    session: &client::Handle<ClientHandler>,
+    container: &str,
+    src: &str,
+    dest_dir: &str,
+    is_dir: bool,
+    cut: bool,
+) -> Result<()> {
+    let src = normalize_path(src);
+    let dest_dir = normalize_path(dest_dir);
+    let is_dir = is_dir
+        || remote_test(
+            session,
+            container,
+            &format!(
+                "test -d {} && test ! -L {}",
+                shell_single_quote(&src),
+                shell_single_quote(&src)
+            ),
+        )
+        .await;
+    let name = src.rsplit('/').next().unwrap_or(&src).to_string();
+    if name.is_empty() || src == "/" {
+        bail!("invalid source");
+    }
+    if is_dir && super::fs_names::is_same_or_descendant(&src, &dest_dir, false) {
+        bail!("Cannot paste a folder into itself");
+    }
+    let mut dest = String::new();
+    for attempt in 0..100u32 {
+        let candidate = join_child(
+            &dest_dir,
+            &super::fs_names::collision_name(&name, is_dir, attempt),
+        );
+        let exists = remote_test(
+            session,
+            container,
+            &format!("test -e {}", shell_single_quote(&candidate)),
+        )
+        .await;
+        if !exists {
+            dest = candidate;
+            break;
+        }
+    }
+    if dest.is_empty() {
+        bail!("too many copies of {name}");
+    }
+    if cut && dest == src {
+        return Ok(());
+    }
+    let inner = if cut {
+        format!(
+            "mv {} {}",
+            shell_single_quote(&src),
+            shell_single_quote(&dest)
+        )
+    } else if is_dir {
+        format!(
+            "cp -a {src} {dest} || cp -R {src} {dest}",
+            src = shell_single_quote(&src),
+            dest = shell_single_quote(&dest)
+        )
+    } else {
+        format!(
+            "cp -a {} {}",
+            shell_single_quote(&src),
+            shell_single_quote(&dest)
+        )
+    };
+    let cmd = format!(
+        "docker exec {} sh -c {}",
+        shell_single_quote(container.trim()),
+        shell_single_quote(&inner)
+    );
+    remote_exec(session, &cmd).await?;
+    Ok(())
+}
+
 pub async fn resolve_existing_dir(
     session: &client::Handle<ClientHandler>,
     container: &str,

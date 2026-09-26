@@ -55,6 +55,7 @@ Right-click an entry (or use prompts from the menu):
 | Action | Notes |
 |--------|--------|
 | Open | Same as double-click (remote confirms download-then-open) |
+| Copy / Cut / Paste | Same session only (Local, SFTP, or Docker). Paste into the current folder, or into a folder you right-clicked. Collisions are saved as `name - Copy` (no overwrite). Cut rows are dimmed until paste. Shortcuts: Ctrl+C / Ctrl+X / Ctrl+V when the Files panel is focused and no text field is editing |
 | New folder | Name prompt |
 | Rename | Name prompt |
 | Permissions… | Octal mode (e.g. `755`). Local on Windows approximates via readonly bit |
@@ -104,7 +105,7 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 - Snippets as a default tab (optional later)
 - Full remote editor
 - Jump hosts / second SSH connection solely for SFTP (use same session channel)
-- Local multi-file copy/move as Transfers jobs
+- Multi-select copy/move (clipboard is one file or folder at a time)
 
 ## Implementation map
 

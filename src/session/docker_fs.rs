@@ -121,6 +121,89 @@ pub fn dir_size(
     Ok(total)
 }
 
+fn path_exists(container: &str, path: &str) -> bool {
+    docker_cmd()
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "test -e \"$1\"",
+            "_",
+            path,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn path_is_dir(container: &str, path: &str) -> bool {
+    docker_cmd()
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "test -d \"$1\" && test ! -L \"$1\"",
+            "_",
+            path,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn unique_dest(container: &str, dir: &str, name: &str, is_dir: bool) -> Result<String> {
+    for attempt in 0..100u32 {
+        let candidate = join_child(dir, &super::fs_names::collision_name(name, is_dir, attempt));
+        if !path_exists(container, &candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("too many copies of {name}");
+}
+
+/// Copy (`cp -a`) or move (`mv`) `src` into `dest_dir` inside the container.
+pub fn paste(container: &str, src: &str, dest_dir: &str, is_dir: bool, cut: bool) -> Result<()> {
+    let src = normalize_path(src);
+    let dest_dir = normalize_path(dest_dir);
+    let is_dir = is_dir || path_is_dir(container, &src);
+    let name = src.rsplit('/').next().unwrap_or(&src).to_string();
+    if name.is_empty() || src == "/" {
+        bail!("invalid source");
+    }
+    if is_dir && super::fs_names::is_same_or_descendant(&src, &dest_dir, false) {
+        bail!("Cannot paste a folder into itself");
+    }
+    let dest = unique_dest(container, &dest_dir, &name, is_dir)?;
+    if cut && dest == src {
+        return Ok(());
+    }
+    let mut cmd = docker_cmd();
+    if cut {
+        cmd.args(["exec", container, "mv", &src, &dest]);
+    } else if is_dir {
+        // `-R` copies the directory and every nested file. Fall back if `-a` is missing.
+        cmd.args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "cp -a \"$1\" \"$2\" || cp -R \"$1\" \"$2\"",
+            "_",
+            &src,
+            &dest,
+        ]);
+    } else {
+        cmd.args(["exec", container, "cp", "-a", &src, &dest]);
+    }
+    let status = cmd.status().context("docker exec paste")?;
+    if !status.success() {
+        bail!("paste failed: {src} → {dest}");
+    }
+    Ok(())
+}
+
 pub fn join_child(parent: &str, name: &str) -> String {
     let name = name.trim().trim_start_matches('/');
     let p = normalize_path(parent);

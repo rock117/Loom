@@ -117,8 +117,18 @@ struct TransferMenu {
 }
 
 struct EntryMenu {
-    path: String,
+    /// `None` when the pointer is over empty list space, not a row.
+    path: Option<String>,
     position: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct FileClip {
+    pane: Uuid,
+    kind: FilesKind,
+    path: String,
+    is_dir: bool,
+    cut: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -209,6 +219,10 @@ pub struct ContextPanel {
     transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
+    /// Same-session file clipboard (copy / cut → paste). Not the OS clipboard.
+    file_clip: Option<FileClip>,
+    paste_busy: bool,
+    paste_gen: u64,
     prompt: Option<FilesPrompt>,
     /// Remember compress checkbox across transfers in this session.
     last_compress: bool,
@@ -289,6 +303,9 @@ impl ContextPanel {
             transfers_by_pane: HashMap::new(),
             transfer_menu: None,
             entry_menu: None,
+            file_clip: None,
+            paste_busy: false,
+            paste_gen: 0,
             prompt: None,
             last_compress: false,
             last_download_dir: None,
@@ -623,6 +640,264 @@ impl ContextPanel {
         }
     }
 
+    fn clip_matches_session(&self) -> bool {
+        let Some(clip) = &self.file_clip else {
+            return false;
+        };
+        self.bound_pane == Some(clip.pane) && self.files_kind == Some(clip.kind)
+    }
+
+    fn remember_clip(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        let Some(pane) = self.bound_pane else {
+            return;
+        };
+        let Some(kind) = self.files_kind else {
+            return;
+        };
+        self.file_clip = Some(FileClip {
+            pane,
+            kind,
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            cut,
+        });
+        self.entry_menu = None;
+        cx.notify();
+    }
+
+    fn paste_into(&mut self, dest_dir: String, cx: &mut Context<Self>) {
+        if self.paste_busy || dest_dir.is_empty() || !self.clip_matches_session() {
+            return;
+        }
+        let Some(clip) = self.file_clip.clone() else {
+            return;
+        };
+        let case_insensitive = clip.kind == FilesKind::Local && cfg!(windows);
+        if clip.is_dir
+            && crate::session::fs_names::is_same_or_descendant(
+                &clip.path,
+                &dest_dir,
+                case_insensitive,
+            )
+        {
+            self.error = Some("Cannot paste a folder into itself".into());
+            self.entry_menu = None;
+            cx.notify();
+            return;
+        }
+        self.paste_busy = true;
+        self.paste_gen = self.paste_gen.wrapping_add(1);
+        let paste_job = self.paste_gen;
+        let pane = clip.pane;
+        let cut = clip.cut;
+        let source_is_dir = clip.is_dir;
+        let from = clip.path.clone();
+        self.entry_menu = None;
+        self.error = None;
+        cx.notify();
+
+        match clip.kind {
+            FilesKind::Local => {
+                let src = PathBuf::from(&from);
+                let dest = PathBuf::from(&dest_dir);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::paste(&src, &dest, cut) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.finish_paste(
+                            paste_job,
+                            pane,
+                            cut,
+                            result.map_err(|e| format!("{e:#}")),
+                            cx,
+                        )
+                    })
+                        .ok();
+                })
+                .detach();
+            }
+            FilesKind::Sftp => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("SFTP unavailable".into()),
+                        cx,
+                    );
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Paste {
+                        from,
+                        dest_dir,
+                        is_dir: source_is_dir,
+                        cut,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("SFTP unavailable".into()),
+                        cx,
+                    );
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = match rx.recv_async().await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(err)) => Err(format!("{err:#}")),
+                        Err(_) => Err("paste cancelled".into()),
+                    };
+                    this.update(cx, |this, cx| this.finish_paste(paste_job, pane, cut, result, cx))
+                        .ok();
+                })
+                .detach();
+            }
+            FilesKind::Docker => {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("Docker container unavailable".into()),
+                        cx,
+                    );
+                    return;
+                };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerPaste {
+                            container,
+                            from,
+                            dest_dir,
+                            is_dir: source_is_dir,
+                            cut,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.finish_paste(
+                            paste_job,
+                            pane,
+                            cut,
+                            Err("SSH session unavailable".into()),
+                            cx,
+                        );
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = match rx.recv_async().await {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(err)) => Err(format!("{err:#}")),
+                            Err(_) => Err("paste cancelled".into()),
+                        };
+                        this.update(cx, |this, cx| this.finish_paste(paste_job, pane, cut, result, cx))
+                            .ok();
+                    })
+                    .detach();
+                } else {
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                docker_fs::paste(&container, &from, &dest_dir, source_is_dir, cut)
+                            })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.finish_paste(
+                                paste_job,
+                                pane,
+                                cut,
+                                result.map_err(|e| format!("{e:#}")),
+                                cx,
+                            )
+                        })
+                            .ok();
+                    })
+                    .detach();
+                }
+            }
+        }
+    }
+
+    fn finish_paste(
+        &mut self,
+        paste_job: u64,
+        pane: Uuid,
+        cut: bool,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if paste_job != self.paste_gen {
+            return;
+        }
+        self.paste_busy = false;
+        match result {
+            Ok(()) => {
+                if cut {
+                    self.file_clip = None;
+                }
+                if self.bound_pane == Some(pane) {
+                    if let Some(cwd) = self.cwd.clone() {
+                        self.load_dir(cwd, cx);
+                        return;
+                    }
+                }
+                cx.notify();
+            }
+            Err(err) => {
+                if self.bound_pane == Some(pane) {
+                    self.error = Some(err);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_file_clip_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.active_tab != PanelTab::Files
+            || self.prompt.is_some()
+            || self.editing_path
+            || self.editing_search
+        {
+            return false;
+        }
+        let mods = &event.keystroke.modifiers;
+        let chord = (mods.control || mods.platform) && !mods.shift && !mods.alt;
+        if !chord {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "c" | "C" => {
+                self.remember_clip(false, cx);
+                true
+            }
+            "x" | "X" => {
+                self.remember_clip(true, cx);
+                true
+            }
+            "v" | "V" => {
+                if let Some(cwd) = self.cwd.clone() {
+                    self.paste_into(cwd, cx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn reset_files_state(&mut self) {
         self.list_gen = self.list_gen.wrapping_add(1);
         self.cancel_all_dir_size_jobs();
@@ -634,6 +909,9 @@ impl ContextPanel {
         self.listing = false;
         self.transfer_menu = None;
         self.entry_menu = None;
+        self.file_clip = None;
+        self.paste_busy = false;
+        self.paste_gen = self.paste_gen.wrapping_add(1);
         self.prompt = None;
         self.path_edit = RenameEdit::new("");
         self.editing_path = false;
@@ -4447,6 +4725,20 @@ impl ContextPanel {
                             .min_h_0()
                             .w_full()
                             .overflow_y_scroll()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.focus_handle.focus(window);
+                                    this.selected = None;
+                                    this.transfer_menu = None;
+                                    this.entry_menu = Some(EntryMenu {
+                                        path: None,
+                                        position: event.position,
+                                    });
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .when(no_matches, |d| {
                                 d.child(
                                     div()
@@ -4471,6 +4763,9 @@ impl ContextPanel {
                                 };
                                 let entry_click = entry.clone();
                                 let name_el = highlighted_entry_name(&entry.name, &query);
+                                let cut_pending = self.file_clip.as_ref().is_some_and(|clip| {
+                                    clip.cut && clip.path == path && self.clip_matches_session()
+                                });
                                 div()
                                     .id(SharedString::from(format!("file-{path}")))
                                     .flex()
@@ -4480,6 +4775,7 @@ impl ContextPanel {
                                     .py(px(theme::SPACE_1))
                                     .cursor_pointer()
                                     .when(is_sel, |d| d.bg(theme::HOVER))
+                                    .when(cut_pending, |d| d.opacity(0.45))
                                     .hover(|s| s.bg(theme::HOVER))
                                     .child(icon)
                                     .child(name_el)
@@ -4535,18 +4831,20 @@ impl ContextPanel {
                                     )
                                     .on_mouse_down(
                                         MouseButton::Right,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                            this.focus_handle.focus(window);
                                             this.selected = Some(path.clone());
                                             this.transfer_menu = None;
                                             this.entry_menu = Some(EntryMenu {
-                                                path: path.clone(),
+                                                path: Some(path.clone()),
                                                 position: event.position,
                                             });
                                             cx.notify();
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                        this.focus_handle.focus(window);
                                         this.entry_menu = None;
                                         this.selected = Some(entry_click.path.clone());
                                         if event.click_count() >= 2 {
@@ -4857,16 +5155,14 @@ impl ContextPanel {
         )
     }
 
-    fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let menu = self.entry_menu.as_ref()?;
-        let path = menu.path.clone();
-        let path_for_copy = path.clone();
-        let path_for_reveal = path.clone();
-        let path_for_size = path.clone();
-        let position = menu.position;
-        let entry = self.entries.iter().find(|e| e.path == path)?;
-        let is_dir = entry.is_dir;
-        let is_local = self.files_kind == Some(FilesKind::Local);
+    fn render_blank_files_menu(
+        &self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let paste_dest = self.cwd.clone().unwrap_or_default();
+        let can_paste = self.clip_matches_session() && !self.paste_busy && !paste_dest.is_empty();
+        let has_cwd = self.cwd.is_some();
 
         Some(
             deferred(
@@ -4890,6 +5186,99 @@ impl ContextPanel {
                             .shadow_md()
                             .occlude()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "file-blank-paste",
+                                "Paste",
+                                can_paste,
+                                cx,
+                                move |this, _, cx| this.paste_into(paste_dest.clone(), cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-blank-new",
+                                "New folder…",
+                                has_cwd,
+                                cx,
+                                |this, window, cx| this.begin_new_folder(window, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-blank-refresh",
+                                "Refresh",
+                                has_cwd,
+                                cx,
+                                |this, _, cx| {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.entry_menu.as_ref()?;
+        let position = menu.position;
+        let Some(path) = menu.path.clone() else {
+            return self.render_blank_files_menu(position, cx);
+        };
+        let path_for_copy = path.clone();
+        let path_for_reveal = path.clone();
+        let path_for_size = path.clone();
+        let entry = self.entries.iter().find(|e| e.path == path)?;
+        let is_dir = entry.is_dir;
+        let is_local = self.files_kind == Some(FilesKind::Local);
+        let paste_dest = if is_dir {
+            path.clone()
+        } else {
+            self.cwd.clone().unwrap_or_default()
+        };
+        let can_paste = self.clip_matches_session() && !self.paste_busy && !paste_dest.is_empty();
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(Edges {
+                        top: px(4.0),
+                        right: px(4.0),
+                        bottom: px(4.0),
+                        left: px(4.0),
+                    })
+                    .child(
+                        div()
+                            .min_w(px(160.0))
+                            .p(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .shadow_md()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "file-ctx-copy",
+                                "Copy",
+                                true,
+                                cx,
+                                |this, _, cx| this.remember_clip(false, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-cut",
+                                "Cut",
+                                true,
+                                cx,
+                                |this, _, cx| this.remember_clip(true, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-paste",
+                                "Paste",
+                                can_paste,
+                                cx,
+                                move |this, _, cx| this.paste_into(paste_dest.clone(), cx),
+                            ))
                             .child(self.transfer_menu_item(
                                 "file-ctx-copy-path",
                                 "Copy path",
@@ -6958,6 +7347,10 @@ impl Render for ContextPanel {
                     return;
                 }
                 if this.handle_search_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.handle_file_clip_key(event, cx) {
                     cx.stop_propagation();
                     return;
                 }

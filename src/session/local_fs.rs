@@ -119,6 +119,81 @@ pub fn join_child(parent: &str, name: &str) -> PathBuf {
     Path::new(parent).join(name)
 }
 
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn unique_dest(dir: &Path, name: &str, is_dir: bool) -> Result<PathBuf> {
+    for attempt in 0..100u32 {
+        let candidate = dir.join(super::fs_names::collision_name(name, is_dir, attempt));
+        if !path_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("too many copies of {name}");
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(from)
+        .with_context(|| format!("stat {}", from.display()))?;
+    if meta.file_type().is_symlink() || meta.is_file() {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::copy(from, to)
+            .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        std::fs::create_dir(to).with_context(|| format!("mkdir {}", to.display()))?;
+        for entry in std::fs::read_dir(from).with_context(|| format!("read_dir {}", from.display()))?
+        {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    bail!("cannot copy {}", from.display());
+}
+
+/// Copy or move `src` into `dest_dir`. Does not overwrite; collisions become `name - Copy`.
+pub fn paste(src: &Path, dest_dir: &Path, cut: bool) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("stat {}", src.display()))?;
+    let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("invalid source name"))?;
+    let src_text = src.to_string_lossy();
+    let dest_text = dest_dir.to_string_lossy();
+    if is_dir
+        && super::fs_names::is_same_or_descendant(&src_text, &dest_text, cfg!(windows))
+    {
+        bail!("Cannot paste a folder into itself");
+    }
+    let dest = unique_dest(dest_dir, &name, is_dir)?;
+    if cut && dest == src {
+        return Ok(());
+    }
+    if cut {
+        match std::fs::rename(src, &dest) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_tree(src, &dest)?;
+                remove_path(src, is_dir)?;
+                Ok(())
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!("move {} → {}", src.display(), dest.display())
+            }),
+        }
+    } else {
+        copy_tree(src, &dest)
+    }
+}
+
 fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
     if cancel.load(Ordering::Relaxed) {
         bail!("cancelled");
@@ -206,4 +281,32 @@ pub fn parse_mode(text: &str) -> Result<u32> {
         bail!("mode out of range");
     }
     Ok(mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_copies_nested_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-paste-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let nested = src.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("note.txt"), b"hello").unwrap();
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        paste(&src, &dest_dir, false).unwrap();
+
+        let copied = dest_dir.join("src").join("sub").join("note.txt");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "hello");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
