@@ -46,7 +46,7 @@ Compress: upload zips locally then sends `.zip`; download tries remote `zip` →
 
 File rows use **type-specific SVG icons** tinted with Seti colors (VS Code built-in Explorer palette): folders, git, Rust hexagon, Python, Markdown `M↓`, JSON braces, shell green, etc.
 
-Path bar shows current cwd (`/home/user/...` or `C:\Users\...`).
+Path bar shows current cwd (`/home/user/...` or `C:\Users\...`). Enter jumps to a home shortcut by platform: local Windows uses `%USERPROFILE%` (and other `%NAME%` variables); local Linux/macOS, SSH, and Docker use `~` or `~/…` (SSH session home, or the container `$HOME`).
 
 ### Explorer ops (SSH + Local)
 

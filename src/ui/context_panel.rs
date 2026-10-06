@@ -197,6 +197,8 @@ pub struct ContextPanel {
     /// Last local download destination directory.
     last_download_dir: Option<String>,
     /// Address-bar editor for the Files cwd (copy / paste / Enter to navigate).
+    /// Local Windows: `%USERPROFILE%` and other `%NAME%` variables.
+    /// Local Linux/macOS, SSH, and Docker: `~` and `~/…`.
     path_edit: RenameEdit,
     editing_path: bool,
     /// Current-directory name filter (files + folders; non-recursive).
@@ -1977,6 +1979,168 @@ impl ContextPanel {
 
     fn submit_path_edit(&mut self, cx: &mut Context<Self>) {
         let raw = self.path_edit.text.clone();
+        // `~` is a Unix path. Windows Explorer uses `%USERPROFILE%` instead.
+        if self.files_kind == Some(FilesKind::Local) && cfg!(windows) {
+            if local_fs::is_windows_env_path(&raw) {
+                match local_fs::expand_windows_env(&raw) {
+                    Ok(path) => self.navigate_typed_path(path, cx),
+                    Err(msg) => {
+                        self.error = Some(msg);
+                        self.editing_path = true;
+                        cx.notify();
+                    }
+                }
+                return;
+            }
+            self.navigate_typed_path(raw, cx);
+            return;
+        }
+        if local_fs::is_tilde_path(&raw) {
+            self.submit_tilde_path(raw, cx);
+            return;
+        }
+        self.navigate_typed_path(raw, cx);
+    }
+
+    /// Expand `~` / `~/…` then navigate. Home is cached after the first lookup.
+    fn submit_tilde_path(&mut self, raw: String, cx: &mut Context<Self>) {
+        match self.files_kind {
+            Some(FilesKind::Local) => {
+                let path = local_fs::expand_tilde(&raw, &default_local_home());
+                self.navigate_typed_path(path, cx);
+            }
+            Some(FilesKind::Sftp) => {
+                if let Some(home) = self.home.clone().filter(|h| !h.is_empty()) {
+                    self.navigate_typed_path(local_fs::expand_tilde(&raw, &home), cx);
+                    return;
+                }
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.error = Some("No SSH session".into());
+                    cx.notify();
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp.request(SftpRequest::Home { reply: tx }).is_err() {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                self.listing = true;
+                self.error = None;
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        this.listing = false;
+                        match result {
+                            Ok(Ok(home)) => {
+                                this.home = Some(home.clone());
+                                let path = local_fs::expand_tilde(&raw, &home);
+                                this.navigate_typed_path(path, cx);
+                            }
+                            Ok(Err(err)) => {
+                                this.error = Some(format!("{err:#}"));
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                            Err(_) => {
+                                this.error = Some("SFTP home request cancelled".into());
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Docker) => {
+                if let Some(home) = self.home.clone().filter(|h| !h.is_empty()) {
+                    self.navigate_typed_path(local_fs::expand_tilde(&raw, &home), cx);
+                    return;
+                }
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
+                    self.error = Some("Docker container unavailable".into());
+                    cx.notify();
+                    return;
+                };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerHome {
+                            container,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.error = Some("SSH session unavailable".into());
+                        cx.notify();
+                        return;
+                    }
+                    self.listing = true;
+                    self.error = None;
+                    cx.notify();
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            this.listing = false;
+                            match result {
+                                Ok(Ok(home)) => {
+                                    this.home = Some(home.clone());
+                                    let path = local_fs::expand_tilde(&raw, &home);
+                                    this.navigate_typed_path(path, cx);
+                                }
+                                Ok(Err(err)) => {
+                                    this.error = Some(format!("{err:#}"));
+                                    this.editing_path = true;
+                                    cx.notify();
+                                }
+                                Err(_) => {
+                                    this.error = Some("Docker home request cancelled".into());
+                                    this.editing_path = true;
+                                    cx.notify();
+                                }
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    return;
+                }
+                self.listing = true;
+                self.error = None;
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { docker_fs::home_dir(&container) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.listing = false;
+                        match result {
+                            Ok(home) => {
+                                this.home = Some(home.clone());
+                                let path = local_fs::expand_tilde(&raw, &home);
+                                this.navigate_typed_path(path, cx);
+                            }
+                            Err(err) => {
+                                this.error = Some(format!("{err:#}"));
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            None => {
+                self.error = Some("No session open".into());
+                cx.notify();
+            }
+        }
+    }
+
+    fn navigate_typed_path(&mut self, raw: String, cx: &mut Context<Self>) {
         match self.files_kind {
             Some(FilesKind::Local) => match local_fs::resolve_existing_dir(&raw) {
                 Ok(dir) => {
