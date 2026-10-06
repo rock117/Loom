@@ -9,6 +9,7 @@ Record **non-obvious GPUI / platform / terminal pitfalls** so the next pass does
 - Local shell mistaken for “Disconnected” (esp. split panes): [LOCAL_SHELL_EXIT.md](./LOCAL_SHELL_EXIT.md).
 - Windows GUI vs child console flash (`CREATE_NO_WINDOW`): [WINDOWS_SUBSYSTEM.md](./WINDOWS_SUBSYSTEM.md), [PLATFORM_SHELL.md](./PLATFORM_SHELL.md).
 - Agent / TUI 输入光标不可见（反色 + 藏原生光标）：[TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md)。
+- 选区拖到边缘时视口跟着滚（定时器 + 窗口鼠标）：[TERMINAL_SELECTION_SCROLL.md](./TERMINAL_SELECTION_SCROLL.md)。
 - Link from the matching ADR in `DECISIONS.md` when the lesson drove a product decision.
 
 ---

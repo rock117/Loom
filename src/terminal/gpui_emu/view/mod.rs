@@ -437,6 +437,21 @@ pub struct TerminalView {
     /// Cell where the current selection press started.
     selection_anchor: Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)>,
 
+    /// Latest pointer during a selection drag (window coordinates).
+    selection_pointer: Option<Point<Pixels>>,
+
+    /// Last cell applied to the selection, so edge scrolling does not repaint every tick.
+    selection_scroll_point: Option<(
+        alacritty_terminal::index::Point,
+        alacritty_terminal::index::Side,
+    )>,
+
+    /// One repeating task while the pointer is outside the text rows. `None` drops it.
+    selection_scroll: Option<Task<()>>,
+
+    /// False after the task decides to stop, so a finished task can be replaced.
+    selection_scroll_live: bool,
+
     /// True while Ctrl (or macOS Cmd) is held — enable clickable URL hover.
     hyperlink_mods: bool,
     /// Pointer is over a URL while `hyperlink_mods` is active.
@@ -499,6 +514,9 @@ struct ScrollbarGeometry {
 
 /// Alacritty-style wheel multiplier (lines per notch / scaled pixel delta).
 const SCROLL_MULTIPLIER: f32 = 3.0;
+/// How often a selection drag outside the text rows advances the viewport.
+const SELECTION_SCROLL_INTERVAL_MS: u64 = 50;
+const SELECTION_SCROLL_MAX_LINES: i32 = 3;
 const SCROLLBAR_WIDTH: f32 = 10.0;
 const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 const LINE_NUMBER_PAD: f32 = 6.0;
@@ -639,6 +657,10 @@ impl TerminalView {
             selecting: false,
             selection_dragged: false,
             selection_anchor: None,
+            selection_pointer: None,
+            selection_scroll_point: None,
+            selection_scroll: None,
+            selection_scroll_live: false,
             hyperlink_mods: false,
             hover_hyperlink: false,
             hover_url_span: None,
@@ -1017,9 +1039,12 @@ impl TerminalView {
         };
 
         use alacritty_terminal::selection::{Selection, SelectionType};
+        self.stop_selection_scroll();
         self.selecting = true;
         self.selection_dragged = false;
         self.selection_anchor = Some((point, side));
+        self.selection_pointer = Some(event.position);
+        self.selection_scroll_point = Some((point, side));
         self.state.with_term_mut(|term| {
             term.selection = Some(Selection::new(SelectionType::Simple, point, side));
         });
@@ -1041,11 +1066,18 @@ impl TerminalView {
             return;
         }
 
+        self.finish_selection_drag(event.position, cx);
+    }
+
+    fn finish_selection_drag(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
         }
+        self.stop_selection_scroll();
         self.selecting = false;
         self.selection_anchor = None;
+        self.selection_pointer = None;
+        self.selection_scroll_point = None;
 
         // Plain click (no drag): clear selection — don't leave a blue cell that
         // looks like a second cursor. Real shell cursor stays at the prompt.
@@ -1057,7 +1089,7 @@ impl TerminalView {
         }
         self.selection_dragged = false;
 
-        if let Some((point, side)) = self.cell_at(event.position) {
+        if let Some((point, side)) = self.cell_at_clamped(position) {
             self.state.with_term_mut(|term| {
                 if let Some(selection) = term.selection.as_mut() {
                     selection.update(point, side);
@@ -1120,21 +1152,7 @@ impl TerminalView {
             }
             return;
         }
-        let Some((point, side)) = self.cell_at(event.position) else {
-            return;
-        };
-        if self
-            .selection_anchor
-            .is_some_and(|(anchor, anchor_side)| anchor != point || anchor_side != side)
-        {
-            self.selection_dragged = true;
-        }
-        self.state.with_term_mut(|term| {
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(point, side);
-            }
-        });
-        cx.notify();
+        self.track_selection_pointer(event.position, cx);
     }
 
     fn cell_at(
@@ -1173,6 +1191,171 @@ impl TerminalView {
             .with_term(|term| term.grid().display_offset());
         let point = viewport_to_point(display_offset, AlacPoint::new(row, Column(col)));
         Some((point, side))
+    }
+
+    /// Like [`Self::cell_at`], but a pointer above or below the grid clamps to the edge row.
+    fn cell_at_clamped(
+        &self,
+        position: Point<Pixels>,
+    ) -> Option<(alacritty_terminal::index::Point, alacritty_terminal::index::Side)> {
+        use alacritty_terminal::index::{Column, Point as AlacPoint, Side};
+        use alacritty_terminal::term::viewport_to_point;
+
+        let cell_w: f32 = self.renderer.cell_width.into();
+        let cell_h: f32 = self.renderer.cell_height.into();
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let gutter = self.line_number_gutter_width();
+        let origin_x = self.last_bounds.origin.x + self.config.padding.left + px(gutter);
+        let origin_y = self.last_bounds.origin.y + self.config.padding.top;
+        let rel_x: f32 = (position.x - origin_x).into();
+        let rel_y: f32 = (position.y - origin_y).into();
+        let (cols, rows) = (self.state.cols().max(1), self.state.rows().max(1));
+        let col = if rel_x < 0.0 {
+            0
+        } else {
+            ((rel_x / cell_w) as usize).min(cols.saturating_sub(1))
+        };
+        let row = if rel_y < 0.0 {
+            0
+        } else {
+            ((rel_y / cell_h) as usize).min(rows.saturating_sub(1))
+        };
+        let side = if rel_x < 0.0 || (rel_x % cell_w) < cell_w * 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        let display_offset = self
+            .state
+            .with_term(|term| term.grid().display_offset());
+        let point = viewport_to_point(display_offset, AlacPoint::new(row, Column(col)));
+        Some((point, side))
+    }
+
+    fn track_selection_pointer(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if !self.selecting {
+            return;
+        }
+        self.selection_pointer = Some(position);
+        if self.selection_scroll_lines_at(position).is_some() {
+            self.ensure_selection_scroll(cx);
+            if self.extend_selection_clamped(position) {
+                cx.notify();
+            }
+        } else {
+            self.stop_selection_scroll();
+            if self.extend_selection_at(position) {
+                cx.notify();
+            }
+        }
+    }
+
+    fn selection_scroll_lines_at(&self, position: Point<Pixels>) -> Option<i32> {
+        let cell_h: f32 = self.renderer.cell_height.into();
+        if cell_h <= 0.0 {
+            return None;
+        }
+        let rows = self.state.rows().max(1);
+        let top: f32 = (self.last_bounds.origin.y + self.config.padding.top).into();
+        let bottom = top + rows as f32 * cell_h;
+        selection_scroll_lines(f32::from(position.y), top, bottom, cell_h)
+    }
+
+    fn extend_selection_at(&mut self, position: Point<Pixels>) -> bool {
+        match self.cell_at(position) {
+            Some((point, side)) => self.apply_selection_point(point, side),
+            None => false,
+        }
+    }
+
+    fn extend_selection_clamped(&mut self, position: Point<Pixels>) -> bool {
+        match self.cell_at_clamped(position) {
+            Some((point, side)) => self.apply_selection_point(point, side),
+            None => false,
+        }
+    }
+
+    fn apply_selection_point(
+        &mut self,
+        point: alacritty_terminal::index::Point,
+        side: alacritty_terminal::index::Side,
+    ) -> bool {
+        if self
+            .selection_anchor
+            .is_some_and(|(anchor, anchor_side)| anchor != point || anchor_side != side)
+        {
+            self.selection_dragged = true;
+        }
+        if self.selection_scroll_point == Some((point, side)) {
+            return false;
+        }
+        let mut updated = false;
+        self.state.with_term_mut(|term| {
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, side);
+                updated = true;
+            }
+        });
+        if updated {
+            self.selection_scroll_point = Some((point, side));
+        }
+        updated
+    }
+
+    fn ensure_selection_scroll(&mut self, cx: &mut Context<Self>) {
+        if self.selection_scroll_live {
+            return;
+        }
+        self.selection_scroll_live = true;
+        self.selection_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(SELECTION_SCROLL_INTERVAL_MS))
+                    .await;
+                let keep = this
+                    .update(cx, |this, cx| this.selection_scroll_tick(cx))
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn stop_selection_scroll(&mut self) {
+        self.selection_scroll_live = false;
+        self.selection_scroll = None;
+    }
+
+    /// Scroll one step while the pointer stays outside the text rows.
+    /// Returns false when the task should exit. Does not drop the task from inside itself.
+    fn selection_scroll_tick(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.selecting || !self.selection_scroll_live {
+            self.selection_scroll_live = false;
+            return false;
+        }
+        let Some(position) = self.selection_pointer else {
+            self.selection_scroll_live = false;
+            return false;
+        };
+        let Some(lines) = self.selection_scroll_lines_at(position) else {
+            self.selection_scroll_live = false;
+            return false;
+        };
+        let has_selection = self.state.with_term(|term| term.selection.is_some());
+        if !has_selection {
+            self.selection_scroll_live = false;
+            return false;
+        }
+        use alacritty_terminal::grid::Scroll;
+        let scrolled = self.apply_scroll(Scroll::Delta(lines));
+        let extended = self.extend_selection_clamped(position);
+        if scrolled || extended {
+            cx.notify();
+        }
+        true
     }
 
     /// Ctrl/Cmd+click: open http(s)/… URL under the cell, if any.
@@ -1334,14 +1517,17 @@ impl TerminalView {
         scroll: alacritty_terminal::grid::Scroll,
         cx: &mut Context<Self>,
     ) {
-        let changed = self.state.with_term_mut(|term| {
+        if self.apply_scroll(scroll) {
+            cx.notify();
+        }
+    }
+
+    fn apply_scroll(&mut self, scroll: alacritty_terminal::grid::Scroll) -> bool {
+        self.state.with_term_mut(|term| {
             let before = term.grid().display_offset();
             term.scroll_display(scroll);
             term.grid().display_offset() != before
-        });
-        if changed {
-            cx.notify();
-        }
+        })
     }
 
     /// Scroll metrics for the overlay scrollbar. `None` when there is no history.
@@ -1441,6 +1627,7 @@ impl TerminalView {
             });
         }
         self.selecting = false;
+        self.stop_selection_scroll();
         cx.notify();
         true
     }
@@ -2030,6 +2217,42 @@ impl Render for TerminalView {
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
 
+                        // While selecting, listen on the window so a pointer outside the
+                        // terminal still moves the selection and releases the drag.
+                        // Listeners last one frame; the timer task is the only long-lived work.
+                        if view_paint.read(cx).selecting {
+                            let view_move = view_paint.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, _, cx| {
+                                    if phase != DispatchPhase::Bubble {
+                                        return;
+                                    }
+                                    view_move.update(cx, |this, cx| {
+                                        if this.scrollbar_drag.is_some() {
+                                            return;
+                                        }
+                                        this.track_selection_pointer(event.position, cx);
+                                    });
+                                },
+                            );
+                            let view_up = view_paint.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent, phase, _, cx| {
+                                    if phase != DispatchPhase::Bubble
+                                        || event.button != MouseButton::Left
+                                    {
+                                        return;
+                                    }
+                                    view_up.update(cx, |this, cx| {
+                                        if this.scrollbar_drag.is_some() {
+                                            return;
+                                        }
+                                        this.finish_selection_drag(event.position, cx);
+                                    });
+                                },
+                            );
+                        }
+
                         // Register IME / text input handler for the focused surface.
                         // When Find is open, bind to the find focus so Chinese IME commits
                         // land in the query field instead of being dropped.
@@ -2217,5 +2440,53 @@ impl Render for TerminalView {
     }
 }
 
-// Tests are omitted due to macro expansion issues with the test attribute
-// in this configuration. Integration tests can be added separately.
+/// Lines to scroll while selecting. Positive moves into older history.
+/// The top and bottom half-row are edges, so dragging to the last visible line scrolls.
+fn selection_scroll_lines(pointer_y: f32, top: f32, bottom: f32, line_h: f32) -> Option<i32> {
+    if line_h <= 0.0 || bottom <= top {
+        return None;
+    }
+    let mut edge = (line_h * 0.5).max(1.0);
+    let height = bottom - top;
+    if height <= edge * 2.0 {
+        edge = height * 0.2;
+    }
+    let raw = if pointer_y < top + edge {
+        ((top + edge) - pointer_y) / line_h
+    } else if pointer_y > bottom - edge {
+        -((pointer_y - (bottom - edge)) / line_h)
+    } else {
+        return None;
+    };
+    let lines = if raw > 0.0 {
+        raw.ceil() as i32
+    } else if raw < 0.0 {
+        raw.floor() as i32
+    } else {
+        0
+    };
+    if lines == 0 {
+        return None;
+    }
+    Some(lines.clamp(-SELECTION_SCROLL_MAX_LINES, SELECTION_SCROLL_MAX_LINES))
+}
+
+#[cfg(test)]
+mod selection_scroll_tests {
+    use super::selection_scroll_lines;
+
+    #[test]
+    fn inside_text_does_not_scroll() {
+        assert_eq!(selection_scroll_lines(40.0, 10.0, 100.0, 20.0), None);
+    }
+
+    #[test]
+    fn outside_clamps_speed() {
+        assert_eq!(selection_scroll_lines(9.0, 10.0, 100.0, 20.0), Some(1));
+        assert_eq!(selection_scroll_lines(-200.0, 10.0, 100.0, 20.0), Some(3));
+        assert_eq!(selection_scroll_lines(95.0, 10.0, 100.0, 20.0), Some(-1));
+        assert_eq!(selection_scroll_lines(100.0, 10.0, 100.0, 20.0), Some(-1));
+        assert_eq!(selection_scroll_lines(400.0, 10.0, 100.0, 20.0), Some(-3));
+        assert_eq!(selection_scroll_lines(0.0, 0.0, 10.0, 0.0), None);
+    }
+}
