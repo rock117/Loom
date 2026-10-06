@@ -1,7 +1,7 @@
 //! Overlay: pick Docker host (Local | SSH Profile) → Name + container → Save / Save & Open.
 //!
 //! - **Local** — `docker ps` on this machine; saves a Local profile (`docker exec …`).
-//! - **SSH** — pick an existing SSH profile, list containers via
+//! - **SSH** — pick an existing SSH host profile (saved Docker-over-SSH sessions are omitted), list containers via
 //!   [`docker::list_running_containers_ssh`] on a background thread; saves a
 //!   Docker-over-SSH profile (`new_ssh_docker_profile`). Password auth reuses the
 //!   host profile keyring; missing password emits [`DockerPickerEvent::NeedSshPassword`].
@@ -584,15 +584,24 @@ impl DockerPicker {
     }
 }
 
+/// Plain SSH host. Docker-over-SSH is still `ProfileKind::Ssh`, but it is a container session.
+fn is_ssh_host(kind: &ProfileKind) -> bool {
+    matches!(kind, ProfileKind::Ssh { .. }) && !kind.is_docker_ssh()
+}
+
+fn push_ssh_host(p: &Profile, out: &mut Vec<SshProfileRow>) {
+    if is_ssh_host(&p.kind) {
+        out.push(SshProfileRow {
+            id: p.id,
+            name: p.name.clone(),
+            summary: p.kind.summary(),
+        });
+    }
+}
+
 fn collect_ssh_profiles(ws: &crate::model::WorkspaceFile, out: &mut Vec<SshProfileRow>) {
     for p in &ws.profiles {
-        if matches!(p.kind, crate::model::ProfileKind::Ssh { .. }) {
-            out.push(SshProfileRow {
-                id: p.id,
-                name: p.name.clone(),
-                summary: p.kind.summary(),
-            });
-        }
+        push_ssh_host(p, out);
     }
     for g in &ws.groups {
         collect_ssh_in_group(g, out);
@@ -601,13 +610,7 @@ fn collect_ssh_profiles(ws: &crate::model::WorkspaceFile, out: &mut Vec<SshProfi
 
 fn collect_ssh_in_group(g: &crate::model::Group, out: &mut Vec<SshProfileRow>) {
     for p in &g.profiles {
-        if matches!(p.kind, crate::model::ProfileKind::Ssh { .. }) {
-            out.push(SshProfileRow {
-                id: p.id,
-                name: p.name.clone(),
-                summary: p.kind.summary(),
-            });
-        }
+        push_ssh_host(p, out);
     }
     for c in &g.children {
         collect_ssh_in_group(c, out);
@@ -1291,4 +1294,53 @@ fn form_btn(
                 cx.stop_propagation();
             }))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_ssh_profiles;
+    use crate::model::{Group, Profile, SshAuth, WorkspaceFile};
+    use crate::session::docker::new_ssh_docker_profile;
+    use uuid::Uuid;
+
+    #[test]
+    fn ssh_host_list_skips_docker_sessions() {
+        let host = Profile::new_ssh("box", "10.0.0.1".into(), 22, "root".into());
+        let docker = new_ssh_docker_profile(
+            "web",
+            "10.0.0.1".into(),
+            22,
+            "root".into(),
+            SshAuth::Password { remember: true },
+            "abc123def456",
+        );
+        let nested_host = Profile::new_ssh("nested", "10.0.0.2".into(), 22, "me".into());
+        let nested_docker = new_ssh_docker_profile(
+            "db",
+            "10.0.0.2".into(),
+            22,
+            "me".into(),
+            SshAuth::Password { remember: false },
+            "fff",
+        );
+        let mut ws = WorkspaceFile::default_workspace();
+        let host_name = host.name.clone();
+        let nested_name = nested_host.name.clone();
+        ws.profiles.push(host);
+        ws.profiles.push(docker);
+        ws.profiles.push(Profile::new_local("extra-local"));
+        ws.groups.push(Group {
+            id: Uuid::new_v4(),
+            name: "hosts".into(),
+            collapsed: false,
+            profiles: vec![nested_host, nested_docker],
+            children: Vec::new(),
+            order: Vec::new(),
+        });
+
+        let mut rows = Vec::new();
+        collect_ssh_profiles(&ws, &mut rows);
+        let names: Vec<_> = rows.into_iter().map(|r| r.name).collect();
+        assert_eq!(names, vec![host_name, nested_name]);
+    }
 }
