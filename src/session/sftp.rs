@@ -10,6 +10,7 @@ use russh::client;
 use russh_sftp::client::SftpSession;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::dir_size_progress::Throttle;
 use super::ssh::ClientHandler;
 use super::transfer_archive;
 use super::transfer_filter::{FilterMatcher, TransferFilter};
@@ -163,6 +164,21 @@ pub enum SftpRequest {
         mode: u32,
         reply: Sender<Result<()>>,
     },
+    /// Copy or move a remote path into a directory (own SFTP session; does not block browse).
+    Paste {
+        from: String,
+        dest_dir: String,
+        is_dir: bool,
+        cut: bool,
+        reply: Sender<Result<()>>,
+    },
+    /// Recursive directory byte size (dedicated SFTP session; does not block browse lane).
+    DirSize {
+        path: String,
+        cancel: TransferCancel,
+        progress: Sender<u64>,
+        reply: Sender<Result<u64>>,
+    },
     /// One-shot remote host metrics (runs on the SSH Handle, not SFTP).
     HostProbe {
         reply: Sender<Result<crate::session::host_info::HostSnapshot>>,
@@ -199,6 +215,21 @@ pub enum SftpRequest {
         path: String,
         mode: u32,
         reply: Sender<Result<()>>,
+    },
+    DockerPaste {
+        container: String,
+        from: String,
+        dest_dir: String,
+        is_dir: bool,
+        cut: bool,
+        reply: Sender<Result<()>>,
+    },
+    DockerDirSize {
+        container: String,
+        path: String,
+        cancel: TransferCancel,
+        progress: Sender<u64>,
+        reply: Sender<Result<u64>>,
     },
     DockerProbe {
         container: String,
@@ -318,9 +349,19 @@ fn is_docker_exec_request(req: &SftpRequest) -> bool {
             | SftpRequest::DockerRemove { .. }
             | SftpRequest::DockerRename { .. }
             | SftpRequest::DockerChmod { .. }
+            | SftpRequest::DockerPaste { .. }
+            | SftpRequest::DockerDirSize { .. }
             | SftpRequest::DockerProbe { .. }
             | SftpRequest::DockerResolveDir { .. }
     )
+}
+
+fn is_paste_request(req: &SftpRequest) -> bool {
+    matches!(req, SftpRequest::Paste { .. })
+}
+
+fn is_dir_size_request(req: &SftpRequest) -> bool {
+    matches!(req, SftpRequest::DirSize { .. })
 }
 
 /// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
@@ -342,6 +383,42 @@ pub async fn run_sftp_worker(
     });
 
     while let Ok(req) = req_rx.recv_async().await {
+        if is_paste_request(&req) {
+            let SftpRequest::Paste {
+                from,
+                dest_dir,
+                is_dir,
+                cut,
+                reply,
+            } = req
+            else {
+                continue;
+            };
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                let result = paste_standalone(&session, &from, &dest_dir, is_dir, cut).await;
+                let _ = reply.send(result);
+            });
+            continue;
+        }
+        if is_dir_size_request(&req) {
+            let SftpRequest::DirSize {
+                path,
+                cancel,
+                progress,
+                reply,
+            } = req
+            else {
+                continue;
+            };
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                let result =
+                    dir_size_standalone(&session, &path, &cancel, &progress).await;
+                let _ = reply.send(result);
+            });
+            continue;
+        }
         if is_host_probe(&req) {
             let SftpRequest::HostProbe { reply } = req else {
                 continue;
@@ -435,6 +512,10 @@ async fn ensure_session(
             LaneKind::Browse => "browse",
             LaneKind::Transfer => "transfer",
         };
+        log::warn!(
+            target: "loom::sftp",
+            "channel budget exhausted lane={label} max={GLOBAL_SFTP_CHANNEL_BUDGET}"
+        );
         bail!(
             "SFTP {label} unavailable: too many open SFTP channels (max {GLOBAL_SFTP_CHANNEL_BUDGET})"
         );
@@ -442,10 +523,20 @@ async fn ensure_session(
     let guard = ChannelBudgetGuard;
     match open_sftp(session).await {
         Ok(s) => {
+            let label = match kind {
+                LaneKind::Browse => "browse",
+                LaneKind::Transfer => "transfer",
+            };
+            log::debug!(target: "loom::sftp", "session open lane={label}");
             *sftp = Some((s, guard));
             Ok(())
         }
         Err(err) => {
+            let label = match kind {
+                LaneKind::Browse => "browse",
+                LaneKind::Transfer => "transfer",
+            };
+            log::warn!(target: "loom::sftp", "session open fail lane={label}: {err:#}");
             drop(guard);
             Err(err)
         }
@@ -477,10 +568,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
-                    .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "download begin id={id} remote={remote} local={} compress={}",
+                local.display(),
+                options.compress
             );
+            let started = std::time::Instant::now();
+            let result =
+                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
+                    .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "download ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "download fail id={id} remote={remote}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::Upload {
             id,
@@ -491,9 +602,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "upload begin id={id} local={} remote_dir={remote_dir} compress={}",
+                local.display(),
+                options.compress
             );
+            let started = std::time::Instant::now();
+            let result =
+                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "upload ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "upload fail id={id} local={}: {err:#}",
+                    local.display()
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::Mkdir { path, reply } => {
             let _ = reply.send(
@@ -519,6 +651,16 @@ async fn dispatch_request(
         SftpRequest::Chmod { path, mode, reply } => {
             let _ = reply.send(chmod_path(sftp, &path, mode).await);
         }
+        SftpRequest::Paste { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "paste must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DirSize { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "dir size must not run on SFTP lane"
+            )));
+        }
         SftpRequest::HostProbe { reply } => {
             let _ = reply.send(Err(anyhow::anyhow!(
                 "host probe must not run on SFTP lane"
@@ -533,12 +675,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                docker_download_staged(
-                    session, sftp, id, &container, &remote, &local, progress, cancel,
-                )
-                .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "docker download begin id={id} container={container} remote={remote} local={}",
+                local.display()
             );
+            let started = std::time::Instant::now();
+            let result = docker_download_staged(
+                session, sftp, id, &container, &remote, &local, progress, cancel,
+            )
+            .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "docker download ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "docker download fail id={id}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::DockerUpload {
             id,
@@ -549,12 +709,30 @@ async fn dispatch_request(
             reply,
             cancel,
         } => {
-            let _ = reply.send(
-                docker_upload_staged(
-                    session, sftp, id, &container, &local, &remote_dir, progress, cancel,
-                )
-                .await,
+            log::info!(
+                target: "loom::sftp.transfer",
+                "docker upload begin id={id} container={container} local={} remote_dir={remote_dir}",
+                local.display()
             );
+            let started = std::time::Instant::now();
+            let result = docker_upload_staged(
+                session, sftp, id, &container, &local, &remote_dir, progress, cancel,
+            )
+            .await;
+            match &result {
+                Ok(out) => log::info!(
+                    target: "loom::sftp.transfer",
+                    "docker upload ok id={id} files={} bytes={} elapsed_ms={}",
+                    out.files,
+                    out.bytes,
+                    started.elapsed().as_millis()
+                ),
+                Err(err) => log::warn!(
+                    target: "loom::sftp.transfer",
+                    "docker upload fail id={id}: {err:#}"
+                ),
+            }
+            let _ = reply.send(result);
         }
         SftpRequest::DockerHome { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(
@@ -581,6 +759,16 @@ async fn dispatch_request(
         }
         SftpRequest::DockerResolveDir { reply, .. } => {
             let _ = reply.send(Err("docker resolve must not run on SFTP lane".into()));
+        }
+        SftpRequest::DockerDirSize { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker dir size must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::DockerPaste { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "docker paste must not run on SFTP lane"
+            )));
         }
     }
 }
@@ -652,6 +840,44 @@ async fn dispatch_docker_exec(session: &client::Handle<ClientHandler>, req: Sftp
             let _ = reply.send(
                 crate::session::docker_ssh::resolve_existing_dir(session, &container, &path)
                     .await,
+            );
+        }
+        SftpRequest::DockerDirSize {
+            container,
+            path,
+            cancel,
+            progress,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::dir_size(
+                    session,
+                    &container,
+                    &path,
+                    &cancel,
+                    &progress,
+                )
+                .await,
+            );
+        }
+        SftpRequest::DockerPaste {
+            container,
+            from,
+            dest_dir,
+            is_dir,
+            cut,
+            reply,
+        } => {
+            let _ = reply.send(
+                crate::session::docker_ssh::paste(
+                    session,
+                    &container,
+                    &from,
+                    &dest_dir,
+                    is_dir,
+                    cut,
+                )
+                .await,
             );
         }
         _ => {}
@@ -777,11 +1003,17 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
         SftpRequest::Mkdir { reply, .. }
         | SftpRequest::Remove { reply, .. }
         | SftpRequest::Rename { reply, .. }
-        | SftpRequest::Chmod { reply, .. }
+        |         SftpRequest::Chmod { reply, .. }
         | SftpRequest::DockerMkdir { reply, .. }
         | SftpRequest::DockerRemove { reply, .. }
         | SftpRequest::DockerRename { reply, .. }
         | SftpRequest::DockerChmod { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(msg)));
+        }
+        SftpRequest::DirSize { reply, .. } | SftpRequest::DockerDirSize { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(msg)));
+        }
+        SftpRequest::Paste { reply, .. } | SftpRequest::DockerPaste { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::HostProbe { reply } | SftpRequest::DockerProbe { reply, .. } => {
@@ -824,6 +1056,213 @@ async fn chmod_path(sftp: &SftpSession, path: &str, mode: u32) -> Result<()> {
         .await
         .with_context(|| format!("chmod {path}"))?;
     Ok(())
+}
+
+async fn paste_standalone(
+    session: &Arc<client::Handle<ClientHandler>>,
+    from: &str,
+    dest_dir: &str,
+    is_dir: bool,
+    cut: bool,
+) -> Result<()> {
+    if !try_acquire_channel_budget() {
+        bail!("SFTP paste unavailable: too many open SFTP channels");
+    }
+    let guard = ChannelBudgetGuard;
+    let sftp = open_sftp(session).await?;
+    let result = paste_remote(&sftp, from, dest_dir, is_dir, cut).await;
+    drop(sftp);
+    drop(guard);
+    result
+}
+
+async fn remote_exists(sftp: &SftpSession, path: &str) -> bool {
+    sftp.metadata(path.to_string()).await.is_ok()
+}
+
+async fn paste_remote(
+    sftp: &SftpSession,
+    from: &str,
+    dest_dir: &str,
+    is_dir: bool,
+    cut: bool,
+) -> Result<()> {
+    let meta = sftp
+        .metadata(from.to_string())
+        .await
+        .with_context(|| format!("stat {from}"))?;
+    let is_dir = is_dir || meta.file_type().is_dir();
+    let name = from
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(from)
+        .to_string();
+    if name.is_empty() || from == "/" {
+        bail!("invalid source");
+    }
+    if is_dir && crate::session::fs_names::is_same_or_descendant(from, dest_dir, false) {
+        bail!("Cannot paste a folder into itself");
+    }
+    let mut dest = String::new();
+    for attempt in 0..100u32 {
+        let candidate = join_remote(
+            dest_dir,
+            &crate::session::fs_names::collision_name(&name, is_dir, attempt),
+        );
+        if !remote_exists(sftp, &candidate).await {
+            dest = candidate;
+            break;
+        }
+    }
+    if dest.is_empty() {
+        bail!("too many copies of {name}");
+    }
+    if cut && dest == from {
+        return Ok(());
+    }
+    if cut {
+        sftp.rename(from.to_string(), dest.clone())
+            .await
+            .with_context(|| format!("move {from} → {dest}"))?;
+        return Ok(());
+    }
+    copy_remote(sftp, from, &dest, is_dir).await
+}
+
+/// Copy a file, or a directory and everything under it.
+async fn copy_remote(sftp: &SftpSession, from: &str, to: &str, hinted_dir: bool) -> Result<()> {
+    if hinted_dir {
+        return copy_remote_dir(sftp, from, to).await;
+    }
+    match sftp.metadata(from.to_string()).await {
+        Ok(meta) if meta.file_type().is_dir() => copy_remote_dir(sftp, from, to).await,
+        Ok(meta) if meta.file_type().is_file() || meta.file_type().is_symlink() => {
+            copy_remote_file(sftp, from, to).await
+        }
+        _ => match sftp.read_dir(from.to_string()).await {
+            Ok(entries) => {
+                sftp.create_dir(to.to_string())
+                    .await
+                    .with_context(|| format!("mkdir {to}"))?;
+                for entry in entries {
+                    let child_to = join_remote(to, &entry.file_name());
+                    Box::pin(copy_remote(
+                        sftp,
+                        &entry.path(),
+                        &child_to,
+                        entry.file_type().is_dir(),
+                    ))
+                    .await?;
+                }
+                Ok(())
+            }
+            Err(_) => copy_remote_file(sftp, from, to).await,
+        },
+    }
+}
+
+async fn copy_remote_dir(sftp: &SftpSession, from: &str, to: &str) -> Result<()> {
+    sftp.create_dir(to.to_string())
+        .await
+        .with_context(|| format!("mkdir {to}"))?;
+    for entry in sftp
+        .read_dir(from.to_string())
+        .await
+        .with_context(|| format!("read_dir {from}"))?
+    {
+        let child_to = join_remote(to, &entry.file_name());
+        Box::pin(copy_remote(
+            sftp,
+            &entry.path(),
+            &child_to,
+            entry.file_type().is_dir(),
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+async fn copy_remote_file(sftp: &SftpSession, from: &str, to: &str) -> Result<()> {
+    let mut src = sftp
+        .open(from.to_string())
+        .await
+        .with_context(|| format!("open {from}"))?;
+    let mut dst = sftp
+        .create(to.to_string())
+        .await
+        .with_context(|| format!("create {to}"))?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = src
+            .read(&mut buf)
+            .await
+            .with_context(|| format!("read {from}"))?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])
+            .await
+            .with_context(|| format!("write {to}"))?;
+    }
+    Ok(())
+}
+
+async fn dir_size_standalone(
+    session: &Arc<client::Handle<ClientHandler>>,
+    path: &str,
+    cancel: &TransferCancel,
+    progress: &Sender<u64>,
+) -> Result<u64> {
+    if !try_acquire_channel_budget() {
+        bail!("SFTP dir size unavailable: too many open SFTP channels");
+    }
+    let guard = ChannelBudgetGuard;
+    let sftp = open_sftp(session).await?;
+    let result = dir_size_recursive(&sftp, path, cancel, progress).await;
+    drop(sftp);
+    drop(guard);
+    result
+}
+
+async fn dir_size_recursive(
+    sftp: &SftpSession,
+    root: &str,
+    cancel: &TransferCancel,
+    progress: &Sender<u64>,
+) -> Result<u64> {
+    ensure_not_cancelled(cancel)?;
+    let mut stack = vec![root.to_string()];
+    let mut total = 0u64;
+    let mut steps = 0u32;
+    let mut throttle = Throttle::new();
+    while let Some(path) = stack.pop() {
+        steps = steps.wrapping_add(1);
+        if steps % 64 == 0 {
+            ensure_not_cancelled(cancel)?;
+        }
+        let meta = sftp
+            .metadata(path.clone())
+            .await
+            .with_context(|| format!("stat {path}"))?;
+        if meta.file_type().is_file() {
+            total = total.saturating_add(meta.size.unwrap_or(0));
+            throttle.maybe_send(total, progress);
+            continue;
+        }
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        for entry in sftp
+            .read_dir(path.clone())
+            .await
+            .with_context(|| format!("read_dir {path}"))?
+        {
+            stack.push(entry.path());
+        }
+    }
+    throttle.flush(total, progress);
+    Ok(total)
 }
 
 async fn list_dir(sftp: &SftpSession, path: &str) -> Result<Vec<RemoteEntry>> {

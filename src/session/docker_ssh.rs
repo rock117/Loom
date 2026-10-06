@@ -1,12 +1,17 @@
 //! Docker Files over an existing SSH session: browse via `docker exec`,
 //! stage transfers with remote `docker cp` under `/tmp` (SFTP lane finishes the copy).
 
+use std::sync::atomic::Ordering;
+
 use anyhow::{Context, Result, bail};
+use flume::Sender;
+
+use super::dir_size_progress::Throttle;
 use russh::client;
 use russh::ChannelMsg;
 
 use super::docker_fs::{join_child, normalize_path};
-use super::sftp::RemoteEntry;
+use super::sftp::{RemoteEntry, TransferCancel};
 use super::ssh::{ClientHandler, shell_single_quote};
 
 /// Run a non-interactive remote command; return stdout on exit 0.
@@ -108,6 +113,134 @@ pub async fn list_dir(
         });
     }
     Ok(rows)
+}
+
+fn ensure_not_cancelled(cancel: &TransferCancel) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+/// Recursive byte size via layered `list_dir` (one remote `docker exec` per directory level).
+pub async fn dir_size(
+    session: &client::Handle<ClientHandler>,
+    container: &str,
+    path: &str,
+    cancel: &TransferCancel,
+    progress: &Sender<u64>,
+) -> Result<u64> {
+    let root = normalize_path(path);
+    ensure_not_cancelled(cancel)?;
+    let mut stack = vec![root];
+    let mut total = 0u64;
+    let mut steps = 0u32;
+    let mut throttle = Throttle::new();
+    while let Some(dir) = stack.pop() {
+        steps = steps.wrapping_add(1);
+        if steps % 16 == 0 {
+            ensure_not_cancelled(cancel)?;
+        }
+        for entry in list_dir(session, container, &dir).await? {
+            if entry.is_dir {
+                stack.push(entry.path);
+            } else {
+                total = total.saturating_add(entry.size);
+                throttle.maybe_send(total, progress);
+            }
+        }
+    }
+    throttle.flush(total, progress);
+    Ok(total)
+}
+
+async fn remote_test(session: &client::Handle<ClientHandler>, container: &str, script: &str) -> bool {
+    let cmd = format!(
+        "docker exec {} sh -c {}",
+        shell_single_quote(container.trim()),
+        shell_single_quote(script)
+    );
+    remote_exec(session, &cmd).await.is_ok()
+}
+
+/// Copy (`cp -a`) or move (`mv`) inside the container over SSH.
+pub async fn paste(
+    session: &client::Handle<ClientHandler>,
+    container: &str,
+    src: &str,
+    dest_dir: &str,
+    is_dir: bool,
+    cut: bool,
+) -> Result<()> {
+    let src = normalize_path(src);
+    let dest_dir = normalize_path(dest_dir);
+    let is_dir = is_dir
+        || remote_test(
+            session,
+            container,
+            &format!(
+                "test -d {} && test ! -L {}",
+                shell_single_quote(&src),
+                shell_single_quote(&src)
+            ),
+        )
+        .await;
+    let name = src.rsplit('/').next().unwrap_or(&src).to_string();
+    if name.is_empty() || src == "/" {
+        bail!("invalid source");
+    }
+    if is_dir && super::fs_names::is_same_or_descendant(&src, &dest_dir, false) {
+        bail!("Cannot paste a folder into itself");
+    }
+    let mut dest = String::new();
+    for attempt in 0..100u32 {
+        let candidate = join_child(
+            &dest_dir,
+            &super::fs_names::collision_name(&name, is_dir, attempt),
+        );
+        let exists = remote_test(
+            session,
+            container,
+            &format!("test -e {}", shell_single_quote(&candidate)),
+        )
+        .await;
+        if !exists {
+            dest = candidate;
+            break;
+        }
+    }
+    if dest.is_empty() {
+        bail!("too many copies of {name}");
+    }
+    if cut && dest == src {
+        return Ok(());
+    }
+    let inner = if cut {
+        format!(
+            "mv {} {}",
+            shell_single_quote(&src),
+            shell_single_quote(&dest)
+        )
+    } else if is_dir {
+        format!(
+            "cp -a {src} {dest} || cp -R {src} {dest}",
+            src = shell_single_quote(&src),
+            dest = shell_single_quote(&dest)
+        )
+    } else {
+        format!(
+            "cp -a {} {}",
+            shell_single_quote(&src),
+            shell_single_quote(&dest)
+        )
+    };
+    let cmd = format!(
+        "docker exec {} sh -c {}",
+        shell_single_quote(container.trim()),
+        shell_single_quote(&inner)
+    );
+    remote_exec(session, &cmd).await?;
+    Ok(())
 }
 
 pub async fn resolve_existing_dir(

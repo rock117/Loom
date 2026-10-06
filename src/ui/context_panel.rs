@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use gpui::prelude::*;
 use gpui::*;
@@ -115,8 +117,29 @@ struct TransferMenu {
 }
 
 struct EntryMenu {
-    path: String,
+    /// `None` when the pointer is over empty list space, not a row.
+    path: Option<String>,
     position: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct FileClip {
+    pane: Uuid,
+    kind: FilesKind,
+    path: String,
+    is_dir: bool,
+    cut: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirSizeState {
+    Pending(u64),
+    Done(u64),
+    Failed,
+}
+
+struct DirSizeJob {
+    cancel: TransferCancel,
 }
 
 enum FilesPrompt {
@@ -187,10 +210,19 @@ pub struct ContextPanel {
     bound_sftp_alive: bool,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
+    /// On-demand directory sizes (right-click → Calculate size).
+    dir_sizes: HashMap<String, DirSizeState>,
+    dir_size_jobs: HashMap<String, DirSizeJob>,
+    /// Bumps when navigation cancels in-flight dir-size jobs.
+    dir_size_gen: u64,
     /// Transfers keyed by SSH pane id (not shared across servers/tabs).
     transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
+    /// Same-session file clipboard (copy / cut → paste). Not the OS clipboard.
+    file_clip: Option<FileClip>,
+    paste_busy: bool,
+    paste_gen: u64,
     prompt: Option<FilesPrompt>,
     /// Remember compress checkbox across transfers in this session.
     last_compress: bool,
@@ -265,9 +297,15 @@ impl ContextPanel {
             files_kind: None,
             bound_sftp_alive: false,
             list_gen: 0,
+            dir_sizes: HashMap::new(),
+            dir_size_jobs: HashMap::new(),
+            dir_size_gen: 0,
             transfers_by_pane: HashMap::new(),
             transfer_menu: None,
             entry_menu: None,
+            file_clip: None,
+            paste_busy: false,
+            paste_gen: 0,
             prompt: None,
             last_compress: false,
             last_download_dir: None,
@@ -356,8 +394,513 @@ impl ContextPanel {
         )
     }
 
+    fn cancel_all_dir_size_jobs(&mut self) {
+        self.dir_size_gen = self.dir_size_gen.wrapping_add(1);
+        for (_, job) in self.dir_size_jobs.drain() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.dir_sizes.clear();
+    }
+
+    fn finish_dir_size(
+        &mut self,
+        size_gen: u64,
+        path: String,
+        bytes: Option<u64>,
+        cancelled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if size_gen != self.dir_size_gen {
+            return;
+        }
+        self.dir_size_jobs.remove(&path);
+        if cancelled {
+            self.dir_sizes.remove(&path);
+        } else if let Some(n) = bytes {
+            self.dir_sizes.insert(path, DirSizeState::Done(n));
+        } else {
+            self.dir_sizes.insert(path, DirSizeState::Failed);
+        }
+        cx.notify();
+    }
+
+    fn apply_dir_size_progress(
+        &mut self,
+        size_gen: u64,
+        path: &str,
+        bytes: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if size_gen != self.dir_size_gen || !self.dir_size_jobs.contains_key(path) {
+            return;
+        }
+        if matches!(self.dir_sizes.get(path), Some(DirSizeState::Pending(prev)) if *prev == bytes)
+        {
+            return;
+        }
+        self.dir_sizes
+            .insert(path.to_string(), DirSizeState::Pending(bytes));
+        cx.notify();
+    }
+
+    fn spawn_dir_size_progress_listener(
+        &self,
+        size_gen: u64,
+        path: String,
+        progress_rx: flume::Receiver<u64>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            while let Ok(bytes) = progress_rx.recv_async().await {
+                this.update(cx, |this, cx| {
+                    this.apply_dir_size_progress(size_gen, &path, bytes, cx);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Size column text and whether a dir-size job is still running.
+    fn entry_size_display(&self, entry: &RemoteEntry) -> (String, bool) {
+        if entry.is_dir {
+            match self.dir_sizes.get(&entry.path) {
+                Some(DirSizeState::Pending(n)) => (format_size(*n), true),
+                Some(DirSizeState::Done(n)) => (format_size(*n), false),
+                Some(DirSizeState::Failed) => ("—".into(), false),
+                None => (String::new(), false),
+            }
+        } else {
+            (format_size(entry.size), false)
+        }
+    }
+
+    fn begin_dir_size(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self
+            .entries
+            .iter()
+            .any(|e| e.path == path && e.is_dir)
+        {
+            return;
+        }
+        if let Some(old) = self.dir_size_jobs.remove(&path) {
+            old.cancel.store(true, Ordering::Relaxed);
+        }
+        let cancel = transfer_cancel_flag();
+        self.dir_size_jobs.insert(
+            path.clone(),
+            DirSizeJob {
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        self.dir_sizes.insert(path.clone(), DirSizeState::Pending(0));
+        self.entry_menu = None;
+        let size_gen = self.dir_size_gen;
+        let (progress_tx, progress_rx) = flume::unbounded();
+        self.spawn_dir_size_progress_listener(size_gen, path.clone(), progress_rx, cx);
+        cx.notify();
+
+        match self.files_kind {
+            Some(FilesKind::Local) => {
+                let path_buf = PathBuf::from(&path);
+                let progress = progress_tx.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move {
+                            local_fs::dir_size(&path_buf, cancel.as_ref(), &progress)
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(n) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                            Err(err) => {
+                                let cancelled = format!("{err:#}").contains("cancelled");
+                                this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Sftp) => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                let progress_for_sftp = progress_tx.clone();
+                if sftp
+                    .request(SftpRequest::DirSize {
+                        path: path.clone(),
+                        cancel,
+                        progress: progress_for_sftp,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        match result {
+                            Ok(Ok(n)) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                            Ok(Err(err)) => {
+                                let cancelled = format!("{err:#}").contains("cancelled");
+                                this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                            }
+                            Err(_) => this.finish_dir_size(size_gen, path, None, true, cx),
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+            Some(FilesKind::Docker) => {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
+                    self.dir_size_jobs.remove(&path);
+                    self.dir_sizes.insert(path, DirSizeState::Failed);
+                    cx.notify();
+                    return;
+                };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    let progress_for_docker = progress_tx.clone();
+                    if sftp
+                        .request(SftpRequest::DockerDirSize {
+                            container,
+                            path: path.clone(),
+                            cancel,
+                            progress: progress_for_docker,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.dir_size_jobs.remove(&path);
+                        self.dir_sizes.insert(path, DirSizeState::Failed);
+                        cx.notify();
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = rx.recv_async().await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(Ok(n)) => {
+                                    this.finish_dir_size(size_gen, path, Some(n), false, cx)
+                                }
+                                Ok(Err(err)) => {
+                                    let cancelled = format!("{err:#}").contains("cancelled");
+                                    this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                                }
+                                Err(_) => this.finish_dir_size(size_gen, path, None, true, cx),
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                } else {
+                    let path_for_size = path.clone();
+                    let progress = progress_tx.clone();
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                docker_fs::dir_size(
+                                    &container,
+                                    &path_for_size,
+                                    cancel.as_ref(),
+                                    &progress,
+                                )
+                            })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            match result {
+                                Ok(n) => this.finish_dir_size(size_gen, path, Some(n), false, cx),
+                                Err(err) => {
+                                    let cancelled = format!("{err:#}").contains("cancelled");
+                                    this.finish_dir_size(size_gen, path, None, cancelled, cx);
+                                }
+                            }
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+            }
+            None => {
+                self.dir_size_jobs.remove(&path);
+                self.dir_sizes.remove(&path);
+                cx.notify();
+            }
+        }
+    }
+
+    fn clip_matches_session(&self) -> bool {
+        let Some(clip) = &self.file_clip else {
+            return false;
+        };
+        self.bound_pane == Some(clip.pane) && self.files_kind == Some(clip.kind)
+    }
+
+    fn remember_clip(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        let Some(pane) = self.bound_pane else {
+            return;
+        };
+        let Some(kind) = self.files_kind else {
+            return;
+        };
+        self.file_clip = Some(FileClip {
+            pane,
+            kind,
+            path: entry.path.clone(),
+            is_dir: entry.is_dir,
+            cut,
+        });
+        self.entry_menu = None;
+        cx.notify();
+    }
+
+    fn paste_into(&mut self, dest_dir: String, cx: &mut Context<Self>) {
+        if self.paste_busy || dest_dir.is_empty() || !self.clip_matches_session() {
+            return;
+        }
+        let Some(clip) = self.file_clip.clone() else {
+            return;
+        };
+        let case_insensitive = clip.kind == FilesKind::Local && cfg!(windows);
+        if clip.is_dir
+            && crate::session::fs_names::is_same_or_descendant(
+                &clip.path,
+                &dest_dir,
+                case_insensitive,
+            )
+        {
+            self.error = Some("Cannot paste a folder into itself".into());
+            self.entry_menu = None;
+            cx.notify();
+            return;
+        }
+        self.paste_busy = true;
+        self.paste_gen = self.paste_gen.wrapping_add(1);
+        let paste_job = self.paste_gen;
+        let pane = clip.pane;
+        let cut = clip.cut;
+        let source_is_dir = clip.is_dir;
+        let from = clip.path.clone();
+        self.entry_menu = None;
+        self.error = None;
+        cx.notify();
+
+        match clip.kind {
+            FilesKind::Local => {
+                let src = PathBuf::from(&from);
+                let dest = PathBuf::from(&dest_dir);
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_spawn(async move { local_fs::paste(&src, &dest, cut) })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.finish_paste(
+                            paste_job,
+                            pane,
+                            cut,
+                            result.map_err(|e| format!("{e:#}")),
+                            cx,
+                        )
+                    })
+                        .ok();
+                })
+                .detach();
+            }
+            FilesKind::Sftp => {
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("SFTP unavailable".into()),
+                        cx,
+                    );
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::Paste {
+                        from,
+                        dest_dir,
+                        is_dir: source_is_dir,
+                        cut,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("SFTP unavailable".into()),
+                        cx,
+                    );
+                    return;
+                }
+                cx.spawn(async move |this, cx| {
+                    let result = match rx.recv_async().await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(err)) => Err(format!("{err:#}")),
+                        Err(_) => Err("paste cancelled".into()),
+                    };
+                    this.update(cx, |this, cx| this.finish_paste(paste_job, pane, cut, result, cx))
+                        .ok();
+                })
+                .detach();
+            }
+            FilesKind::Docker => {
+                let Some((_, container, sftp)) = self.focused_docker(cx) else {
+                    self.finish_paste(
+                        paste_job,
+                        pane,
+                        cut,
+                        Err("Docker container unavailable".into()),
+                        cx,
+                    );
+                    return;
+                };
+                if let Some(sftp) = sftp {
+                    let (tx, rx) = flume::bounded(1);
+                    if sftp
+                        .request(SftpRequest::DockerPaste {
+                            container,
+                            from,
+                            dest_dir,
+                            is_dir: source_is_dir,
+                            cut,
+                            reply: tx,
+                        })
+                        .is_err()
+                    {
+                        self.finish_paste(
+                            paste_job,
+                            pane,
+                            cut,
+                            Err("SSH session unavailable".into()),
+                            cx,
+                        );
+                        return;
+                    }
+                    cx.spawn(async move |this, cx| {
+                        let result = match rx.recv_async().await {
+                            Ok(Ok(())) => Ok(()),
+                            Ok(Err(err)) => Err(format!("{err:#}")),
+                            Err(_) => Err("paste cancelled".into()),
+                        };
+                        this.update(cx, |this, cx| this.finish_paste(paste_job, pane, cut, result, cx))
+                            .ok();
+                    })
+                    .detach();
+                } else {
+                    cx.spawn(async move |this, cx| {
+                        let result = cx
+                            .background_spawn(async move {
+                                docker_fs::paste(&container, &from, &dest_dir, source_is_dir, cut)
+                            })
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.finish_paste(
+                                paste_job,
+                                pane,
+                                cut,
+                                result.map_err(|e| format!("{e:#}")),
+                                cx,
+                            )
+                        })
+                            .ok();
+                    })
+                    .detach();
+                }
+            }
+        }
+    }
+
+    fn finish_paste(
+        &mut self,
+        paste_job: u64,
+        pane: Uuid,
+        cut: bool,
+        result: Result<(), String>,
+        cx: &mut Context<Self>,
+    ) {
+        if paste_job != self.paste_gen {
+            return;
+        }
+        self.paste_busy = false;
+        match result {
+            Ok(()) => {
+                if cut {
+                    self.file_clip = None;
+                }
+                if self.bound_pane == Some(pane) {
+                    if let Some(cwd) = self.cwd.clone() {
+                        self.load_dir(cwd, cx);
+                        return;
+                    }
+                }
+                cx.notify();
+            }
+            Err(err) => {
+                if self.bound_pane == Some(pane) {
+                    self.error = Some(err);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_file_clip_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.active_tab != PanelTab::Files
+            || self.prompt.is_some()
+            || self.editing_path
+            || self.editing_search
+        {
+            return false;
+        }
+        let mods = &event.keystroke.modifiers;
+        let chord = (mods.control || mods.platform) && !mods.shift && !mods.alt;
+        if !chord {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "c" | "C" => {
+                self.remember_clip(false, cx);
+                true
+            }
+            "x" | "X" => {
+                self.remember_clip(true, cx);
+                true
+            }
+            "v" | "V" => {
+                if let Some(cwd) = self.cwd.clone() {
+                    self.paste_into(cwd, cx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn reset_files_state(&mut self) {
         self.list_gen = self.list_gen.wrapping_add(1);
+        self.cancel_all_dir_size_jobs();
         self.cwd = None;
         self.home = None;
         self.entries.clear();
@@ -366,6 +909,9 @@ impl ContextPanel {
         self.listing = false;
         self.transfer_menu = None;
         self.entry_menu = None;
+        self.file_clip = None;
+        self.paste_busy = false;
+        self.paste_gen = self.paste_gen.wrapping_add(1);
         self.prompt = None;
         self.path_edit = RenameEdit::new("");
         self.editing_path = false;
@@ -603,6 +1149,7 @@ impl ContextPanel {
     }
 
     fn load_dir(&mut self, path: String, cx: &mut Context<Self>) {
+        self.cancel_all_dir_size_jobs();
         match self.files_kind {
             Some(FilesKind::Sftp) => self.load_dir_sftp(path, cx),
             Some(FilesKind::Docker) => self.load_dir_docker(path, cx),
@@ -4178,6 +4725,20 @@ impl ContextPanel {
                             .min_h_0()
                             .w_full()
                             .overflow_y_scroll()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.focus_handle.focus(window);
+                                    this.selected = None;
+                                    this.transfer_menu = None;
+                                    this.entry_menu = Some(EntryMenu {
+                                        path: None,
+                                        position: event.position,
+                                    });
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .when(no_matches, |d| {
                                 d.child(
                                     div()
@@ -4192,11 +4753,7 @@ impl ContextPanel {
                                 let path = entry.path.clone();
                                 let is_sel = selected.as_deref() == Some(path.as_str());
                                 let icon = file_icon::entry_icon(&entry.name, entry.is_dir);
-                                let size = if entry.is_dir {
-                                    String::new()
-                                } else {
-                                    format_size(entry.size)
-                                };
+                                let (size, size_calculating) = self.entry_size_display(&entry);
                                 let mtime = format_mtime(entry.mtime);
                                 let kind = entry_kind_label(&entry);
                                 let ext = if entry.is_dir {
@@ -4206,6 +4763,9 @@ impl ContextPanel {
                                 };
                                 let entry_click = entry.clone();
                                 let name_el = highlighted_entry_name(&entry.name, &query);
+                                let cut_pending = self.file_clip.as_ref().is_some_and(|clip| {
+                                    clip.cut && clip.path == path && self.clip_matches_session()
+                                });
                                 div()
                                     .id(SharedString::from(format!("file-{path}")))
                                     .flex()
@@ -4215,6 +4775,7 @@ impl ContextPanel {
                                     .py(px(theme::SPACE_1))
                                     .cursor_pointer()
                                     .when(is_sel, |d| d.bg(theme::HOVER))
+                                    .when(cut_pending, |d| d.opacity(0.45))
                                     .hover(|s| s.bg(theme::HOVER))
                                     .child(icon)
                                     .child(name_el)
@@ -4259,23 +4820,31 @@ impl ContextPanel {
                                             .w(px(column_width(SortField::Size)))
                                             .flex_shrink_0()
                                             .text_xs()
-                                            .text_color(theme::TEXT_MUTED)
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_color(if size_calculating {
+                                                theme::ACCENT
+                                            } else {
+                                                theme::TEXT_MUTED
+                                            })
                                             .child(size),
                                     )
                                     .on_mouse_down(
                                         MouseButton::Right,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                            this.focus_handle.focus(window);
                                             this.selected = Some(path.clone());
                                             this.transfer_menu = None;
                                             this.entry_menu = Some(EntryMenu {
-                                                path: path.clone(),
+                                                path: Some(path.clone()),
                                                 position: event.position,
                                             });
                                             cx.notify();
                                             cx.stop_propagation();
                                         }),
                                     )
-                                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                    .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                        this.focus_handle.focus(window);
                                         this.entry_menu = None;
                                         this.selected = Some(entry_click.path.clone());
                                         if event.click_count() >= 2 {
@@ -4586,15 +5155,14 @@ impl ContextPanel {
         )
     }
 
-    fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let menu = self.entry_menu.as_ref()?;
-        let path = menu.path.clone();
-        let path_for_copy = path.clone();
-        let path_for_reveal = path.clone();
-        let position = menu.position;
-        let entry = self.entries.iter().find(|e| e.path == path)?;
-        let is_dir = entry.is_dir;
-        let is_local = self.files_kind == Some(FilesKind::Local);
+    fn render_blank_files_menu(
+        &self,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let paste_dest = self.cwd.clone().unwrap_or_default();
+        let can_paste = self.clip_matches_session() && !self.paste_busy && !paste_dest.is_empty();
+        let has_cwd = self.cwd.is_some();
 
         Some(
             deferred(
@@ -4619,6 +5187,99 @@ impl ContextPanel {
                             .occlude()
                             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                             .child(self.transfer_menu_item(
+                                "file-blank-paste",
+                                "Paste",
+                                can_paste,
+                                cx,
+                                move |this, _, cx| this.paste_into(paste_dest.clone(), cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-blank-new",
+                                "New folder…",
+                                has_cwd,
+                                cx,
+                                |this, window, cx| this.begin_new_folder(window, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-blank-refresh",
+                                "Refresh",
+                                has_cwd,
+                                cx,
+                                |this, _, cx| {
+                                    if let Some(cwd) = this.cwd.clone() {
+                                        this.load_dir(cwd, cx);
+                                    }
+                                },
+                            )),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.entry_menu.as_ref()?;
+        let position = menu.position;
+        let Some(path) = menu.path.clone() else {
+            return self.render_blank_files_menu(position, cx);
+        };
+        let path_for_copy = path.clone();
+        let path_for_reveal = path.clone();
+        let path_for_size = path.clone();
+        let entry = self.entries.iter().find(|e| e.path == path)?;
+        let is_dir = entry.is_dir;
+        let is_local = self.files_kind == Some(FilesKind::Local);
+        let paste_dest = if is_dir {
+            path.clone()
+        } else {
+            self.cwd.clone().unwrap_or_default()
+        };
+        let can_paste = self.clip_matches_session() && !self.paste_busy && !paste_dest.is_empty();
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(Edges {
+                        top: px(4.0),
+                        right: px(4.0),
+                        bottom: px(4.0),
+                        left: px(4.0),
+                    })
+                    .child(
+                        div()
+                            .min_w(px(160.0))
+                            .p(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .shadow_md()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "file-ctx-copy",
+                                "Copy",
+                                true,
+                                cx,
+                                |this, _, cx| this.remember_clip(false, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-cut",
+                                "Cut",
+                                true,
+                                cx,
+                                |this, _, cx| this.remember_clip(true, cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "file-ctx-paste",
+                                "Paste",
+                                can_paste,
+                                cx,
+                                move |this, _, cx| this.paste_into(paste_dest.clone(), cx),
+                            ))
+                            .child(self.transfer_menu_item(
                                 "file-ctx-copy-path",
                                 "Copy path",
                                 true,
@@ -4630,6 +5291,17 @@ impl ContextPanel {
                                     this.entry_menu = None;
                                 },
                             ))
+                            .when(is_dir, |d| {
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-dir-size",
+                                    "Calculate size",
+                                    true,
+                                    cx,
+                                    move |this, _, cx| {
+                                        this.begin_dir_size(path_for_size.clone(), cx);
+                                    },
+                                ))
+                            })
                             .when(!is_dir, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-open",
@@ -6675,6 +7347,10 @@ impl Render for ContextPanel {
                     return;
                 }
                 if this.handle_search_key(event, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.handle_file_clip_key(event, cx) {
                     cx.stop_propagation();
                     return;
                 }

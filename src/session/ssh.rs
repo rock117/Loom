@@ -114,9 +114,22 @@ impl client::Handler for ClientHandler {
     ) -> Result<bool, Self::Error> {
         let fp = server_public_key.fingerprint(HashAlg::Sha256).to_string();
         match known_hosts::check_and_record(&self.host, self.port, &fp) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                log::debug!(
+                    target: "loom::ssh.connect",
+                    "host key ok {host}:{port} fp={fp}",
+                    host = self.host,
+                    port = self.port
+                );
+                Ok(true)
+            }
             Err(err) => {
-                eprintln!("loom: SSH host key rejected: {err:#}");
+                log::warn!(
+                    target: "loom::ssh.connect",
+                    "host key rejected {host}:{port}: {err:#}",
+                    host = self.host,
+                    port = self.port
+                );
                 Ok(false)
             }
         }
@@ -140,6 +153,14 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let cols = params.cols.max(1);
     let rows = params.rows.max(1);
     let remote_command = params.remote_command.clone();
+    let host_log = host.clone();
+    let user_log = user.clone();
+
+    log::info!(
+        target: "loom::ssh.connect",
+        "begin {user}@{host}:{port}"
+    );
+    let connect_started = std::time::Instant::now();
 
     thread::Builder::new()
         .name("loom-ssh".into())
@@ -152,15 +173,16 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
             {
                 Ok(rt) => rt,
                 Err(err) => {
+                    log::error!(target: "loom::ssh.connect", "tokio runtime: {err}");
                     let _ = ready_tx.send(Err(anyhow::anyhow!("tokio runtime: {err}")));
                     return;
                 }
             };
             rt.block_on(async move {
                 match run_session(
-                    host,
+                    host.clone(),
                     port,
-                    user,
+                    user.clone(),
                     auth,
                     cols,
                     rows,
@@ -177,12 +199,19 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                 .await
                 {
                     Ok(()) => {
+                        log::info!(
+                            target: "loom::ssh.connect",
+                            "session ended cleanly {user}@{host}:{port}"
+                        );
                         let _ = stdout_tx.send(Vec::new());
                     }
                     Err(err) => {
                         let _ = ready_tx.send(Err(anyhow::anyhow!("{err:#}")));
                         let _ = stdout_tx.send(Vec::new());
-                        eprintln!("loom: SSH session ended: {err:#}");
+                        log::warn!(
+                            target: "loom::ssh.connect",
+                            "session ended {user}@{host}:{port}: {err:#}"
+                        );
                     }
                 }
             });
@@ -190,9 +219,27 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
         .context("spawn SSH thread")?;
 
     match ready_rx.recv_timeout(Duration::from_secs(45)) {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(_) => bail!("SSH connection timed out"),
+        Ok(Ok(())) => {
+            log::info!(
+                target: "loom::ssh.connect",
+                "ready {user_log}@{host_log}:{port} elapsed_ms={}",
+                connect_started.elapsed().as_millis()
+            );
+        }
+        Ok(Err(err)) => {
+            log::error!(
+                target: "loom::ssh.connect",
+                "failed {user_log}@{host_log}:{port}: {err:#}"
+            );
+            return Err(err);
+        }
+        Err(_) => {
+            log::error!(
+                target: "loom::ssh.connect",
+                "timeout {user_log}@{host_log}:{port} after 45s"
+            );
+            bail!("SSH connection timed out");
+        }
     }
 
     let resize = Arc::new(move |c: usize, r: usize| {
@@ -243,10 +290,12 @@ async fn run_session(
     let mut session = client::connect(config, (host.as_str(), port), handler)
         .await
         .with_context(|| format!("connect to {host}:{port}"))?;
+    log::debug!(target: "loom::ssh.connect", "tcp ok {user}@{host}:{port}");
 
     authenticate(&mut session, &user, auth)
         .await
         .context("SSH authentication")?;
+    log::debug!(target: "loom::ssh.connect", "auth ok {user}@{host}:{port}");
 
     let mut channel = session
         .channel_open_session()
@@ -258,6 +307,7 @@ async fn run_session(
         .await
         .context("request PTY")?;
     if let Some(cmd) = remote_command.as_deref() {
+        log::debug!(target: "loom::ssh.connect", "exec remote command {user}@{host}:{port}");
         channel
             .exec(true, cmd)
             .await
@@ -267,6 +317,7 @@ async fn run_session(
             .request_shell(true)
             .await
             .context("request shell")?;
+        log::debug!(target: "loom::ssh.connect", "shell ok {user}@{host}:{port}");
     }
 
     // Share Handle via Arc so SFTP / forwards can open channels while the shell runs.
@@ -290,6 +341,10 @@ async fn run_session(
         tokio::select! {
             biased;
             _ = shutdown_rx.recv_async() => {
+                log::info!(
+                    target: "loom::ssh.connect",
+                    "disconnect requested {user}@{host}:{port}"
+                );
                 let _ = session
                     .disconnect(Disconnect::ByApplication, "closed", "")
                     .await;

@@ -53,15 +53,22 @@ impl WorkspaceStore {
 
     pub fn persist_now(&mut self) {
         if let Err(error) = save_workspace(&self.workspace) {
-            eprintln!("loom: failed to save workspace: {error:#}");
+            log::error!(target: "loom::persist", "failed to save workspace: {error:#}");
         }
         if let Err(error) = save_ui_state(&self.ui_state) {
-            eprintln!("loom: failed to save ui state: {error:#}");
+            log::error!(target: "loom::persist", "failed to save ui state: {error:#}");
         }
         if let Err(error) = save_settings(&self.settings) {
-            eprintln!("loom: failed to save settings: {error:#}");
+            log::error!(target: "loom::persist", "failed to save settings: {error:#}");
         }
         self.dirty = false;
+    }
+
+    /// Persist settings and hot-reload the logger from `settings.logging`.
+    pub fn persist_logging_settings(&mut self) {
+        crate::shared::logging::reconfigure(&self.settings.logging);
+        self.mark_dirty();
+        self.persist_now();
     }
 
     pub fn persist_if_dirty(&mut self) {

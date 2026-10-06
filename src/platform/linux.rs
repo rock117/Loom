@@ -6,6 +6,13 @@ pub fn native_config_dir() -> PathBuf {
         .join("loom")
 }
 
+pub fn native_logs_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("loom")
+        .join("logs")
+}
+
 pub fn native_default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
 }

@@ -115,7 +115,7 @@ impl LocalPty {
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
-                eprintln!("loom: pty resize failed: {error}");
+                log::warn!(target: "loom::pty", "resize failed: {error}");
             }
         }
     }

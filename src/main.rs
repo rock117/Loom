@@ -11,5 +11,7 @@ mod terminal;
 mod ui;
 
 fn main() {
+    let settings = model::load_settings();
+    shared::logging::init(&settings.logging);
     app::run();
 }

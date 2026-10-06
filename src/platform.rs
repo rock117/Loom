@@ -28,6 +28,11 @@ pub fn config_dir() -> PathBuf {
     native_config_dir()
 }
 
+/// Writable logs directory (`%LOCALAPPDATA%/Loom/logs`, etc.). See `docs/LOGGING.md`.
+pub fn logs_dir() -> PathBuf {
+    native_logs_dir()
+}
+
 /// Default interactive shell executable (absolute path preferred on Windows).
 pub fn default_shell() -> String {
     native_default_shell()
@@ -58,8 +63,9 @@ pub fn resolve_shell(configured: Option<&str>) -> ResolvedShell {
                 invalid_configured: None,
             };
         }
-        eprintln!(
-            "loom: configured shell `{shell}` not found; using platform default"
+        log::warn!(
+            target: "loom",
+            "configured shell `{shell}` not found; using platform default"
         );
         return ResolvedShell {
             path: default_shell(),

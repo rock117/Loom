@@ -42,7 +42,10 @@ pub fn needs_password_prompt(profile_id: Uuid) -> bool {
         Ok(None) => true,
         Ok(Some(_)) => false,
         Err(err) => {
-            eprintln!("loom: keyring read failed ({err:#}); prompting for password");
+            log::warn!(
+                target: "loom::ssh.auth",
+                "keyring read failed ({err:#}); prompting for password"
+            );
             true
         }
     }

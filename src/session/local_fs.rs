@@ -4,9 +4,12 @@
 //! without a Tokio reactor.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
+use flume::Sender;
 
+use super::dir_size_progress::Throttle;
 use super::sftp::RemoteEntry;
 
 /// List a local directory as [`RemoteEntry`] rows (unsorted; UI applies sort).
@@ -116,6 +119,149 @@ pub fn join_child(parent: &str, name: &str) -> PathBuf {
     Path::new(parent).join(name)
 }
 
+fn path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+fn unique_dest(dir: &Path, name: &str, is_dir: bool) -> Result<PathBuf> {
+    for attempt in 0..100u32 {
+        let candidate = dir.join(super::fs_names::collision_name(name, is_dir, attempt));
+        if !path_exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!("too many copies of {name}");
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(from)
+        .with_context(|| format!("stat {}", from.display()))?;
+    if meta.file_type().is_symlink() || meta.is_file() {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("mkdir {}", parent.display()))?;
+        }
+        std::fs::copy(from, to)
+            .with_context(|| format!("copy {} → {}", from.display(), to.display()))?;
+        return Ok(());
+    }
+    if meta.is_dir() {
+        std::fs::create_dir(to).with_context(|| format!("mkdir {}", to.display()))?;
+        for entry in std::fs::read_dir(from).with_context(|| format!("read_dir {}", from.display()))?
+        {
+            let entry = entry?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    bail!("cannot copy {}", from.display());
+}
+
+/// Copy or move `src` into `dest_dir`. Does not overwrite; collisions become `name - Copy`.
+pub fn paste(src: &Path, dest_dir: &Path, cut: bool) -> Result<()> {
+    let meta = std::fs::symlink_metadata(src)
+        .with_context(|| format!("stat {}", src.display()))?;
+    let is_dir = meta.is_dir() && !meta.file_type().is_symlink();
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| anyhow::anyhow!("invalid source name"))?;
+    let src_text = src.to_string_lossy();
+    let dest_text = dest_dir.to_string_lossy();
+    if is_dir
+        && super::fs_names::is_same_or_descendant(&src_text, &dest_text, cfg!(windows))
+    {
+        bail!("Cannot paste a folder into itself");
+    }
+    let dest = unique_dest(dest_dir, &name, is_dir)?;
+    if cut && dest == src {
+        return Ok(());
+    }
+    if cut {
+        match std::fs::rename(src, &dest) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                copy_tree(src, &dest)?;
+                remove_path(src, is_dir)?;
+                Ok(())
+            }
+            Err(err) => Err(err).with_context(|| {
+                format!("move {} → {}", src.display(), dest.display())
+            }),
+        }
+    } else {
+        copy_tree(src, &dest)
+    }
+}
+
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<()> {
+    if cancel.load(Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    Ok(())
+}
+
+/// Recursive byte size of a directory tree (does not follow symlinks).
+/// Poll `cancel` periodically so navigation can abort the walk off the UI thread.
+pub fn dir_size(path: &Path, cancel: &AtomicBool, progress: &Sender<u64>) -> Result<u64> {
+    ensure_not_cancelled(cancel)?;
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if meta.is_file() {
+        let n = meta.len();
+        let _ = progress.send(n);
+        return Ok(n);
+    }
+    if !meta.is_dir() {
+        bail!("not a directory");
+    }
+    let mut total = 0u64;
+    let mut steps = 0u32;
+    let mut throttle = Throttle::new();
+    walk_dir_size(
+        path,
+        &mut total,
+        cancel,
+        &mut steps,
+        progress,
+        &mut throttle,
+    )?;
+    throttle.flush(total, progress);
+    Ok(total)
+}
+
+fn walk_dir_size(
+    path: &Path,
+    total: &mut u64,
+    cancel: &AtomicBool,
+    steps: &mut u32,
+    progress: &Sender<u64>,
+    throttle: &mut Throttle,
+) -> Result<()> {
+    *steps = steps.wrapping_add(1);
+    if *steps % 256 == 0 {
+        ensure_not_cancelled(cancel)?;
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+    if meta.is_file() {
+        *total = total.saturating_add(meta.len());
+        throttle.maybe_send(*total, progress);
+        return Ok(());
+    }
+    if !meta.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path).with_context(|| format!("read_dir {}", path.display()))? {
+        let entry = entry?;
+        walk_dir_size(&entry.path(), total, cancel, steps, progress, throttle)?;
+    }
+    Ok(())
+}
+
 pub fn parse_mode(text: &str) -> Result<u32> {
     let t = text.trim();
     if t.is_empty() {
@@ -135,4 +281,32 @@ pub fn parse_mode(text: &str) -> Result<u32> {
         bail!("mode out of range");
     }
     Ok(mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_copies_nested_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-paste-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let src = root.join("src");
+        let nested = src.join("sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("note.txt"), b"hello").unwrap();
+        let dest_dir = root.join("dest");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        paste(&src, &dest_dir, false).unwrap();
+
+        let copied = dest_dir.join("src").join("sub").join("note.txt");
+        assert_eq!(std::fs::read_to_string(&copied).unwrap(), "hello");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
