@@ -4984,12 +4984,12 @@ impl ContextPanel {
     /// Apply a probe reply only when it still matches the active focused pane.
     fn apply_host_info_result(
         &mut self,
-        gen: u64,
+        probe_gen: u64,
         pane_id: Uuid,
         result: Result<HostSnapshot, String>,
         cx: &mut Context<Self>,
     ) {
-        if gen != self.host_info_gen {
+        if probe_gen != self.host_info_gen {
             return;
         }
         let focused = self
@@ -5019,7 +5019,7 @@ impl ContextPanel {
     }
 
     fn start_local_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
-        let gen = self.begin_host_info_probe(pane_id);
+        let probe_gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -5027,7 +5027,7 @@ impl ContextPanel {
                 .await;
             this.update(cx, |this, cx| {
                 this.apply_host_info_result(
-                    gen,
+                    probe_gen,
                     pane_id,
                     result.map_err(|err| format!("{err:#}")),
                     cx,
@@ -5044,7 +5044,7 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        let gen = self.begin_host_info_probe(pane_id);
+        let probe_gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         if let Some(sftp) = sftp {
             let (tx, rx) = flume::bounded(1);
@@ -5055,7 +5055,7 @@ impl ContextPanel {
                 })
                 .is_err()
             {
-                if gen == self.host_info_gen {
+                if probe_gen == self.host_info_gen {
                     self.host_info_loading = false;
                     self.host_info_error = Some("SSH session unavailable".into());
                 }
@@ -5070,7 +5070,7 @@ impl ContextPanel {
                         Ok(Err(err)) => Err(format!("{err:#}")),
                         Err(_) => Err("Host probe cancelled".into()),
                     };
-                    this.apply_host_info_result(gen, pane_id, mapped, cx);
+                    this.apply_host_info_result(probe_gen, pane_id, mapped, cx);
                 })
                 .ok();
             })
@@ -5083,7 +5083,7 @@ impl ContextPanel {
                 .await;
             this.update(cx, |this, cx| {
                 this.apply_host_info_result(
-                    gen,
+                    probe_gen,
                     pane_id,
                     result.map_err(|err| format!("{err:#}")),
                     cx,
@@ -5095,14 +5095,14 @@ impl ContextPanel {
     }
 
     fn start_ssh_host_probe(&mut self, pane_id: Uuid, sftp: SftpHandle, cx: &mut Context<Self>) {
-        let gen = self.begin_host_info_probe(pane_id);
+        let probe_gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         let (tx, rx) = flume::bounded(1);
         if sftp
             .request(SftpRequest::HostProbe { reply: tx })
             .is_err()
         {
-            if gen == self.host_info_gen {
+            if probe_gen == self.host_info_gen {
                 self.host_info_loading = false;
                 self.host_info_error = Some("SSH session unavailable".into());
             }
@@ -5117,7 +5117,7 @@ impl ContextPanel {
                     Ok(Err(err)) => Err(format!("{err:#}")),
                     Err(_) => Err("Host probe cancelled".into()),
                 };
-                this.apply_host_info_result(gen, pane_id, mapped, cx);
+                this.apply_host_info_result(probe_gen, pane_id, mapped, cx);
             })
             .ok();
         })
