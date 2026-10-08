@@ -217,6 +217,8 @@ pub struct ContextPanel {
     host_info_pane: Option<Uuid>,
     host_info_loading: bool,
     host_info_error: Option<String>,
+    /// Bumped on each probe start / files reset so stale Local/SSH/Docker replies are ignored.
+    host_info_gen: u64,
     /// Inline Temporary Local forward form on the Info tab.
     forward_temp: Option<ForwardTempEdit>,
     /// Brief "Copied" label flash after clipboard write.
@@ -286,6 +288,7 @@ impl ContextPanel {
             host_info_pane: None,
             host_info_loading: false,
             host_info_error: None,
+            host_info_gen: 0,
             forward_temp: None,
             fwd_copy_flash: None,
             _fwd_copy_flash_task: None,
@@ -381,6 +384,7 @@ impl ContextPanel {
         self.host_info_pane = None;
         self.host_info_loading = false;
         self.host_info_error = None;
+        self.host_info_gen = self.host_info_gen.wrapping_add(1);
     }
 
     /// Drop transfer lists for panes that no longer exist; cancel their jobs.
@@ -4947,9 +4951,6 @@ impl ContextPanel {
 
     /// Load host info when entering Info or after pane change (no auto interval).
     fn ensure_host_info(&mut self, cx: &mut Context<Self>) {
-        if self.host_info_loading {
-            return;
-        }
         let pane_id = self
             .tabs
             .read(cx)
@@ -4962,33 +4963,75 @@ impl ContextPanel {
             self.host_info_error = Some("No session open".into());
             return;
         };
+        // Wait only for a probe of *this* pane. A stale Local probe must not block SSH.
+        if self.host_info_loading && self.host_info_pane == Some(pane_id) {
+            return;
+        }
         if self.host_info.is_some() && self.host_info_pane == Some(pane_id) {
             return;
         }
         self.refresh_host_info(cx);
     }
 
-    fn start_local_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+    fn begin_host_info_probe(&mut self, pane_id: Uuid) -> u64 {
+        self.host_info_gen = self.host_info_gen.wrapping_add(1);
         self.host_info_loading = true;
         self.host_info_error = None;
         self.host_info_pane = Some(pane_id);
+        self.host_info_gen
+    }
+
+    /// Apply a probe reply only when it still matches the active focused pane.
+    fn apply_host_info_result(
+        &mut self,
+        gen: u64,
+        pane_id: Uuid,
+        result: Result<HostSnapshot, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if gen != self.host_info_gen {
+            return;
+        }
+        let focused = self
+            .tabs
+            .read(cx)
+            .active_tab()
+            .and_then(|t| t.focused_pane())
+            .map(|p| p.id);
+        if focused != Some(pane_id) {
+            // Latest probe for a pane that is no longer focused — drop the reply,
+            // clear the spinner so Info is not stuck on Loading.
+            self.host_info_loading = false;
+            cx.notify();
+            return;
+        }
+        self.host_info_loading = false;
+        match result {
+            Ok(snap) => {
+                self.host_info = Some(snap);
+                self.host_info_error = None;
+            }
+            Err(err) => {
+                self.host_info_error = Some(err);
+            }
+        }
+        cx.notify();
+    }
+
+    fn start_local_host_probe(&mut self, pane_id: Uuid, cx: &mut Context<Self>) {
+        let gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move { host_info::collect_local() })
                 .await;
             this.update(cx, |this, cx| {
-                this.host_info_loading = false;
-                match result {
-                    Ok(snap) => {
-                        this.host_info = Some(snap);
-                        this.host_info_error = None;
-                    }
-                    Err(err) => {
-                        this.host_info_error = Some(format!("{err:#}"));
-                    }
-                }
-                cx.notify();
+                this.apply_host_info_result(
+                    gen,
+                    pane_id,
+                    result.map_err(|err| format!("{err:#}")),
+                    cx,
+                );
             })
             .ok();
         })
@@ -5001,9 +5044,7 @@ impl ContextPanel {
             cx.notify();
             return;
         };
-        self.host_info_loading = true;
-        self.host_info_error = None;
-        self.host_info_pane = Some(pane_id);
+        let gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         if let Some(sftp) = sftp {
             let (tx, rx) = flume::bounded(1);
@@ -5014,28 +5055,22 @@ impl ContextPanel {
                 })
                 .is_err()
             {
-                self.host_info_loading = false;
-                self.host_info_error = Some("SSH session unavailable".into());
+                if gen == self.host_info_gen {
+                    self.host_info_loading = false;
+                    self.host_info_error = Some("SSH session unavailable".into());
+                }
                 cx.notify();
                 return;
             }
             cx.spawn(async move |this, cx| {
                 let result = rx.recv_async().await;
                 this.update(cx, |this, cx| {
-                    this.host_info_loading = false;
-                    match result {
-                        Ok(Ok(snap)) => {
-                            this.host_info = Some(snap);
-                            this.host_info_error = None;
-                        }
-                        Ok(Err(err)) => {
-                            this.host_info_error = Some(format!("{err:#}"));
-                        }
-                        Err(_) => {
-                            this.host_info_error = Some("Host probe cancelled".into());
-                        }
-                    }
-                    cx.notify();
+                    let mapped = match result {
+                        Ok(Ok(snap)) => Ok(snap),
+                        Ok(Err(err)) => Err(format!("{err:#}")),
+                        Err(_) => Err("Host probe cancelled".into()),
+                    };
+                    this.apply_host_info_result(gen, pane_id, mapped, cx);
                 })
                 .ok();
             })
@@ -5047,17 +5082,12 @@ impl ContextPanel {
                 .background_spawn(async move { docker_fs::container_snapshot(&container) })
                 .await;
             this.update(cx, |this, cx| {
-                this.host_info_loading = false;
-                match result {
-                    Ok(snap) => {
-                        this.host_info = Some(snap);
-                        this.host_info_error = None;
-                    }
-                    Err(err) => {
-                        this.host_info_error = Some(format!("{err:#}"));
-                    }
-                }
-                cx.notify();
+                this.apply_host_info_result(
+                    gen,
+                    pane_id,
+                    result.map_err(|err| format!("{err:#}")),
+                    cx,
+                );
             })
             .ok();
         })
@@ -5065,37 +5095,29 @@ impl ContextPanel {
     }
 
     fn start_ssh_host_probe(&mut self, pane_id: Uuid, sftp: SftpHandle, cx: &mut Context<Self>) {
-        self.host_info_loading = true;
-        self.host_info_error = None;
-        self.host_info_pane = Some(pane_id);
+        let gen = self.begin_host_info_probe(pane_id);
         cx.notify();
         let (tx, rx) = flume::bounded(1);
         if sftp
             .request(SftpRequest::HostProbe { reply: tx })
             .is_err()
         {
-            self.host_info_loading = false;
-            self.host_info_error = Some("SSH session unavailable".into());
+            if gen == self.host_info_gen {
+                self.host_info_loading = false;
+                self.host_info_error = Some("SSH session unavailable".into());
+            }
             cx.notify();
             return;
         }
         cx.spawn(async move |this, cx| {
             let result = rx.recv_async().await;
             this.update(cx, |this, cx| {
-                this.host_info_loading = false;
-                match result {
-                    Ok(Ok(snap)) => {
-                        this.host_info = Some(snap);
-                        this.host_info_error = None;
-                    }
-                    Ok(Err(err)) => {
-                        this.host_info_error = Some(format!("{err:#}"));
-                    }
-                    Err(_) => {
-                        this.host_info_error = Some("Host probe cancelled".into());
-                    }
-                }
-                cx.notify();
+                let mapped = match result {
+                    Ok(Ok(snap)) => Ok(snap),
+                    Ok(Err(err)) => Err(format!("{err:#}")),
+                    Err(_) => Err("Host probe cancelled".into()),
+                };
+                this.apply_host_info_result(gen, pane_id, mapped, cx);
             })
             .ok();
         })

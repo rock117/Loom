@@ -84,7 +84,7 @@ Transfers footer stays empty unless an SSH pane is focused. Use Reveal / Copy Pa
 
 ## Info
 
-Compact **Host** / **Container** view (no session summary). Loads on first open for the current pane; **↻** refreshes (no interval polling).
+Compact **Host** / **Container** view (no session summary). Loads on first open for the **focused** pane; **↻** refreshes (no interval polling). Stale Local/SSH/Docker probe replies are ignored after a pane switch or refresh.
 
 | Block | Content |
 |-------|---------|
