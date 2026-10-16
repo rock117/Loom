@@ -18,12 +18,14 @@ This is **not** Local port forwarding (`-L`). The jump host opens a `direct-tcpi
 
 Passwords:
 
-| Role | Keyring service entry |
-|------|------------------------|
+| Role | Keyring user (service `loom`) |
+|------|-------------------------------|
 | Target | `ssh/{profile_id}` |
-| Jump | `ssh/{profile_id}/jump` |
+| Jump | `ssh-jump/{profile_id}` (legacy `ssh/{id}/jump` is migrated on read) |
 
-Both can use password (Remember → keyring) or private key. Connect prompts collect jump first, then target, when credentials are missing.
+Jump uses a **separate user prefix** on purpose: on Windows the Cred Manager target is `{user}.loom`, and a nested `ssh/{id}/jump` could interfere with `ssh/{id}`. |
+
+Both can use password (Remember → keyring) or private key. Connect prompts collect jump first, then target, when credentials are missing. Checking **Remember** on a connect prompt also sets the profile’s `remember: true` so a later profile Save with a blank password does not wipe the keyring entry.
 
 ## UI
 

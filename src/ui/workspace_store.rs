@@ -208,6 +208,40 @@ impl WorkspaceStore {
         id
     }
 
+    /// After a password modal "Remember", keep profile `remember: true` so a later
+    /// form Save with a blank password does not wipe the keyring entry.
+    pub fn mark_ssh_password_remembered(
+        &mut self,
+        id: Uuid,
+        jump: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(profile) = self.workspace.find_profile_mut(id) else {
+            return false;
+        };
+        let crate::model::ProfileKind::Ssh { auth, jump: jump_host, .. } = &mut profile.kind else {
+            return false;
+        };
+        if jump {
+            let Some(j) = jump_host.as_mut() else {
+                return false;
+            };
+            if let crate::model::SshAuth::Password { remember } = &mut j.auth {
+                *remember = true;
+            } else {
+                return false;
+            }
+        } else if let crate::model::SshAuth::Password { remember } = auth {
+            *remember = true;
+        } else {
+            return false;
+        }
+        self.mark_dirty();
+        self.persist_now();
+        cx.notify();
+        true
+    }
+
     /// Update an existing SSH profile's connection fields (keeps id / group).
     pub fn update_ssh_profile(
         &mut self,

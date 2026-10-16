@@ -21,8 +21,10 @@ pub enum SshFormEvent {
     Saved {
         profile_id: Uuid,
         connect: bool,
-        /// Present when password was not saved to the keyring (one-shot connect).
+        /// Present when target password was not saved to the keyring (one-shot connect).
         oneshot_password: Option<String>,
+        /// Present when jump password was not saved to the keyring (one-shot connect).
+        oneshot_jump_password: Option<String>,
     },
     Toast(SharedString),
 }
@@ -715,19 +717,22 @@ impl SshForm {
         let creating = self.editing.is_none();
         let id = self.editing.unwrap_or_else(Uuid::new_v4);
 
-        let (auth, oneshot) = if self.use_private_key {
+        // Validate + build auth first; write keyring after jump so target is stored last
+        // (avoids any Windows Cred Manager interference between the two entries).
+        let (auth, oneshot, target_pw_to_store, clear_target_pw) = if self.use_private_key {
             let path = self.key_path.text.trim().to_string();
             if path.is_empty() {
                 self.error = Some("Private key path is required".into());
                 cx.notify();
                 return;
             }
-            let _ = credentials::delete_password(id);
             (
                 SshAuth::PrivateKey {
                     path: PathBuf::from(path),
                 },
                 None,
+                None,
+                true, // drop any leftover password when switching to key
             )
         } else {
             if self.password.text.is_empty() {
@@ -740,34 +745,30 @@ impl SshForm {
                 }
             }
 
-            if !self.password.text.is_empty() {
-                if self.remember {
-                    if let Err(err) = credentials::set_password(id, &self.password.text) {
-                        self.error = Some(format!("Could not store password: {err:#}"));
-                        cx.notify();
-                        return;
-                    }
-                } else {
-                    let _ = credentials::delete_password(id);
-                }
-            } else if !self.remember {
-                let _ = credentials::delete_password(id);
-            }
-
             let oneshot = if !self.password.text.is_empty() && !self.remember {
                 Some(self.password.text.clone())
             } else {
                 None
             };
+            let to_store = if !self.password.text.is_empty() && self.remember {
+                Some(self.password.text.clone())
+            } else {
+                None
+            };
+            // Remember off + no new password to store → clear any previous keyring entry.
+            let clear_target = !self.remember && to_store.is_none();
 
             (
                 SshAuth::Password {
                     remember: self.remember,
                 },
                 oneshot,
+                to_store,
+                clear_target,
             )
         };
 
+        let mut oneshot_jump: Option<String> = None;
         let jump = if self.jump_enabled {
             let jhost = self.jump_host.text.trim().to_string();
             let juser = self.jump_user.text.trim().to_string();
@@ -817,6 +818,7 @@ impl SshForm {
                         }
                     } else {
                         let _ = credentials::delete_jump_password(id);
+                        oneshot_jump = Some(self.jump_password.text.clone());
                     }
                 } else if !self.jump_remember {
                     let _ = credentials::delete_jump_password(id);
@@ -835,6 +837,17 @@ impl SshForm {
             let _ = credentials::delete_jump_password(id);
             None
         };
+
+        // Target password last — must survive after jump keyring writes.
+        if clear_target_pw {
+            let _ = credentials::delete_password(id);
+        } else if let Some(pw) = target_pw_to_store {
+            if let Err(err) = credentials::set_password(id, &pw) {
+                self.error = Some(format!("Could not store password: {err:#}"));
+                cx.notify();
+                return;
+            }
+        }
 
         let remote_cwd = {
             let t = self.remote_cwd.text.trim();
@@ -901,6 +914,7 @@ impl SshForm {
             profile_id: id,
             connect,
             oneshot_password: oneshot,
+            oneshot_jump_password: oneshot_jump,
         });
     }
 

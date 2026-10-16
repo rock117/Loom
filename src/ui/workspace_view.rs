@@ -286,12 +286,19 @@ impl WorkspaceView {
                     profile_id,
                     connect,
                     oneshot_password,
+                    oneshot_jump_password,
                 } => {
                     this.show_ssh_form = false;
                     if this.finish_pending_save_as(*profile_id, cx) {
                         // Bound current session; do not open a second tab.
                     } else if *connect {
-                        this.connect_ssh(*profile_id, oneshot_password.clone(), window, cx);
+                        this.connect_ssh(
+                            *profile_id,
+                            oneshot_password.clone(),
+                            oneshot_jump_password.clone(),
+                            window,
+                            cx,
+                        );
                     } else {
                         this.set_toast("Saved successfully", cx);
                     }
@@ -546,7 +553,7 @@ impl WorkspaceView {
             self.password_oneshot_jump = None;
             self.show_password_prompt(
                 profile.id,
-                Self::password_prompt_title(&profile.name, role),
+                Self::password_prompt_title(&profile, role),
                 role,
                 PendingPasswordAction::Open,
                 window,
@@ -573,6 +580,7 @@ impl WorkspaceView {
         &mut self,
         profile_id: uuid::Uuid,
         oneshot_password: Option<String>,
+        oneshot_jump_password: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -587,20 +595,17 @@ impl WorkspaceView {
             return;
         };
 
-        if let Some(password) = oneshot_password {
-            self.tabs.update(cx, |m, cx| {
-                m.open_ssh_with_overrides(&profile, Some(password), None, &font_family, cx);
-            });
-            self.persist_tabs(cx);
-            return;
-        }
+        self.password_oneshot_target = oneshot_password;
+        self.password_oneshot_jump = oneshot_jump_password;
 
-        if let Some(role) = TabManager::ssh_password_need(&profile, false, false) {
-            self.password_oneshot_target = None;
-            self.password_oneshot_jump = None;
+        if let Some(role) = TabManager::ssh_password_need(
+            &profile,
+            self.password_oneshot_jump.is_some(),
+            self.password_oneshot_target.is_some(),
+        ) {
             self.show_password_prompt(
                 profile.id,
-                Self::password_prompt_title(&profile.name, role),
+                Self::password_prompt_title(&profile, role),
                 role,
                 PendingPasswordAction::Open,
                 window,
@@ -609,16 +614,36 @@ impl WorkspaceView {
             return;
         }
 
+        let target = self.password_oneshot_target.take();
+        let jump = self.password_oneshot_jump.take();
         self.tabs.update(cx, |m, cx| {
-            m.open_ssh_profile(&profile, &font_family, cx);
+            m.open_ssh_with_overrides(&profile, target, jump, &font_family, cx);
         });
         self.persist_tabs(cx);
     }
 
-    fn password_prompt_title(name: &str, role: SshPasswordRole) -> String {
+    fn password_prompt_title(profile: &crate::model::Profile, role: SshPasswordRole) -> String {
+        let crate::model::ProfileKind::Ssh {
+            host,
+            port,
+            user,
+            jump,
+            ..
+        } = &profile.kind
+        else {
+            return profile.name.clone();
+        };
         match role {
-            SshPasswordRole::Target => name.to_string(),
-            SshPasswordRole::Jump => format!("{name} · jump host"),
+            SshPasswordRole::Target => {
+                format!("Target · {user}@{host}:{port}")
+            }
+            SshPasswordRole::Jump => {
+                if let Some(j) = jump {
+                    format!("Jump · {}@{}:{}", j.user, j.host, j.port)
+                } else {
+                    format!("Jump host · {}", profile.name)
+                }
+            }
         }
     }
 
@@ -648,9 +673,18 @@ impl WorkspaceView {
                     profile_id,
                     password,
                     role,
-                    remembered: _,
+                    remembered,
                 } => {
                     this.password_prompt = None;
+                    if *remembered {
+                        this.store.update(cx, |s, cx| {
+                            s.mark_ssh_password_remembered(
+                                *profile_id,
+                                matches!(role, SshPasswordRole::Jump),
+                                cx,
+                            );
+                        });
+                    }
                     match role {
                         SshPasswordRole::Target => {
                             this.password_oneshot_target = Some(password.clone());
@@ -678,7 +712,7 @@ impl WorkspaceView {
                         ) {
                             this.show_password_prompt(
                                 *profile_id,
-                                Self::password_prompt_title(&profile.name, next),
+                                Self::password_prompt_title(profile, next),
                                 next,
                                 action,
                                 window,
@@ -839,6 +873,13 @@ impl WorkspaceView {
             } => {
                 self.password_oneshot_target = None;
                 self.password_oneshot_jump = None;
+                let title = self
+                    .store
+                    .read(cx)
+                    .workspace
+                    .find_profile(profile_id)
+                    .map(|p| Self::password_prompt_title(p, role))
+                    .unwrap_or(title);
                 self.show_password_prompt(profile_id, title, role, action, window, cx);
             }
         }
@@ -895,7 +936,7 @@ impl WorkspaceView {
                 })
                 .collect()
         };
-        for (pid, label, have_session_pw) in candidates {
+        for (pid, _label, have_session_pw) in candidates {
             if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
                 if let Some(role) =
                     TabManager::ssh_password_need(&profile, false, have_session_pw)
@@ -904,7 +945,7 @@ impl WorkspaceView {
                     self.password_oneshot_jump = None;
                     self.show_password_prompt(
                         pid,
-                        Self::password_prompt_title(&label, role),
+                        Self::password_prompt_title(&profile, role),
                         role,
                         PendingPasswordAction::ReconnectTab(tab_id),
                         window,
@@ -934,7 +975,7 @@ impl WorkspaceView {
                     .map(|pid| (pid, p.label.clone(), p.session_password.is_some()))
             })
         };
-        if let Some((pid, label, have_session_pw)) = prompt {
+        if let Some((pid, _label, have_session_pw)) = prompt {
             if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
                 if let Some(role) =
                     TabManager::ssh_password_need(&profile, false, have_session_pw)
@@ -943,7 +984,7 @@ impl WorkspaceView {
                     self.password_oneshot_jump = None;
                     self.show_password_prompt(
                         pid,
-                        Self::password_prompt_title(&label, role),
+                        Self::password_prompt_title(&profile, role),
                         role,
                         PendingPasswordAction::ReconnectPane(pane_id),
                         window,
