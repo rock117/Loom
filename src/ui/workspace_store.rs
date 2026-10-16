@@ -219,6 +219,7 @@ impl WorkspaceStore {
         auth: crate::model::SshAuth,
         forwards: Vec<crate::model::PortForwardRule>,
         cwd: Option<String>,
+        jump: Option<crate::model::SshJumpHost>,
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(profile) = self.workspace.find_profile_mut(id) else {
@@ -241,6 +242,7 @@ impl WorkspaceStore {
             auth,
             docker_container,
             cwd: cwd.filter(|s| !s.trim().is_empty()),
+            jump,
         };
         profile.forwards = forwards;
         self.selection = Selection::Profile(id);
@@ -286,6 +288,7 @@ impl WorkspaceStore {
         match self.selection {
             Selection::Profile(id) => {
                 let _ = crate::session::credentials::delete_password(id);
+                let _ = crate::session::credentials::delete_jump_password(id);
                 self.workspace.remove_profile(id);
                 self.workspace.sync_orders();
                 self.selection = Selection::None;
@@ -296,6 +299,7 @@ impl WorkspaceStore {
             Selection::Group(id) => {
                 for pid in self.workspace.profile_ids_in_group(id) {
                     let _ = crate::session::credentials::delete_password(pid);
+                    let _ = crate::session::credentials::delete_jump_password(pid);
                 }
                 self.workspace.remove_group(id);
                 if self.workspace.groups.is_empty() && self.workspace.profiles.is_empty() {

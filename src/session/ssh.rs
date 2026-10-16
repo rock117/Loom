@@ -26,6 +26,15 @@ pub enum SshAuthMaterial {
     },
 }
 
+/// Jump host for ProxyJump (`ssh -J`). Connected first; target SSH rides a direct-tcpip channel.
+#[derive(Debug, Clone)]
+pub struct SshJumpParams {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuthMaterial,
+}
+
 pub struct SshConnectParams {
     pub host: String,
     pub port: u16,
@@ -36,6 +45,8 @@ pub struct SshConnectParams {
     /// When set, request a PTY then `exec` this command instead of a login shell
     /// (used for remote `docker exec -it …`).
     pub remote_command: Option<String>,
+    /// Optional one-hop jump host.
+    pub jump: Option<SshJumpParams>,
 }
 
 /// Handles returned to the UI after a successful SSH shell start.
@@ -140,6 +151,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let cols = params.cols.max(1);
     let rows = params.rows.max(1);
     let remote_command = params.remote_command.clone();
+    let jump = params.jump.clone();
 
     thread::Builder::new()
         .name("loom-ssh".into())
@@ -165,6 +177,7 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                     cols,
                     rows,
                     remote_command,
+                    jump,
                     stdin_rx,
                     stdout_tx.clone(),
                     resize_rx,
@@ -220,6 +233,7 @@ async fn run_session(
     cols: u32,
     rows: u32,
     remote_command: Option<String>,
+    jump: Option<SshJumpParams>,
     stdin_rx: Receiver<Vec<u8>>,
     stdout_tx: Sender<Vec<u8>>,
     resize_rx: Receiver<(u32, u32)>,
@@ -235,18 +249,68 @@ async fn run_session(
         ..Default::default()
     });
 
-    let handler = ClientHandler {
-        host: host.clone(),
-        port,
+    // Keep the jump Handle alive for the whole target session (direct-tcpip tunnel).
+    let mut _jump_keepalive: Option<client::Handle<ClientHandler>> = None;
+
+    let session = if let Some(jump) = jump {
+        let jump_config = Arc::clone(&config);
+        let jump_handler = ClientHandler {
+            host: jump.host.clone(),
+            port: jump.port,
+        };
+        let mut jump_session = client::connect(
+            jump_config,
+            (jump.host.as_str(), jump.port),
+            jump_handler,
+        )
+        .await
+        .with_context(|| format!("connect to jump {0}:{1}", jump.host, jump.port))?;
+
+        authenticate(&mut jump_session, &jump.user, jump.auth)
+            .await
+            .context("jump host authentication")?;
+
+        let tunnel = jump_session
+            .channel_open_direct_tcpip(
+                host.clone(),
+                u32::from(port),
+                "127.0.0.1",
+                0,
+            )
+            .await
+            .with_context(|| {
+                format!("open jump tunnel to {host}:{port} via {}:{}", jump.host, jump.port)
+            })?;
+
+        let stream = tunnel.into_stream();
+        let target_handler = ClientHandler {
+            host: host.clone(),
+            port,
+        };
+        let mut target = client::connect_stream(Arc::clone(&config), stream, target_handler)
+            .await
+            .with_context(|| format!("SSH handshake to {host}:{port} via jump"))?;
+
+        authenticate(&mut target, &user, auth)
+            .await
+            .context("target SSH authentication")?;
+
+        _jump_keepalive = Some(jump_session);
+        target
+    } else {
+        let handler = ClientHandler {
+            host: host.clone(),
+            port,
+        };
+        let mut session = client::connect(Arc::clone(&config), (host.as_str(), port), handler)
+            .await
+            .with_context(|| format!("connect to {host}:{port}"))?;
+
+        authenticate(&mut session, &user, auth)
+            .await
+            .context("SSH authentication")?;
+        session
     };
-
-    let mut session = client::connect(config, (host.as_str(), port), handler)
-        .await
-        .with_context(|| format!("connect to {host}:{port}"))?;
-
-    authenticate(&mut session, &user, auth)
-        .await
-        .context("SSH authentication")?;
 
     let mut channel = session
         .channel_open_session()

@@ -15,12 +15,13 @@ use crate::platform;
 use crate::session::credentials;
 use crate::session::forward::ForwardHandle;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
-use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams};
+use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams, SshJumpParams};
 use crate::session::wsl;
 use crate::shared::theme;
 use crate::terminal::{ColorPalette, TerminalConfig, TerminalSplitDirection, TerminalView, TerminalViewEvent};
 use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::pane_layout::{PaneLayout, RemoveResult, SplitDirection};
+use crate::ui::password_prompt::SshPasswordRole;
 use crate::ui::workspace_store::WorkspaceStore;
 
 pub struct PaneSession {
@@ -83,7 +84,11 @@ pub struct TabSession {
 #[derive(Clone, Debug)]
 pub enum SessionOpResult {
     Done,
-    NeedsPassword { profile_id: Uuid, title: String },
+    NeedsPassword {
+        profile_id: Uuid,
+        title: String,
+        role: SshPasswordRole,
+    },
 }
 
 impl TabSession {
@@ -256,16 +261,27 @@ impl TabManager {
                     Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
                 }
             }
-            ProfileKind::Ssh { .. } => match resolve_ssh_auth(profile, None) {
-                Ok(Some(auth)) => {
-                    let cwd = cwd_override
-                        .filter(|s| !s.trim().is_empty())
-                        .or_else(|| profile.kind.common_cwd());
-                    self.begin_ssh(profile, auth, font_family, cwd, cx);
+            ProfileKind::Ssh { .. } => {
+                let cwd = cwd_override
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| profile.kind.common_cwd());
+                match (
+                    resolve_ssh_auth(profile, None),
+                    resolve_jump_params(profile, None),
+                ) {
+                    (Ok(Some(auth)), Ok(jump)) => {
+                        if profile.kind.ssh_jump().is_some() && jump.is_none() {
+                            self.push_failed(profile, "jump password required".into(), cx);
+                        } else {
+                            self.begin_ssh(profile, auth, jump, font_family, cwd, cx);
+                        }
+                    }
+                    (Ok(None), _) => self.push_failed(profile, "password required".into(), cx),
+                    (Err(err), _) | (_, Err(err)) => {
+                        self.push_failed(profile, format!("{err:#}"), cx)
+                    }
                 }
-                Ok(None) => self.push_failed(profile, "password required".into(), cx),
-                Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
-            },
+            }
         }
     }
 
@@ -388,12 +404,23 @@ impl TabManager {
                     );
                 }
             }
-            ProfileKind::Ssh { .. } => match resolve_ssh_auth(profile, None) {
-                Ok(Some(auth)) => {
-                    self.begin_ssh_saved_tab(profile, layout, panes, auth, font_family, cx);
+            ProfileKind::Ssh { .. } => match (
+                resolve_ssh_auth(profile, None),
+                resolve_jump_params(profile, None),
+            ) {
+                (Ok(Some(auth)), Ok(jump)) => {
+                    if profile.kind.ssh_jump().is_some() && jump.is_none() {
+                        self.push_failed(profile, "jump password required".into(), cx);
+                    } else {
+                        self.begin_ssh_saved_tab(
+                            profile, layout, panes, auth, jump, font_family, cx,
+                        );
+                    }
                 }
-                Ok(None) => self.push_failed(profile, "password required".into(), cx),
-                Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+                (Ok(None), _) => self.push_failed(profile, "password required".into(), cx),
+                (Err(err), _) | (_, Err(err)) => {
+                    self.push_failed(profile, format!("{err:#}"), cx)
+                }
             },
         }
     }
@@ -404,6 +431,7 @@ impl TabManager {
         layout: &SavedPaneLayout,
         panes: &[PaneSnapshot],
         auth: SshAuthMaterial,
+        jump: Option<SshJumpParams>,
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
@@ -442,7 +470,7 @@ impl TabManager {
             pane_map.insert(pane_id, pane);
         }
         let Some(tree) = PaneLayout::from_saved(layout, &leaf_ids) else {
-            self.begin_ssh(profile, auth, font_family, common, cx);
+            self.begin_ssh(profile, auth, jump, font_family, common, cx);
             return;
         };
         let focused = tree.first_leaf();
@@ -473,6 +501,7 @@ impl TabManager {
                 pane_id,
                 profile,
                 auth.clone(),
+                jump.clone(),
                 font_family,
                 initial_cwd,
                 i == 0,
@@ -488,11 +517,7 @@ impl TabManager {
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
-        match resolve_ssh_auth(profile, None) {
-            Ok(Some(auth)) => self.open_ssh_authenticated(profile, auth, font_family, cx),
-            Ok(None) => self.push_failed(profile, "password required".into(), cx),
-            Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
-        }
+        self.open_ssh_with_overrides(profile, None, None, font_family, cx);
     }
 
     pub fn open_ssh_with_password(
@@ -502,41 +527,95 @@ impl TabManager {
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
-        match resolve_ssh_auth(profile, Some(password)) {
-            Ok(Some(auth)) => self.open_ssh_authenticated(profile, auth, font_family, cx),
-            Ok(None) => self.push_failed(profile, "password required".into(), cx),
-            Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
+        self.open_ssh_with_overrides(profile, Some(password), None, font_family, cx);
+    }
+
+    /// Open SSH with optional oneshot passwords (target and/or jump).
+    pub fn open_ssh_with_overrides(
+        &mut self,
+        profile: &Profile,
+        target_password: Option<String>,
+        jump_password: Option<String>,
+        font_family: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let auth = match resolve_ssh_auth(profile, target_password) {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                self.push_failed(profile, "password required".into(), cx);
+                return;
+            }
+            Err(err) => {
+                self.push_failed(profile, format!("{err:#}"), cx);
+                return;
+            }
+        };
+        let jump = match resolve_jump_params(profile, jump_password) {
+            Ok(j) => j,
+            Err(err) => {
+                self.push_failed(profile, format!("{err:#}"), cx);
+                return;
+            }
+        };
+        if profile.kind.ssh_jump().is_some() && jump.is_none() {
+            self.push_failed(profile, "jump password required".into(), cx);
+            return;
         }
+        self.open_ssh_authenticated(profile, auth, jump, font_family, cx);
     }
 
     fn open_ssh_authenticated(
         &mut self,
         profile: &Profile,
         auth: SshAuthMaterial,
+        jump: Option<SshJumpParams>,
         font_family: &str,
         cx: &mut Context<Self>,
     ) {
         if let Some((layout, panes)) = profile.saved_tab() {
-            self.begin_ssh_saved_tab(profile, layout, panes, auth, font_family, cx);
+            self.begin_ssh_saved_tab(profile, layout, panes, auth, jump, font_family, cx);
             return;
         }
         self.begin_ssh(
             profile,
             auth,
+            jump,
             font_family,
             profile.kind.common_cwd(),
             cx,
         );
     }
 
-    pub fn ssh_needs_password(profile: &Profile) -> bool {
-        matches!(
+    /// Next password still required (jump first, then target).
+    pub fn ssh_password_need(
+        profile: &Profile,
+        have_jump_oneshot: bool,
+        have_target_oneshot: bool,
+    ) -> Option<SshPasswordRole> {
+        if let Some(j) = profile.kind.ssh_jump() {
+            if matches!(j.auth, SshAuth::Password { .. })
+                && !have_jump_oneshot
+                && credentials::needs_jump_password_prompt(profile.id)
+            {
+                return Some(SshPasswordRole::Jump);
+            }
+        }
+        if matches!(
             &profile.kind,
             ProfileKind::Ssh {
                 auth: SshAuth::Password { .. },
                 ..
             }
-        ) && credentials::needs_password_prompt(profile.id)
+        ) && !have_target_oneshot
+            && credentials::needs_password_prompt(profile.id)
+        {
+            return Some(SshPasswordRole::Target);
+        }
+        None
+    }
+
+    pub fn ssh_needs_password(profile: &Profile) -> bool {
+        Self::ssh_password_need(profile, false, false).is_some()
     }
 
     fn push_failed(&mut self, profile: &Profile, message: String, cx: &mut Context<Self>) {
@@ -569,6 +648,7 @@ impl TabManager {
         &mut self,
         profile: &Profile,
         auth: SshAuthMaterial,
+        jump: Option<SshJumpParams>,
         font_family: &str,
         initial_cwd: Option<String>,
         cx: &mut Context<Self>,
@@ -611,6 +691,7 @@ impl TabManager {
             pane_id,
             profile,
             auth,
+            jump,
             font_family,
             initial_cwd,
             true,
@@ -624,6 +705,7 @@ impl TabManager {
         pane_id: Uuid,
         profile: &Profile,
         auth: SshAuthMaterial,
+        jump: Option<SshJumpParams>,
         font_family: &str,
         initial_cwd: Option<String>,
         start_profile_forwards: bool,
@@ -644,6 +726,7 @@ impl TabManager {
             pane_id,
             &profile.kind,
             auth,
+            jump,
             auto_forwards,
             font_family,
             initial_cwd,
@@ -657,6 +740,7 @@ impl TabManager {
         pane_id: Uuid,
         kind: &ProfileKind,
         auth: SshAuthMaterial,
+        jump: Option<SshJumpParams>,
         auto_forwards: Vec<crate::model::PortForwardRule>,
         font_family: &str,
         initial_cwd: Option<String>,
@@ -686,6 +770,7 @@ impl TabManager {
             cols: 80,
             rows: 24,
             remote_command,
+            jump,
         };
         let family = if font_family.trim().is_empty() {
             platform::monospace_font_family().to_string()
@@ -1172,7 +1257,7 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
-        self.split_pane_inner(pane_id, direction, store, None, window, cx)
+        self.split_pane_inner(pane_id, direction, store, None, None, window, cx)
     }
 
     pub fn split_pane_with_password(
@@ -1180,11 +1265,37 @@ impl TabManager {
         pane_id: Uuid,
         direction: SplitDirection,
         password: String,
+        role: SshPasswordRole,
         store: &Entity<WorkspaceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
-        self.split_pane_inner(pane_id, direction, store, Some(password), window, cx)
+        let (target, jump) = match role {
+            SshPasswordRole::Target => (Some(password), None),
+            SshPasswordRole::Jump => (None, Some(password)),
+        };
+        self.split_pane_with_overrides(pane_id, direction, target, jump, store, window, cx)
+    }
+
+    pub fn split_pane_with_overrides(
+        &mut self,
+        pane_id: Uuid,
+        direction: SplitDirection,
+        target_password: Option<String>,
+        jump_password: Option<String>,
+        store: &Entity<WorkspaceStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> SessionOpResult {
+        self.split_pane_inner(
+            pane_id,
+            direction,
+            store,
+            target_password,
+            jump_password,
+            window,
+            cx,
+        )
     }
 
     fn split_pane_inner(
@@ -1193,6 +1304,7 @@ impl TabManager {
         direction: SplitDirection,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
+        jump_password: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
@@ -1275,8 +1387,13 @@ impl TabManager {
                 };
                 // override → source session_password → keyring
                 let effective_password = password.or(source_password);
-                match resolve_ssh_auth(&pseudo, effective_password) {
-                    Ok(Some(auth)) => {
+                match (
+                    resolve_ssh_auth(&pseudo, effective_password),
+                    resolve_jump_params(&pseudo, jump_password),
+                ) {
+                    (Ok(Some(auth)), Ok(jump))
+                        if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
+                    {
                         let new_id = Uuid::new_v4();
                         let pane = PaneSession {
                             id: new_id,
@@ -1307,6 +1424,7 @@ impl TabManager {
                                 new_id,
                                 &kind,
                                 auth,
+                                jump,
                                 auto_forwards,
                                 &font_family,
                                 None,
@@ -1318,11 +1436,12 @@ impl TabManager {
                         }
                         SessionOpResult::Done
                     }
-                    Ok(None) => {
+                    (Ok(None), _) => {
                         if let Some(pid) = auth_profile_id {
                             SessionOpResult::NeedsPassword {
                                 profile_id: pid,
                                 title: label,
+                                role: SshPasswordRole::Target,
                             }
                         } else {
                             AppBus::emit(
@@ -1336,13 +1455,33 @@ impl TabManager {
                             SessionOpResult::Done
                         }
                     }
-                    Err(err) => {
+                    (Ok(Some(_)), Ok(None)) if pseudo.kind.ssh_jump().is_some() => {
+                        if let Some(pid) = auth_profile_id {
+                            SessionOpResult::NeedsPassword {
+                                profile_id: pid,
+                                title: label,
+                                role: SshPasswordRole::Jump,
+                            }
+                        } else {
+                            AppBus::emit(
+                                &self.app_bus,
+                                AppBusEvent::Toast(
+                                    "Split needs a saved jump password — open from sidebar or Save As… first"
+                                        .into(),
+                                ),
+                                cx,
+                            );
+                            SessionOpResult::Done
+                        }
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
                         if let Some(pane) = self.tabs[tab_idx].panes.get_mut(&pane_id) {
                             pane.status_message = format!("split failed: {err:#}");
                         }
                         cx.notify();
                         SessionOpResult::Done
                     }
+                    _ => SessionOpResult::Done,
                 }
             }
         }
@@ -1405,7 +1544,7 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.reconnect_inner(tab_id, None, store, None, Some(window), cx);
+        self.reconnect_inner(tab_id, None, store, None, None, Some(window), cx);
     }
 
     /// SSH password reconnect (no Window required — used after modal submit).
@@ -1413,10 +1552,35 @@ impl TabManager {
         &mut self,
         tab_id: Uuid,
         password: String,
+        role: SshPasswordRole,
         store: &Entity<WorkspaceStore>,
         cx: &mut Context<Self>,
     ) {
-        self.reconnect_inner(tab_id, None, store, Some(password), None, cx);
+        let (target, jump) = match role {
+            SshPasswordRole::Target => (Some(password), None),
+            SshPasswordRole::Jump => (None, Some(password)),
+        };
+        self.reconnect_with_overrides(tab_id, None, target, jump, store, cx);
+    }
+
+    pub fn reconnect_with_overrides(
+        &mut self,
+        tab_id: Uuid,
+        only_pane: Option<Uuid>,
+        target_password: Option<String>,
+        jump_password: Option<String>,
+        store: &Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reconnect_inner(
+            tab_id,
+            only_pane,
+            store,
+            target_password,
+            jump_password,
+            None,
+            cx,
+        );
     }
 
     /// Reconnect a single pane (empty / Failed split placeholder).
@@ -1435,13 +1599,29 @@ impl TabManager {
         else {
             return;
         };
-        self.reconnect_inner(tab_id, Some(pane_id), store, None, Some(window), cx);
+        self.reconnect_inner(tab_id, Some(pane_id), store, None, None, Some(window), cx);
     }
 
     pub fn reconnect_pane_with_password(
         &mut self,
         pane_id: Uuid,
         password: String,
+        role: SshPasswordRole,
+        store: &Entity<WorkspaceStore>,
+        cx: &mut Context<Self>,
+    ) {
+        let (target, jump) = match role {
+            SshPasswordRole::Target => (Some(password), None),
+            SshPasswordRole::Jump => (None, Some(password)),
+        };
+        self.reconnect_pane_with_overrides(pane_id, target, jump, store, cx);
+    }
+
+    pub fn reconnect_pane_with_overrides(
+        &mut self,
+        pane_id: Uuid,
+        target_password: Option<String>,
+        jump_password: Option<String>,
         store: &Entity<WorkspaceStore>,
         cx: &mut Context<Self>,
     ) {
@@ -1453,7 +1633,14 @@ impl TabManager {
         else {
             return;
         };
-        self.reconnect_inner(tab_id, Some(pane_id), store, Some(password), None, cx);
+        self.reconnect_with_overrides(
+            tab_id,
+            Some(pane_id),
+            target_password,
+            jump_password,
+            store,
+            cx,
+        );
     }
 
     /// Profile for a pane (Bound), used by password reconnect UI.
@@ -1469,6 +1656,7 @@ impl TabManager {
         only_pane: Option<Uuid>,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
+        jump_password: Option<String>,
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
@@ -1589,8 +1777,13 @@ impl TabManager {
                         panes: None,
                     };
                     let effective_password = password.clone().or(session_password);
-                    match resolve_ssh_auth(&pseudo, effective_password) {
-                        Ok(Some(auth)) => {
+                    match (
+                        resolve_ssh_auth(&pseudo, effective_password),
+                        resolve_jump_params(&pseudo, jump_password.clone()),
+                    ) {
+                        (Ok(Some(auth)), Ok(jump))
+                            if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
+                        {
                             if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                                 pane.profile_id = profile_id;
                                 pane.auth_profile_id =
@@ -1605,24 +1798,32 @@ impl TabManager {
                                 pane_id,
                                 &kind,
                                 auth,
+                                jump,
                                 auto_forwards,
                                 &font_family,
                                 None,
                                 cx,
                             );
                         }
-                        Ok(None) => {
+                        (Ok(None), _) => {
                             if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                                 pane.state = ConnectionState::Failed;
                                 pane.status_message = "password required".into();
                             }
                         }
-                        Err(err) => {
+                        (Ok(Some(_)), Ok(None)) if pseudo.kind.ssh_jump().is_some() => {
+                            if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
+                                pane.state = ConnectionState::Failed;
+                                pane.status_message = "jump password required".into();
+                            }
+                        }
+                        (Err(err), _) | (_, Err(err)) => {
                             if let Some(pane) = self.tabs[idx].panes.get_mut(&pane_id) {
                                 pane.state = ConnectionState::Failed;
                                 pane.status_message = format!("{err:#}");
                             }
                         }
+                        _ => {}
                     }
                 }
             }
@@ -2032,17 +2233,22 @@ impl TabManager {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
-        self.duplicate_active_ephemeral(store, None, window, cx)
+        self.duplicate_active_ephemeral(store, None, None, window, cx)
     }
 
     pub fn duplicate_active_with_password(
         &mut self,
         password: String,
+        role: SshPasswordRole,
         store: &Entity<WorkspaceStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
-        self.duplicate_active_ephemeral(store, Some(password), window, cx)
+        let (target, jump) = match role {
+            SshPasswordRole::Target => (Some(password), None),
+            SshPasswordRole::Jump => (None, Some(password)),
+        };
+        self.duplicate_active_ephemeral(store, target, jump, window, cx)
     }
 
     pub fn begin_rename_active(&mut self, _cx: &mut Context<Self>) -> Option<String> {
@@ -2292,6 +2498,7 @@ impl TabManager {
         &mut self,
         store: &Entity<WorkspaceStore>,
         password: Option<String>,
+        jump_password: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> SessionOpResult {
@@ -2352,8 +2559,13 @@ impl TabManager {
                     layout: None,
                     panes: None,
                 };
-                match resolve_ssh_auth(&pseudo, password.or(source_password)) {
-                    Ok(Some(auth)) => {
+                match (
+                    resolve_ssh_auth(&pseudo, password.or(source_password)),
+                    resolve_jump_params(&pseudo, jump_password),
+                ) {
+                    (Ok(Some(auth)), Ok(jump))
+                        if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
+                    {
                         let pane_id = Uuid::new_v4();
                         let pane = PaneSession {
                             id: pane_id,
@@ -2384,6 +2596,7 @@ impl TabManager {
                             pane_id,
                             &kind,
                             auth,
+                            jump,
                             auto_forwards,
                             &font_family,
                             None,
@@ -2391,11 +2604,12 @@ impl TabManager {
                         );
                         SessionOpResult::Done
                     }
-                    Ok(None) => {
+                    (Ok(None), _) => {
                         if let Some(pid) = auth_pid {
                             SessionOpResult::NeedsPassword {
                                 profile_id: pid,
                                 title: label,
+                                role: SshPasswordRole::Target,
                             }
                         } else {
                             AppBus::emit(
@@ -2409,10 +2623,30 @@ impl TabManager {
                             SessionOpResult::Done
                         }
                     }
-                    Err(err) => {
+                    (Ok(Some(_)), Ok(None)) if pseudo.kind.ssh_jump().is_some() => {
+                        if let Some(pid) = auth_pid {
+                            SessionOpResult::NeedsPassword {
+                                profile_id: pid,
+                                title: label,
+                                role: SshPasswordRole::Jump,
+                            }
+                        } else {
+                            AppBus::emit(
+                                &self.app_bus,
+                                AppBusEvent::Toast(
+                                    "Duplicate needs a saved jump password — open from sidebar or Save As… first"
+                                        .into(),
+                                ),
+                                cx,
+                            );
+                            SessionOpResult::Done
+                        }
+                    }
+                    (Err(err), _) | (_, Err(err)) => {
                         eprintln!("loom: duplicate SSH failed: {err:#}");
                         SessionOpResult::Done
                     }
+                    _ => SessionOpResult::Done,
                 }
             }
         }
@@ -2634,6 +2868,39 @@ fn resolve_ssh_auth(
             passphrase: None,
         })),
     }
+}
+
+/// Resolve jump-host params. `Ok(None)` means no jump, or jump password still missing
+/// (caller checks `profile.kind.ssh_jump()` to distinguish).
+fn resolve_jump_params(
+    profile: &Profile,
+    password_override: Option<String>,
+) -> anyhow::Result<Option<SshJumpParams>> {
+    let Some(j) = profile.kind.ssh_jump() else {
+        return Ok(None);
+    };
+    let auth = match &j.auth {
+        SshAuth::Password { .. } => {
+            let pw = match password_override {
+                Some(p) => Some(p),
+                None => credentials::get_jump_password(profile.id)?,
+            };
+            let Some(pw) = pw else {
+                return Ok(None);
+            };
+            SshAuthMaterial::Password(pw)
+        }
+        SshAuth::PrivateKey { path } => SshAuthMaterial::PrivateKey {
+            path: path.clone(),
+            passphrase: None,
+        },
+    };
+    Ok(Some(SshJumpParams {
+        host: j.host.clone(),
+        port: j.port,
+        user: j.user.clone(),
+        auth,
+    }))
 }
 
 fn terminal_config(

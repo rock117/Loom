@@ -21,6 +21,15 @@ fn default_true() -> bool {
     true
 }
 
+/// One SSH ProxyJump hop (`ssh -J user@jump:port`). Password stored under `ssh/{id}/jump` in the keyring.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SshJumpHost {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: SshAuth,
+}
+
 /// One leaf in a saved Tab snapshot (see `docs/PROFILE_TAB_LAYOUT.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct PaneSnapshot {
@@ -86,6 +95,9 @@ pub enum ProfileKind {
         /// Default remote (or container) cwd when no per-pane snapshot cwd is set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Optional jump host (one hop). Older workspace files omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jump: Option<SshJumpHost>,
     },
 }
 
@@ -154,12 +166,20 @@ impl ProfileKind {
                 port,
                 user,
                 docker_container,
+                jump,
                 ..
             } => {
                 if let Some(id) = docker_container.as_deref() {
                     let id = id.trim();
                     let short = if id.len() > 12 { &id[..12] } else { id };
                     format!("docker · {short} @ {user}@{host}:{port}")
+                } else if let Some(j) = jump {
+                    format!(
+                        "ssh · {user}@{host}:{port} via {juser}@{jhost}:{jport}",
+                        juser = j.user,
+                        jhost = j.host,
+                        jport = j.port
+                    )
                 } else {
                     format!("ssh · {user}@{host}:{port}")
                 }
@@ -210,6 +230,18 @@ impl ProfileKind {
 
     pub fn is_docker(&self) -> bool {
         self.is_docker_local() || self.is_docker_ssh()
+    }
+
+    /// Jump host for ProxyJump profiles.
+    pub fn ssh_jump(&self) -> Option<&SshJumpHost> {
+        match self {
+            Self::Ssh { jump: Some(j), .. }
+                if !j.host.trim().is_empty() && !j.user.trim().is_empty() =>
+            {
+                Some(j)
+            }
+            _ => None,
+        }
     }
 
     /// Container id for Docker-over-SSH profiles.
@@ -304,6 +336,7 @@ impl Profile {
                 auth: SshAuth::Password { remember: true },
                 docker_container: None,
                 cwd: None,
+                jump: None,
             },
             forwards: Vec::new(),
             layout: None,

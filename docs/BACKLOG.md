@@ -13,7 +13,7 @@ Active / near-term work stays in `ARCHITECTURE.md` → Implementation progress. 
 
 | ID | Idea | Notes |
 |----|------|--------|
-| P1 | **SSH / bastion** | **MVP shipped** (russh + keyring passwords + TOFU known_hosts). Still open: jump hosts, agent, key passphrase UI, nicer host-key change flow. |
+| P1 | **SSH / bastion** | **MVP shipped** (russh + keyring passwords + TOFU known_hosts). **One-hop ProxyJump shipped** — [SSH_JUMP.md](./SSH_JUMP.md). Still open: multi-hop chains, agent, key passphrase UI, nicer host-key change flow. |
 | P1b | **Docker session** | Phase 1 done — icon picker Local\|SSH UI; local `docker exec`. Files/`docker cp` + remote SSH Docker still TODO. Spec: [DOCKER_SESSION.md](./DOCKER_SESSION.md). |
 | P1c | **SSH port forwarding** | Spec only — [PORT_FORWARD.md](./PORT_FORWARD.md). Local / Remote / SOCKS on the same russh session as shell+SFTP. **Enhancement, not core.** **Do not implement** until explicitly ordered. Phases: Local → Remote → SOCKS. |
 | P2 | **Session templates** | One action opens a defined set of tabs (e.g. API + DB + logs). |

@@ -17,6 +17,7 @@ For **Zed 主题机制研究**（对照用，勿拷 GPL 源码）, see [ZED_THEM
 For **壳内 `loom …` 元命令 / 批处理 / 指令组合**（中文需求草案，尚未实现）, see [LOOM_CLI.md](./LOOM_CLI.md).  
 For **插件系统（扩展点 / Lua 沙箱 / 隔离与诊断）**（中文规格，尚未实现）, see [PLUGINS.md](./PLUGINS.md).  
 For **SSH/PTY 断线检测与手动重连**（已实现，中文说明）, see [SESSION_RECONNECT.md](./SESSION_RECONNECT.md).  
+For **SSH ProxyJump（一跳 bastion）**（已实现）, see [SSH_JUMP.md](./SSH_JUMP.md).  
 For **PTY 高吞吐输出合并 notify**（已实现，不丢字节）, see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md).  
 For **终端 ANSI 配色预设**（已实现；默认 Default 不变）, see [TERMINAL_ANSI_PALETTE.md](./TERMINAL_ANSI_PALETTE.md).  
 For **终端反色 / 光标可见性（Agent CLI 等）**（已修复，中文说明）, see [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md).  

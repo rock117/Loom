@@ -8,12 +8,24 @@ use crate::session::credentials;
 use crate::shared::theme;
 use crate::ui::rename_edit::typed_text_from_keystroke;
 
+/// Which SSH password the modal is collecting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshPasswordRole {
+    /// Target host (`ssh/{id}` keyring).
+    Target,
+    /// ProxyJump hop (`ssh/{id}/jump` keyring).
+    Jump,
+}
+
 #[derive(Clone, Debug)]
 pub enum PasswordPromptEvent {
     Cancel,
     Submit {
         profile_id: Uuid,
         password: String,
+        role: SshPasswordRole,
+        /// True when the password was written to the OS keyring.
+        remembered: bool,
     },
 }
 
@@ -21,17 +33,24 @@ pub struct PasswordPrompt {
     focus_handle: FocusHandle,
     pub profile_id: Uuid,
     pub title: String,
+    pub role: SshPasswordRole,
     password: String,
     remember: bool,
     error: Option<String>,
 }
 
 impl PasswordPrompt {
-    pub fn new(profile_id: Uuid, title: impl Into<String>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        profile_id: Uuid,
+        title: impl Into<String>,
+        role: SshPasswordRole,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
             profile_id,
             title: title.into(),
+            role,
             password: String::new(),
             remember: true,
             error: None,
@@ -95,7 +114,15 @@ impl PasswordPrompt {
             return;
         }
         if self.remember {
-            if let Err(err) = credentials::set_password(self.profile_id, &self.password) {
+            let store_result = match self.role {
+                SshPasswordRole::Target => {
+                    credentials::set_password(self.profile_id, &self.password)
+                }
+                SshPasswordRole::Jump => {
+                    credentials::set_jump_password(self.profile_id, &self.password)
+                }
+            };
+            if let Err(err) = store_result {
                 self.error = Some(format!("Could not store password: {err:#}"));
                 cx.notify();
                 return;
@@ -104,6 +131,8 @@ impl PasswordPrompt {
         cx.emit(PasswordPromptEvent::Submit {
             profile_id: self.profile_id,
             password: self.password.clone(),
+            role: self.role,
+            remembered: self.remember,
         });
     }
 }
@@ -123,6 +152,10 @@ impl Render for PasswordPrompt {
         };
         let err = self.error.clone();
         let title = self.title.clone();
+        let heading = match self.role {
+            SshPasswordRole::Target => "SSH password",
+            SshPasswordRole::Jump => "Jump host password",
+        };
 
         div()
             .id("ssh-password-overlay")
@@ -201,7 +234,7 @@ impl Render for PasswordPrompt {
                             .text_lg()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::TEXT)
-                            .child("SSH password"),
+                            .child(heading),
                     )
                     .child(
                         div()

@@ -151,14 +151,30 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// Full `ssh … user@host` line ready to paste into another terminal.
+///
+/// `jump` is `(user, host, port)` for `ssh -J` (one hop).
 pub fn format_open_ssh_command(
     user: &str,
     host: &str,
     port: u16,
     identity_file: Option<&Path>,
     forward_flags: impl IntoIterator<Item = impl AsRef<str>>,
+    jump: Option<(&str, &str, u16)>,
 ) -> String {
     let mut parts: Vec<String> = vec!["ssh".into()];
+    if let Some((juser, jhost, jport)) = jump {
+        let juser = juser.trim();
+        let jhost = jhost.trim();
+        if !jhost.is_empty() {
+            let spec = if juser.is_empty() {
+                format!("{jhost}:{jport}")
+            } else {
+                format!("{juser}@{jhost}:{jport}")
+            };
+            parts.push("-J".into());
+            parts.push(spec);
+        }
+    }
     for flag in forward_flags {
         let f = flag.as_ref().trim();
         if !f.is_empty() {

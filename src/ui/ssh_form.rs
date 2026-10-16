@@ -7,7 +7,7 @@ use gpui::*;
 use uuid::Uuid;
 
 use crate::model::{
-    PortForwardRule, Profile, ProfileKind, SshAuth, format_open_ssh_command,
+    PortForwardRule, Profile, ProfileKind, SshAuth, SshJumpHost, format_open_ssh_command,
     suggest_free_bind_port,
 };
 use crate::session::credentials;
@@ -52,6 +52,17 @@ pub struct SshForm {
     /// When true, password field shows plaintext instead of bullets.
     password_visible: bool,
     remember: bool,
+    /// Optional ProxyJump hop (`ssh -J`).
+    jump_enabled: bool,
+    jump_host: RenameEdit,
+    jump_port: RenameEdit,
+    jump_user: RenameEdit,
+    jump_password: RenameEdit,
+    jump_key_path: RenameEdit,
+    jump_use_private_key: bool,
+    jump_remember: bool,
+    has_stored_jump_password: bool,
+    jump_password_visible: bool,
     /// Persistent Local forward rules for this SSH profile.
     forwards: Vec<PortForwardRule>,
     forwards_open: bool,
@@ -66,7 +77,7 @@ pub struct SshForm {
     field: Field,
     /// Mouse-drag text selection in the active field.
     selecting: bool,
-    field_bounds: [Option<Bounds<Pixels>>; 7],
+    field_bounds: [Option<Bounds<Pixels>>; 12],
     /// Bounds of the focused port-forward inline field (IME candidate window).
     forward_ime_bounds: Option<Bounds<Pixels>>,
     _caret_blink: Option<Task<()>>,
@@ -103,6 +114,11 @@ enum Field {
     RemoteCwd,
     Password,
     KeyPath,
+    JumpHost,
+    JumpPort,
+    JumpUser,
+    JumpPassword,
+    JumpKeyPath,
 }
 
 impl SshForm {
@@ -122,6 +138,16 @@ impl SshForm {
             has_stored_password: false,
             password_visible: false,
             remember: true,
+            jump_enabled: false,
+            jump_host: field_edit(""),
+            jump_port: field_edit("22"),
+            jump_user: field_edit(""),
+            jump_password: field_edit(""),
+            jump_key_path: field_edit(""),
+            jump_use_private_key: false,
+            jump_remember: true,
+            has_stored_jump_password: false,
+            jump_password_visible: false,
             forwards: Vec::new(),
             forwards_open: false,
             forward_edit: None,
@@ -131,7 +157,7 @@ impl SshForm {
             error: None,
             field: Field::Host,
             selecting: false,
-            field_bounds: [None; 7],
+            field_bounds: [None; 12],
             forward_ime_bounds: None,
             _caret_blink: None,
         };
@@ -153,6 +179,16 @@ impl SshForm {
         self.has_stored_password = false;
         self.password_visible = false;
         self.remember = true;
+        self.jump_enabled = false;
+        self.jump_host = field_edit("");
+        self.jump_port = field_edit("22");
+        self.jump_user = field_edit("");
+        self.jump_password = field_edit("");
+        self.jump_key_path = field_edit("");
+        self.jump_use_private_key = false;
+        self.jump_remember = true;
+        self.has_stored_jump_password = false;
+        self.jump_password_visible = false;
         self.forwards.clear();
         self.forwards_open = false;
         self.forward_edit = None;
@@ -186,6 +222,7 @@ impl SshForm {
             user,
             auth,
             cwd,
+            jump,
             ..
         } = profile.kind
         else {
@@ -223,6 +260,44 @@ impl SshForm {
                 self.has_stored_password = false;
             }
         }
+        match jump {
+            Some(j) => {
+                self.jump_enabled = true;
+                self.jump_host = field_edit(j.host);
+                self.jump_port = field_edit(j.port.to_string());
+                self.jump_user = field_edit(j.user);
+                self.jump_password = field_edit("");
+                match j.auth {
+                    SshAuth::Password { remember } => {
+                        self.jump_use_private_key = false;
+                        self.jump_remember = remember;
+                        self.jump_key_path = field_edit("");
+                        self.has_stored_jump_password = credentials::get_jump_password(profile_id)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                    }
+                    SshAuth::PrivateKey { path } => {
+                        self.jump_use_private_key = true;
+                        self.jump_remember = false;
+                        self.jump_key_path = field_edit(path.display().to_string());
+                        self.has_stored_jump_password = false;
+                    }
+                }
+            }
+            None => {
+                self.jump_enabled = false;
+                self.jump_host = field_edit("");
+                self.jump_port = field_edit("22");
+                self.jump_user = field_edit("");
+                self.jump_password = field_edit("");
+                self.jump_key_path = field_edit("");
+                self.jump_use_private_key = false;
+                self.jump_remember = true;
+                self.has_stored_jump_password = false;
+            }
+        }
+        self.jump_password_visible = false;
         self.field = Field::Host;
         self.selecting = false;
         self.start_caret_blink(cx);
@@ -246,6 +321,7 @@ impl SshForm {
             port,
             user,
             auth,
+            jump,
             ..
         } = kind
         else {
@@ -301,6 +377,26 @@ impl SshForm {
                 self.remember = false;
                 self.key_path = field_edit(path.display().to_string());
                 self.password = field_edit("");
+            }
+        }
+        if let Some(j) = jump {
+            self.jump_enabled = true;
+            self.jump_host = field_edit(j.host);
+            self.jump_port = field_edit(j.port.to_string());
+            self.jump_user = field_edit(j.user);
+            match j.auth {
+                SshAuth::Password { remember } => {
+                    self.jump_use_private_key = false;
+                    self.jump_remember = remember;
+                    self.jump_key_path = field_edit("");
+                    self.jump_password = field_edit("");
+                }
+                SshAuth::PrivateKey { path } => {
+                    self.jump_use_private_key = true;
+                    self.jump_remember = false;
+                    self.jump_key_path = field_edit(path.display().to_string());
+                    self.jump_password = field_edit("");
+                }
             }
         }
         self.field = Field::Name;
@@ -401,6 +497,11 @@ impl SshForm {
             Field::RemoteCwd => &self.remote_cwd,
             Field::Password => &self.password,
             Field::KeyPath => &self.key_path,
+            Field::JumpHost => &self.jump_host,
+            Field::JumpPort => &self.jump_port,
+            Field::JumpUser => &self.jump_user,
+            Field::JumpPassword => &self.jump_password,
+            Field::JumpKeyPath => &self.jump_key_path,
         }
     }
 
@@ -422,6 +523,11 @@ impl SshForm {
             Field::RemoteCwd => &mut self.remote_cwd,
             Field::Password => &mut self.password,
             Field::KeyPath => &mut self.key_path,
+            Field::JumpHost => &mut self.jump_host,
+            Field::JumpPort => &mut self.jump_port,
+            Field::JumpUser => &mut self.jump_user,
+            Field::JumpPassword => &mut self.jump_password,
+            Field::JumpKeyPath => &mut self.jump_key_path,
         }
     }
 
@@ -443,6 +549,11 @@ impl SshForm {
             Field::RemoteCwd => &self.remote_cwd,
             Field::Password => &self.password,
             Field::KeyPath => &self.key_path,
+            Field::JumpHost => &self.jump_host,
+            Field::JumpPort => &self.jump_port,
+            Field::JumpUser => &self.jump_user,
+            Field::JumpPassword => &self.jump_password,
+            Field::JumpKeyPath => &self.jump_key_path,
         }
     }
 
@@ -537,24 +648,35 @@ impl SshForm {
     }
 
     fn cycle_field(&mut self) {
-        self.field = if self.use_private_key {
-            match self.field {
-                Field::Name => Field::Host,
-                Field::Host => Field::Port,
-                Field::Port => Field::User,
-                Field::User => Field::RemoteCwd,
-                Field::RemoteCwd => Field::KeyPath,
-                Field::KeyPath | Field::Password => Field::Name,
+        self.field = match self.field {
+            Field::Name => Field::Host,
+            Field::Host => Field::Port,
+            Field::Port => Field::User,
+            Field::User => Field::RemoteCwd,
+            Field::RemoteCwd => {
+                if self.use_private_key {
+                    Field::KeyPath
+                } else {
+                    Field::Password
+                }
             }
-        } else {
-            match self.field {
-                Field::Name => Field::Host,
-                Field::Host => Field::Port,
-                Field::Port => Field::User,
-                Field::User => Field::RemoteCwd,
-                Field::RemoteCwd => Field::Password,
-                Field::Password | Field::KeyPath => Field::Name,
+            Field::Password | Field::KeyPath => {
+                if self.jump_enabled {
+                    Field::JumpHost
+                } else {
+                    Field::Name
+                }
             }
+            Field::JumpHost => Field::JumpPort,
+            Field::JumpPort => Field::JumpUser,
+            Field::JumpUser => {
+                if self.jump_use_private_key {
+                    Field::JumpKeyPath
+                } else {
+                    Field::JumpPassword
+                }
+            }
+            Field::JumpPassword | Field::JumpKeyPath => Field::Name,
         };
         self.active_edit_mut().move_end(false);
     }
@@ -646,6 +768,74 @@ impl SshForm {
             )
         };
 
+        let jump = if self.jump_enabled {
+            let jhost = self.jump_host.text.trim().to_string();
+            let juser = self.jump_user.text.trim().to_string();
+            if jhost.is_empty() || juser.is_empty() {
+                self.error = Some("Jump host and user are required when Jump is enabled".into());
+                cx.notify();
+                return;
+            }
+            let jport: u16 = match self.jump_port.text.trim().parse() {
+                Ok(0) | Err(_) => {
+                    self.error = Some("Jump port must be 1–65535".into());
+                    cx.notify();
+                    return;
+                }
+                Ok(p) => p,
+            };
+            let jauth = if self.jump_use_private_key {
+                let path = self.jump_key_path.text.trim().to_string();
+                if path.is_empty() {
+                    self.error = Some("Jump private key path is required".into());
+                    cx.notify();
+                    return;
+                }
+                let _ = credentials::delete_jump_password(id);
+                SshAuth::PrivateKey {
+                    path: PathBuf::from(path),
+                }
+            } else {
+                if self.jump_password.text.is_empty() {
+                    if creating || !self.has_stored_jump_password {
+                        self.error = Some(
+                            "Jump password is required (saved to OS keyring if Remember is on)"
+                                .into(),
+                        );
+                        cx.notify();
+                        return;
+                    }
+                }
+                if !self.jump_password.text.is_empty() {
+                    if self.jump_remember {
+                        if let Err(err) =
+                            credentials::set_jump_password(id, &self.jump_password.text)
+                        {
+                            self.error = Some(format!("Could not store jump password: {err:#}"));
+                            cx.notify();
+                            return;
+                        }
+                    } else {
+                        let _ = credentials::delete_jump_password(id);
+                    }
+                } else if !self.jump_remember {
+                    let _ = credentials::delete_jump_password(id);
+                }
+                SshAuth::Password {
+                    remember: self.jump_remember,
+                }
+            };
+            Some(SshJumpHost {
+                host: jhost,
+                port: jport,
+                user: juser,
+                auth: jauth,
+            })
+        } else {
+            let _ = credentials::delete_jump_password(id);
+            None
+        };
+
         let remote_cwd = {
             let t = self.remote_cwd.text.trim();
             if t.is_empty() {
@@ -666,6 +856,7 @@ impl SshForm {
                     auth,
                     docker_container: None,
                     cwd: remote_cwd,
+                    jump,
                 },
                 forwards: self.forwards.clone(),
                 layout: None,
@@ -674,6 +865,9 @@ impl SshForm {
             let ok = self.store.update(cx, |s, cx| s.add_ssh_profile(profile, cx));
             if !ok && self.remember && !self.use_private_key {
                 let _ = credentials::delete_password(id);
+            }
+            if !ok {
+                let _ = credentials::delete_jump_password(id);
             }
             ok
         } else {
@@ -687,6 +881,7 @@ impl SshForm {
                     auth,
                     self.forwards.clone(),
                     remote_cwd,
+                    jump,
                     cx,
                 )
             })
@@ -839,6 +1034,208 @@ impl SshForm {
         (user, host, port, identity)
     }
 
+    fn render_jump_section(
+        &self,
+        pass_label: &'static str,
+        pass_hint: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id("ssh-jump-toggle")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::TEXT)
+                            .child(if self.jump_enabled {
+                                "☑ Jump host (ProxyJump)"
+                            } else {
+                                "☐ Jump host (ProxyJump)"
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.jump_enabled = !this.jump_enabled;
+                        if this.jump_enabled {
+                            this.focus_field(Field::JumpHost, window, cx);
+                        }
+                        cx.notify();
+                    })),
+            )
+            .when(self.jump_enabled, |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_MUTED)
+                        .child("Connect via bastion first (one hop, like ssh -J)"),
+                )
+                .child(self.field_row(
+                    "ssh-jump-host",
+                    "Jump host",
+                    Field::JumpHost,
+                    &self.jump_host,
+                    self.field == Field::JumpHost,
+                    false,
+                    "…",
+                    cx,
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div().id("f-jport").flex_1().child(self.field_row(
+                                "ssh-jump-port",
+                                "Jump port",
+                                Field::JumpPort,
+                                &self.jump_port,
+                                self.field == Field::JumpPort,
+                                false,
+                                "…",
+                                cx,
+                            )),
+                        )
+                        .child(
+                            div().id("f-juser").flex_1().child(self.field_row(
+                                "ssh-jump-user",
+                                "Jump user",
+                                Field::JumpUser,
+                                &self.jump_user,
+                                self.field == Field::JumpUser,
+                                false,
+                                "…",
+                                cx,
+                            )),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            div()
+                                .id("ssh-jump-auth-pw-btn")
+                                .flex_1()
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(!self.jump_use_private_key, |d| d.bg(theme::ACCENT))
+                                .when(self.jump_use_private_key, |d| {
+                                    d.bg(theme::ELEVATED).hover(|s| s.bg(theme::HOVER))
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(if !self.jump_use_private_key {
+                                            Hsla {
+                                                h: 0.0,
+                                                s: 0.0,
+                                                l: 1.0,
+                                                a: 1.0,
+                                            }
+                                        } else {
+                                            theme::TEXT
+                                        })
+                                        .child("Password"),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.jump_use_private_key = false;
+                                    this.focus_field(Field::JumpPassword, window, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("ssh-jump-auth-key-btn")
+                                .flex_1()
+                                .px(px(theme::SPACE_2))
+                                .py(px(theme::SPACE_1))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .cursor_pointer()
+                                .when(self.jump_use_private_key, |d| d.bg(theme::ACCENT))
+                                .when(!self.jump_use_private_key, |d| {
+                                    d.bg(theme::ELEVATED).hover(|s| s.bg(theme::HOVER))
+                                })
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(if self.jump_use_private_key {
+                                            Hsla {
+                                                h: 0.0,
+                                                s: 0.0,
+                                                l: 1.0,
+                                                a: 1.0,
+                                            }
+                                        } else {
+                                            theme::TEXT
+                                        })
+                                        .child("Private key"),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.jump_use_private_key = true;
+                                    this.focus_field(Field::JumpKeyPath, window, cx);
+                                })),
+                        ),
+                )
+                .when(!self.jump_use_private_key, |d| {
+                    d.child(self.password_field_row(
+                        "ssh-jump-pass",
+                        pass_label,
+                        Field::JumpPassword,
+                        &self.jump_password,
+                        self.field == Field::JumpPassword,
+                        pass_hint,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .id("ssh-jump-remember")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme::TEXT)
+                                    .child(if self.jump_remember {
+                                        "☑ Remember jump password (OS keyring)"
+                                    } else {
+                                        "☐ Remember jump password (OS keyring)"
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.jump_remember = !this.jump_remember;
+                                cx.notify();
+                            })),
+                    )
+                })
+                .when(self.jump_use_private_key, |d| {
+                    d.child(self.field_row(
+                        "ssh-jump-key",
+                        "Jump private key path",
+                        Field::JumpKeyPath,
+                        &self.jump_key_path,
+                        self.field == Field::JumpKeyPath,
+                        false,
+                        "C:\\Users\\…\\.ssh\\id_ed25519",
+                        cx,
+                    ))
+                })
+            })
+    }
+
     fn copy_open_ssh_for_rules(
         &mut self,
         rules: &[&PortForwardRule],
@@ -854,12 +1251,25 @@ impl SshForm {
             return;
         }
         let flags: Vec<String> = rules.iter().map(|r| r.open_ssh_flag()).collect();
+        let jump = if self.jump_enabled {
+            let jh = self.jump_host.text.trim();
+            let ju = self.jump_user.text.trim();
+            if !jh.is_empty() && !ju.is_empty() {
+                let jp = self.jump_port.text.trim().parse::<u16>().unwrap_or(22);
+                Some((ju.to_string(), jh.to_string(), jp))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let cmd = format_open_ssh_command(
             &user,
             &host,
             port,
             identity.as_deref(),
             &flags,
+            jump.as_ref().map(|(u, h, p)| (u.as_str(), h.as_str(), *p)),
         );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
         self.fwd_copy_flash = Some(flash);
@@ -1460,18 +1870,23 @@ impl SshForm {
         &self,
         id: &'static str,
         label: &'static str,
+        field: Field,
         edit: &RenameEdit,
         active: bool,
         empty_hint: &str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let visible = match field {
+            Field::JumpPassword => self.jump_password_visible,
+            _ => self.password_visible,
+        };
         self.field_row_inner(
             id,
             label,
-            Field::Password,
+            field,
             edit,
             active,
-            !self.password_visible,
+            !visible,
             empty_hint,
             true,
             cx,
@@ -1493,7 +1908,11 @@ impl SshForm {
         let show_hint = edit.text.is_empty() && !active;
         let view = cx.entity();
         let fi = field_idx(field);
-        let reveal_on = with_reveal && self.password_visible;
+        let reveal_on = with_reveal
+            && match field {
+                Field::JumpPassword => self.jump_password_visible,
+                _ => self.password_visible,
+            };
         div()
             .id(id)
             .flex()
@@ -1620,8 +2039,8 @@ impl SshForm {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _, window, cx| {
-                                        this.toggle_password_visible(window, cx);
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.toggle_password_visible(field, window, cx);
                                         cx.stop_propagation();
                                     }),
                                 )
@@ -1633,24 +2052,45 @@ impl SshForm {
             )
     }
 
-    fn toggle_password_visible(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_password_visible(
+        &mut self,
+        field: Field,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.selecting = false;
-        self.password_visible = !self.password_visible;
-
-        if self.password_visible {
-            // Edit mode keeps the field empty ("blank = keep saved") and only shows a
-            // bullet hint — load the keyring value so reveal actually shows plaintext.
-            if self.password.text.is_empty() {
-                if let Some(pid) = self.editing {
-                    if let Ok(Some(pw)) = credentials::get_password(pid) {
-                        self.password = field_edit(pw);
-                        self.has_stored_password = true;
+        if field == Field::JumpPassword {
+            self.jump_password_visible = !self.jump_password_visible;
+            if self.jump_password_visible {
+                if self.jump_password.text.is_empty() {
+                    if let Some(pid) = self.editing {
+                        if let Ok(Some(pw)) = credentials::get_jump_password(pid) {
+                            self.jump_password = field_edit(pw);
+                            self.has_stored_jump_password = true;
+                        }
                     }
                 }
+                self.field = Field::JumpPassword;
+                self.jump_password.move_end(false);
+                self.jump_password.caret_visible = true;
             }
-            self.field = Field::Password;
-            self.password.move_end(false);
-            self.password.caret_visible = true;
+        } else {
+            self.password_visible = !self.password_visible;
+            if self.password_visible {
+                // Edit mode keeps the field empty ("blank = keep saved") and only shows a
+                // bullet hint — load the keyring value so reveal actually shows plaintext.
+                if self.password.text.is_empty() {
+                    if let Some(pid) = self.editing {
+                        if let Ok(Some(pw)) = credentials::get_password(pid) {
+                            self.password = field_edit(pw);
+                            self.has_stored_password = true;
+                        }
+                    }
+                }
+                self.field = Field::Password;
+                self.password.move_end(false);
+                self.password.caret_visible = true;
+            }
         }
 
         self.focus_handle.focus(window);
@@ -1681,6 +2121,11 @@ fn field_idx(field: Field) -> usize {
         Field::RemoteCwd => 4,
         Field::Password => 5,
         Field::KeyPath => 6,
+        Field::JumpHost => 7,
+        Field::JumpPort => 8,
+        Field::JumpUser => 9,
+        Field::JumpPassword => 10,
+        Field::JumpKeyPath => 11,
     }
 }
 
@@ -1843,6 +2288,17 @@ impl Render for SshForm {
         } else {
             "…"
         };
+        let pass_label_jump = if editing && self.has_stored_jump_password {
+            "Jump password (blank = keep saved)"
+        } else {
+            "Jump password"
+        };
+        let pass_hint_jump = if editing && self.has_stored_jump_password && !self.jump_password_visible
+        {
+            "••••••••"
+        } else {
+            "…"
+        };
 
         div()
             .id("ssh-form-overlay")
@@ -1868,7 +2324,7 @@ impl Render for SshForm {
             .child(
                 div()
                     .id("ssh-form-card")
-                    .w(px(420.0))
+                    .w(px(440.0))
                     .p_5()
                     .rounded(px(8.0))
                     .bg(theme::PANEL_BG)
@@ -2068,6 +2524,7 @@ impl Render for SshForm {
                         d.child(self.password_field_row(
                             "ssh-pass",
                             pass_label,
+                            Field::Password,
                             &self.password,
                             self.field == Field::Password,
                             pass_hint,
@@ -2108,6 +2565,7 @@ impl Render for SshForm {
                             cx,
                         ))
                     })
+                    .child(self.render_jump_section(pass_label_jump, pass_hint_jump, cx))
                     .child(self.render_forwards_section(cx))
                     .when_some(err, |d, msg| {
                         d.child(

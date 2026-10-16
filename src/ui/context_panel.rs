@@ -6185,12 +6185,14 @@ impl ContextPanel {
             cx.emit(ContextPanelEvent::Toast("No forwards to copy".into()));
             return;
         }
+        let jump = self.focused_ssh_jump(cx);
         let cmd = format_open_ssh_command(
             &user,
             &host,
             port,
             identity.as_deref(),
             &flags,
+            jump.as_ref().map(|(u, h, p)| (u.as_str(), h.as_str(), *p)),
         );
         cx.write_to_clipboard(ClipboardItem::new_string(cmd));
         let flash = match only_id {
@@ -6235,6 +6237,12 @@ impl ContextPanel {
             }
             ProfileKind::Local { .. } => None,
         }
+    }
+
+    fn focused_ssh_jump(&self, cx: &App) -> Option<(String, String, u16)> {
+        let pane = self.tabs.read(cx).active_tab()?.focused_pane()?;
+        let j = pane.kind.ssh_jump()?;
+        Some((j.user.clone(), j.host.clone(), j.port))
     }
 
     fn retry_forward(&mut self, id: Uuid, cx: &mut Context<Self>) {

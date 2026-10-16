@@ -13,13 +13,22 @@ fn entry(profile_id: Uuid) -> Result<Entry> {
         .context("open credential entry")
 }
 
-pub fn get_password(profile_id: Uuid) -> Result<Option<String>> {
-    match entry(profile_id)?.get_password() {
+fn jump_entry(profile_id: Uuid) -> Result<Entry> {
+    Entry::new("loom", &format!("ssh/{profile_id}/jump"))
+        .context("open jump credential entry")
+}
+
+fn read_password(entry: Entry, what: &str) -> Result<Option<String>> {
+    match entry.get_password() {
         Ok(p) if !p.is_empty() => Ok(Some(p)),
         Ok(_) => Ok(None),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(err) => Err(err).context("read stored SSH password"),
+        Err(err) => Err(err).context(format!("read stored {what} password")),
     }
+}
+
+pub fn get_password(profile_id: Uuid) -> Result<Option<String>> {
+    read_password(entry(profile_id)?, "SSH")
 }
 
 pub fn set_password(profile_id: Uuid, password: &str) -> Result<()> {
@@ -36,6 +45,24 @@ pub fn delete_password(profile_id: Uuid) -> Result<()> {
     }
 }
 
+pub fn get_jump_password(profile_id: Uuid) -> Result<Option<String>> {
+    read_password(jump_entry(profile_id)?, "jump")
+}
+
+pub fn set_jump_password(profile_id: Uuid, password: &str) -> Result<()> {
+    jump_entry(profile_id)?
+        .set_password(password)
+        .context("store jump SSH password")
+}
+
+pub fn delete_jump_password(profile_id: Uuid) -> Result<()> {
+    match jump_entry(profile_id)?.delete_credential() {
+        Ok(()) => Ok(()),
+        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err).context("delete jump SSH password"),
+    }
+}
+
 /// True when this profile needs an interactive password prompt.
 pub fn needs_password_prompt(profile_id: Uuid) -> bool {
     match get_password(profile_id) {
@@ -43,6 +70,17 @@ pub fn needs_password_prompt(profile_id: Uuid) -> bool {
         Ok(Some(_)) => false,
         Err(err) => {
             eprintln!("loom: keyring read failed ({err:#}); prompting for password");
+            true
+        }
+    }
+}
+
+pub fn needs_jump_password_prompt(profile_id: Uuid) -> bool {
+    match get_jump_password(profile_id) {
+        Ok(None) => true,
+        Ok(Some(_)) => false,
+        Err(err) => {
+            eprintln!("loom: jump keyring read failed ({err:#}); prompting for password");
             true
         }
     }

@@ -290,6 +290,7 @@ pub fn new_ssh_docker_profile(
             auth,
             docker_container: Some(container_id.trim().to_string()),
             cwd: None,
+            jump: None,
         },
         forwards: Vec::new(),
         layout: None,

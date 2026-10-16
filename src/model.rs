@@ -16,6 +16,7 @@ pub use persist::{
 };
 pub use profile::{
     ConnectionState, PaneSnapshot, Profile, ProfileKind, SavedPaneLayout, SavedSplitAxis, SshAuth,
+    SshJumpHost,
 };
 pub use snippets::{Snippet, SnippetsFile};
 pub use workspace::{
