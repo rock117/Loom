@@ -268,7 +268,14 @@ async fn run_session(
 
         authenticate(&mut jump_session, &jump.user, jump.auth)
             .await
-            .context("jump host authentication")?;
+            .with_context(|| {
+                format!(
+                    "jump host authentication ({user}@{host}:{port})",
+                    user = jump.user,
+                    host = jump.host,
+                    port = jump.port
+                )
+            })?;
 
         let tunnel = jump_session
             .channel_open_direct_tcpip(
@@ -293,7 +300,7 @@ async fn run_session(
 
         authenticate(&mut target, &user, auth)
             .await
-            .context("target SSH authentication")?;
+            .with_context(|| format!("target SSH authentication ({user}@{host}:{port})"))?;
 
         _jump_keepalive = Some(jump_session);
         target
@@ -407,49 +414,71 @@ async fn run_session(
     Ok(())
 }
 
+/// Fill keyboard-interactive answers. Prefer secret (`!echo`) prompts — OpenSSH
+/// behavior — so Chinese prompts like「密码」still get the password (unlike a
+/// naive English `"password"` substring check).
+fn kbd_int_answers(prompts: &[client::Prompt], password: &str) -> Vec<String> {
+    prompts
+        .iter()
+        .map(|p| {
+            let pl = p.prompt.to_lowercase();
+            if !p.echo
+                || pl.contains("password")
+                || p.prompt.contains('密')
+                || pl.contains("passphrase")
+            {
+                password.to_string()
+            } else {
+                String::new()
+            }
+        })
+        .collect()
+}
+
 async fn authenticate(
     session: &mut client::Handle<ClientHandler>,
     user: &str,
     auth: SshAuthMaterial,
 ) -> Result<()> {
+    let user = user.trim();
     match auth {
         SshAuthMaterial::Password(password) => {
+            let password = password.trim_end_matches(['\r', '\n']).to_string();
             let res = session
                 .authenticate_password(user, password.clone())
                 .await
-                .context("password auth")?;
-            if !res.success() {
-                // Some servers want keyboard-interactive instead.
-                let kbd = session
-                    .authenticate_keyboard_interactive_start(user, None)
-                    .await;
-                if let Ok(mut response) = kbd {
-                    loop {
-                        match response {
-                            KeyboardInteractiveAuthResponse::Success => break,
-                            KeyboardInteractiveAuthResponse::Failure { .. } => {
-                                bail!("authentication failed");
-                            }
-                            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                                let answers: Vec<String> = prompts
-                                    .iter()
-                                    .map(|p| {
-                                        if p.prompt.to_lowercase().contains("password") {
-                                            password.clone()
-                                        } else {
-                                            String::new()
-                                        }
-                                    })
-                                    .collect();
-                                response = session
-                                    .authenticate_keyboard_interactive_respond(answers)
-                                    .await
-                                    .context("keyboard-interactive")?;
-                            }
-                        }
+                .with_context(|| format!("password auth for {user} (password: {password:?})"))?;
+            if res.success() {
+                return Ok(());
+            }
+            // Many bastions offer keyboard-interactive (often with非英文 prompts).
+            let mut response = session
+                .authenticate_keyboard_interactive_start(user, None)
+                .await
+                .with_context(|| {
+                    format!("keyboard-interactive start for {user} (password: {password:?})")
+                })?;
+            loop {
+                match response {
+                    KeyboardInteractiveAuthResponse::Success => break,
+                    KeyboardInteractiveAuthResponse::Failure { .. } => {
+                        // Show the password that was tried so the user can verify
+                        // keyring / form / prompt did not swap jump vs target.
+                        bail!(
+                            "authentication failed for user {user} (password tried: {password:?})"
+                        );
                     }
-                } else {
-                    bail!("authentication failed");
+                    KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                        let answers = kbd_int_answers(&prompts, &password);
+                        response = session
+                            .authenticate_keyboard_interactive_respond(answers)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "keyboard-interactive for {user} (password: {password:?})"
+                                )
+                            })?;
+                    }
                 }
             }
         }
@@ -465,7 +494,7 @@ async fn authenticate(
                 .await
                 .context("publickey auth")?;
             if !res.success() {
-                bail!("public key authentication failed");
+                bail!("public key authentication failed for user {user}");
             }
         }
     }
