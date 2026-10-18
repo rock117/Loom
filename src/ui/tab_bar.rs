@@ -505,10 +505,22 @@ impl Render for TabBar {
         let has_session = active.is_some();
         let can_zoom = manager.can_zoom_active();
         let is_zoomed = manager.active_zoomed();
-        let items: Vec<(Uuid, String, ConnectionState, bool)> = manager
+        let items: Vec<(Uuid, String, ConnectionState, bool, bool)> = manager
             .tabs
             .iter()
-            .map(|t| (t.id, t.title.clone(), t.display_state(), Some(t.id) == active))
+            .map(|t| {
+                let via_jump = t
+                    .focused_pane()
+                    .map(|p| p.kind.has_ssh_jump())
+                    .unwrap_or(false);
+                (
+                    t.id,
+                    t.title.clone(),
+                    t.display_state(),
+                    Some(t.id) == active,
+                    via_jump,
+                )
+            })
             .collect();
         let menu_open = self.split_menu_open;
         let menu_anchor = self.split_menu_anchor;
@@ -662,7 +674,7 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }
             }))
-            .children(items.into_iter().map(|(id, title, state, is_active)| {
+            .children(items.into_iter().map(|(id, title, state, is_active, via_jump)| {
                 let is_renaming = renaming_id == Some(id);
                 let title_el: AnyElement = if is_renaming {
                     if let Some(edit) = rename_edit.as_ref() {
@@ -676,9 +688,23 @@ impl Render for TabBar {
                     }
                 } else {
                     div()
-                        .text_sm()
-                        .text_color(theme::TEXT)
-                        .child(title)
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACE_1))
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(theme::TEXT)
+                                .child(title),
+                        )
+                        .when(via_jump, |d| {
+                            d.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::ICON_SSH_JUMP)
+                                    .child("via"),
+                            )
+                        })
                         .into_any_element()
                 };
                 div()

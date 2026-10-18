@@ -405,6 +405,8 @@ pub enum SidebarProfileKind {
     Wsl,
     Docker,
     Ssh,
+    /// Direct SSH target reached through a ProxyJump hop.
+    SshJump,
 }
 
 impl SidebarProfileKind {
@@ -415,6 +417,8 @@ impl SidebarProfileKind {
             Self::Docker
         } else if kind.is_local() {
             Self::Local
+        } else if kind.has_ssh_jump() {
+            Self::SshJump
         } else {
             Self::Ssh
         }

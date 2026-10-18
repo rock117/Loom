@@ -29,7 +29,18 @@ Both can use password (Remember → keyring) or private key. Connect prompts col
 
 ## UI
 
-SSH profile form → **Jump host (ProxyJump)** checkbox → host / port / user + password or key + Remember. Sidebar summary: `ssh · user@host:port via jumpuser@jumphost:jport`.
+SSH profile form → **Jump host (ProxyJump)** checkbox → host / port / user + password or key + Remember.
+
+Jump vs direct SSH cues:
+
+| Surface | Jump |
+|---------|------|
+| Status bar | Target reads `user@host:port via jumpuser@jumphost:jport`; remote icon uses jump accent |
+| Tab title | Muted `via` next to the name |
+| Sidebar | Muted `via` badge + jump-colored remote icon |
+| Connecting | Status text includes the same `via …` endpoint |
+
+Profile summary (Context / picker): `ssh · user@host:port via jumpuser@jumphost:jport`.
 
 ## Limits (MVP)
 

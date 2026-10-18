@@ -442,12 +442,9 @@ impl TabManager {
         let session_password = session_password_from_auth(&auth);
         for _ in 0..leaf_count {
             let pane_id = Uuid::new_v4();
-            let ProfileKind::Ssh {
-                host, port, user, ..
-            } = &profile.kind
-            else {
+            if !matches!(profile.kind, ProfileKind::Ssh { .. }) {
                 return;
-            };
+            }
             let pane = PaneSession {
                 id: pane_id,
                 profile_id: Some(profile.id),
@@ -456,7 +453,7 @@ impl TabManager {
                 kind: profile.kind.clone(),
                 label: profile.name.clone(),
                 state: ConnectionState::Connecting,
-                status_message: format!("connecting to {user}@{host}:{port}…"),
+                status_message: profile.kind.ssh_connecting_status(),
                 terminal: None,
                 pty_master: None,
                 pty_killer: None,
@@ -653,12 +650,9 @@ impl TabManager {
         initial_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let ProfileKind::Ssh {
-            host, port, user, ..
-        } = &profile.kind
-        else {
+        if !matches!(profile.kind, ProfileKind::Ssh { .. }) {
             return;
-        };
+        }
 
         let pane_id = Uuid::new_v4();
         let session_password = session_password_from_auth(&auth);
@@ -670,7 +664,7 @@ impl TabManager {
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Connecting,
-            status_message: format!("connecting to {user}@{host}:{port}…"),
+            status_message: profile.kind.ssh_connecting_status(),
             terminal: None,
             pty_master: None,
             pty_killer: None,
@@ -1374,7 +1368,7 @@ impl TabManager {
                 }
                 SessionOpResult::Done
             }
-            ProfileKind::Ssh { host, port, user, .. } => {
+            ProfileKind::Ssh { .. } => {
                 let auto_forwards =
                     collect_auto_forwards(store, auth_profile_id, source_forwards.as_ref(), cx);
                 let pseudo = Profile {
@@ -1404,7 +1398,7 @@ impl TabManager {
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
-                            status_message: format!("connecting to {user}@{host}:{port}…"),
+                            status_message: kind.ssh_connecting_status(),
                             terminal: None,
                             pty_master: None,
                             pty_killer: None,
@@ -1756,7 +1750,7 @@ impl TabManager {
                         cx,
                     );
                 }
-                ProfileKind::Ssh { host, port, user, .. } => {
+                ProfileKind::Ssh { .. } => {
                     let auto_forwards: Vec<_> = auth_profile_id
                         .and_then(|pid| {
                             store.read(cx).workspace.find_profile(pid).map(|p| {
@@ -1790,8 +1784,7 @@ impl TabManager {
                                     auth_profile_id.filter(|_| profile_id.is_none());
                                 pane.session_password = session_password_from_auth(&auth);
                                 pane.state = ConnectionState::Connecting;
-                                pane.status_message =
-                                    format!("connecting to {user}@{host}:{port}…");
+                                pane.status_message = kind.ssh_connecting_status();
                             }
                             self.spawn_ssh_connect_kind(
                                 tab_id,
@@ -2548,7 +2541,7 @@ impl TabManager {
                 }
                 SessionOpResult::Done
             }
-            ProfileKind::Ssh { host, port, user, .. } => {
+            ProfileKind::Ssh { .. } => {
                 let auto_forwards =
                     collect_auto_forwards(store, auth_pid, source_forwards.as_ref(), cx);
                 let pseudo = Profile {
@@ -2575,7 +2568,7 @@ impl TabManager {
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
-                            status_message: format!("connecting to {user}@{host}:{port}…"),
+                            status_message: kind.ssh_connecting_status(),
                             terminal: None,
                             pty_master: None,
                             pty_killer: None,

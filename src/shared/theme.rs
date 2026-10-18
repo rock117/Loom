@@ -121,6 +121,13 @@ pub const ICON_REMOTE: Hsla = Hsla {
     l: 0.58,
     a: 1.0,
 };
+/// SSH via ProxyJump — warmer violet so jump rows read apart from direct SSH.
+pub const ICON_SSH_JUMP: Hsla = Hsla {
+    h: 0.78,
+    s: 0.45,
+    l: 0.58,
+    a: 1.0,
+};
 /// WSL / Linux local distro glyph (warm amber — distinct from Local teal & SSH blue).
 pub const ICON_WSL: Hsla = Hsla {
     h: 0.10,

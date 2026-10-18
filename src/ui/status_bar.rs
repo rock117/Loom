@@ -299,28 +299,21 @@ impl Render for StatusBar {
                 .map(|p| &p.kind)
                 .or(kind_fallback.as_ref())
             {
-                Some(kind @ ProfileKind::Ssh {
-                    host, port, user, ..
-                }) => {
+                Some(kind @ ProfileKind::Ssh { .. }) => {
+                    let target = kind
+                        .ssh_endpoint_display()
+                        .unwrap_or_else(|| "ssh".into());
                     if kind.is_docker_ssh() {
-                        let nice = kind
-                            .docker_ssh_container_id()
-                            .map(|id| {
-                                if id.len() > 12 {
-                                    format!("docker · {} @ {user}@{host}", &id[..12])
-                                } else {
-                                    format!("docker · {id} @ {user}@{host}")
-                                }
-                            })
-                            .unwrap_or_else(|| format!("docker @ {user}@{host}"));
-                        ("icons/ui/docker.svg", theme::ICON_DOCKER, nice, true)
-                    } else {
+                        ("icons/ui/docker.svg", theme::ICON_DOCKER, target, true)
+                    } else if kind.has_ssh_jump() {
                         (
                             "icons/ui/remote.svg",
-                            theme::ICON_REMOTE,
-                            format!("{user}@{host}:{port}"),
+                            theme::ICON_SSH_JUMP,
+                            target,
                             true,
                         )
+                    } else {
+                        ("icons/ui/remote.svg", theme::ICON_REMOTE, target, true)
                     }
                 }
                 Some(kind @ ProfileKind::Local { shell, args, .. }) => {

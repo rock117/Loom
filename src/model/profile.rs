@@ -161,6 +161,27 @@ impl ProfileKind {
                     None => format!("local · {shell}{argv}"),
                 }
             }
+            Self::Ssh { .. } => {
+                let endpoint = self
+                    .ssh_endpoint_display()
+                    .unwrap_or_else(|| "ssh".into());
+                if self.is_docker_ssh() {
+                    endpoint
+                } else {
+                    format!("ssh · {endpoint}")
+                }
+            }
+        }
+    }
+
+    /// True when this SSH profile (or docker-over-SSH) routes through a jump host.
+    pub fn has_ssh_jump(&self) -> bool {
+        matches!(self, Self::Ssh { jump: Some(_), .. })
+    }
+
+    /// Status bar / connect toast target: `user@host:port` or `… via jumpuser@jumphost:port`.
+    pub fn ssh_endpoint_display(&self) -> Option<String> {
+        match self {
             Self::Ssh {
                 host,
                 port,
@@ -169,21 +190,31 @@ impl ProfileKind {
                 jump,
                 ..
             } => {
-                if let Some(id) = docker_container.as_deref() {
+                let base = if let Some(id) = docker_container.as_deref() {
                     let id = id.trim();
                     let short = if id.len() > 12 { &id[..12] } else { id };
                     format!("docker · {short} @ {user}@{host}:{port}")
-                } else if let Some(j) = jump {
-                    format!(
-                        "ssh · {user}@{host}:{port} via {juser}@{jhost}:{jport}",
+                } else {
+                    format!("{user}@{host}:{port}")
+                };
+                Some(match jump {
+                    Some(j) => format!(
+                        "{base} via {juser}@{jhost}:{jport}",
                         juser = j.user,
                         jhost = j.host,
                         jport = j.port
-                    )
-                } else {
-                    format!("ssh · {user}@{host}:{port}")
-                }
+                    ),
+                    None => base,
+                })
             }
+            _ => None,
+        }
+    }
+
+    pub fn ssh_connecting_status(&self) -> String {
+        match self.ssh_endpoint_display() {
+            Some(ep) => format!("connecting to {ep}…"),
+            None => "connecting…".into(),
         }
     }
 

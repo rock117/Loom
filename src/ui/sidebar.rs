@@ -161,6 +161,7 @@ impl Sidebar {
             SidebarProfileKind::Docker => ("icons/ui/docker.svg", theme::ICON_DOCKER),
             SidebarProfileKind::Local => ("icons/ui/terminal.svg", theme::ICON_LOCAL),
             SidebarProfileKind::Ssh => ("icons/ui/remote.svg", theme::ICON_REMOTE),
+            SidebarProfileKind::SshJump => ("icons/ui/remote.svg", theme::ICON_SSH_JUMP),
         }
     }
 
@@ -805,6 +806,7 @@ impl Render for Sidebar {
                                 let (icon_path, icon_color) = Self::profile_icon(profile_kind);
                                 let drag_name: SharedString = pname.clone().into();
                                 let indent = theme::SPACE_1 + depth as f32 * 12.0;
+                                let is_jump = matches!(profile_kind, SidebarProfileKind::SshJump);
                                 let name_el: AnyElement =
                                     if let Some(edit) = renaming.as_ref().filter(|_| selected) {
                                         edit.into_element()
@@ -812,11 +814,29 @@ impl Render for Sidebar {
                                         div()
                                             .flex_1()
                                             .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .text_xs()
-                                            .text_color(theme::TEXT)
-                                            .child(pname.clone())
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(theme::SPACE_1))
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .overflow_hidden()
+                                                    .text_ellipsis()
+                                                    .whitespace_nowrap()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT)
+                                                    .child(pname.clone()),
+                                            )
+                                            .when(is_jump, |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .text_xs()
+                                                        .text_color(theme::ICON_SSH_JUMP)
+                                                        .child("via"),
+                                                )
+                                            })
                                             .into_any_element()
                                     };
                                 div()
