@@ -60,6 +60,8 @@ pub struct SshSessionHandles {
     pub sftp: crate::session::sftp::SftpHandle,
     /// Same-session Local port forwards.
     pub forwards: crate::session::forward::ForwardHandle,
+    /// Connect info for per-transfer SSH connections (see `sftp::spawn_transfer`).
+    pub transfer_target: crate::session::sftp::TransferTarget,
 }
 
 struct ChannelReader {
@@ -153,6 +155,14 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
     let remote_command = params.remote_command.clone();
     let jump = params.jump.clone();
 
+    let transfer_target = crate::session::sftp::TransferTarget {
+        host: host.clone(),
+        port,
+        user: user.clone(),
+        auth: auth.clone(),
+        jump: jump.clone(),
+    };
+
     thread::Builder::new()
         .name("loom-ssh".into())
         .spawn(move || {
@@ -222,7 +232,86 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
         shutdown: shutdown_tx,
         sftp: sftp_handle,
         forwards: forward_handle,
+        transfer_target,
     })
+}
+
+/// Establish an authenticated SSH session, optionally through one jump hop.
+///
+/// Returns `(target, jump)`. Callers must keep the jump handle alive for as long as the
+/// target is used — the target SSH stream rides its `direct-tcpip` channel.
+pub(crate) async fn connect_handles(
+    config: Arc<client::Config>,
+    host: &str,
+    port: u16,
+    user: &str,
+    auth: SshAuthMaterial,
+    jump: Option<SshJumpParams>,
+) -> Result<(
+    client::Handle<ClientHandler>,
+    Option<client::Handle<ClientHandler>>,
+)> {
+    let Some(jump) = jump else {
+        let handler = ClientHandler {
+            host: host.to_string(),
+            port,
+        };
+        let mut session = client::connect(Arc::clone(&config), (host, port), handler)
+            .await
+            .with_context(|| format!("connect to {host}:{port}"))?;
+        authenticate(&mut session, user, auth)
+            .await
+            .context("SSH authentication")?;
+        return Ok((session, None));
+    };
+
+    let jump_handler = ClientHandler {
+        host: jump.host.clone(),
+        port: jump.port,
+    };
+    let mut jump_session = client::connect(
+        Arc::clone(&config),
+        (jump.host.as_str(), jump.port),
+        jump_handler,
+    )
+    .await
+    .with_context(|| format!("connect to jump {0}:{1}", jump.host, jump.port))?;
+
+    authenticate(&mut jump_session, &jump.user, jump.auth)
+        .await
+        .with_context(|| {
+            format!(
+                "jump host authentication ({user}@{host}:{port})",
+                user = jump.user,
+                host = jump.host,
+                port = jump.port
+            )
+        })?;
+
+    let tunnel = jump_session
+        .channel_open_direct_tcpip(host.to_string(), u32::from(port), "127.0.0.1", 0)
+        .await
+        .with_context(|| {
+            format!(
+                "open jump tunnel to {host}:{port} via {}:{}",
+                jump.host, jump.port
+            )
+        })?;
+
+    let stream = tunnel.into_stream();
+    let target_handler = ClientHandler {
+        host: host.to_string(),
+        port,
+    };
+    let mut target = client::connect_stream(Arc::clone(&config), stream, target_handler)
+        .await
+        .with_context(|| format!("SSH handshake to {host}:{port} via jump"))?;
+
+    authenticate(&mut target, user, auth)
+        .await
+        .with_context(|| format!("target SSH authentication ({user}@{host}:{port})"))?;
+
+    Ok((target, Some(jump_session)))
 }
 
 async fn run_session(
@@ -250,74 +339,8 @@ async fn run_session(
     });
 
     // Keep the jump Handle alive for the whole target session (direct-tcpip tunnel).
-    let mut _jump_keepalive: Option<client::Handle<ClientHandler>> = None;
-
-    let session = if let Some(jump) = jump {
-        let jump_config = Arc::clone(&config);
-        let jump_handler = ClientHandler {
-            host: jump.host.clone(),
-            port: jump.port,
-        };
-        let mut jump_session = client::connect(
-            jump_config,
-            (jump.host.as_str(), jump.port),
-            jump_handler,
-        )
-        .await
-        .with_context(|| format!("connect to jump {0}:{1}", jump.host, jump.port))?;
-
-        authenticate(&mut jump_session, &jump.user, jump.auth)
-            .await
-            .with_context(|| {
-                format!(
-                    "jump host authentication ({user}@{host}:{port})",
-                    user = jump.user,
-                    host = jump.host,
-                    port = jump.port
-                )
-            })?;
-
-        let tunnel = jump_session
-            .channel_open_direct_tcpip(
-                host.clone(),
-                u32::from(port),
-                "127.0.0.1",
-                0,
-            )
-            .await
-            .with_context(|| {
-                format!("open jump tunnel to {host}:{port} via {}:{}", jump.host, jump.port)
-            })?;
-
-        let stream = tunnel.into_stream();
-        let target_handler = ClientHandler {
-            host: host.clone(),
-            port,
-        };
-        let mut target = client::connect_stream(Arc::clone(&config), stream, target_handler)
-            .await
-            .with_context(|| format!("SSH handshake to {host}:{port} via jump"))?;
-
-        authenticate(&mut target, &user, auth)
-            .await
-            .with_context(|| format!("target SSH authentication ({user}@{host}:{port})"))?;
-
-        _jump_keepalive = Some(jump_session);
-        target
-    } else {
-        let handler = ClientHandler {
-            host: host.clone(),
-            port,
-        };
-        let mut session = client::connect(Arc::clone(&config), (host.as_str(), port), handler)
-            .await
-            .with_context(|| format!("connect to {host}:{port}"))?;
-
-        authenticate(&mut session, &user, auth)
-            .await
-            .context("SSH authentication")?;
-        session
-    };
+    let (session, _jump_keepalive) =
+        connect_handles(Arc::clone(&config), &host, port, &user, auth, jump).await?;
 
     let mut channel = session
         .channel_open_session()

@@ -1,4 +1,4 @@
-//! Right context panel — Files (SFTP / local FS) + Info (see docs/CONTEXT_PANEL.md).
+﻿//! Right context panel — Files (SFTP / local FS) + Info (see docs/CONTEXT_PANEL.md).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,8 +13,8 @@ use crate::session::docker_fs;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
 use crate::session::sftp::{
-    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferOptions, TransferProgress,
-    join_remote, parent_remote, transfer_cancel_flag,
+    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferJob, TransferOptions,
+    TransferProgress, TransferTarget, join_remote, parent_remote, transfer_cancel_flag,
 };
 use crate::shared::theme;
 use crate::ui::file_icon;
@@ -27,6 +27,11 @@ use crate::ui::transfer_settings::{
 use crate::ui::workspace_store::WorkspaceStore;
 
 const ICON: f32 = 13.0;
+
+/// Last transfer-progress repaint, used to coalesce progress ticks (see
+/// `ContextPanel::request_transfer_repaint`).
+static TRANSFER_REPAINT_AT: parking_lot::Mutex<Option<std::time::Instant>> =
+    parking_lot::Mutex::new(None);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PanelTab {
@@ -310,6 +315,18 @@ impl ContextPanel {
         let id = pane.id;
         let sftp = pane.ssh_sftp.clone()?;
         Some((id, sftp))
+    }
+
+    /// Focused SSH pane + connect info for a dedicated transfer connection.
+    fn focused_transfer(&self, cx: &App) -> Option<(Uuid, TransferTarget)> {
+        let tab = self.tabs.read(cx).active_tab()?;
+        let pane = tab.focused_pane()?;
+        Some((pane.id, pane.ssh_transfer_target.clone()?))
+    }
+
+    /// Transfer connect info for the focused pane (Docker-over-SSH paths).
+    fn focused_transfer_target(&self, cx: &App) -> Option<TransferTarget> {
+        self.focused_transfer(cx).map(|(_, t)| t)
     }
 
     /// SSH SFTP, Docker container FS, or a Local profile pane for filesystem browsing.
@@ -926,12 +943,12 @@ impl ContextPanel {
         if all_files || self.files_kind == Some(FilesKind::Docker) {
             match self.files_kind {
                 Some(FilesKind::Sftp) => {
-                    let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    let Some((_, target)) = self.focused_transfer(cx) else {
                         self.error = Some("No SSH session".into());
                         cx.notify();
                         return;
                     };
-                    self.start_uploads(pane_id, sftp, dest, locals, TransferOptions::default(), cx);
+                    self.start_uploads(pane_id, target, dest, locals, TransferOptions::default(), cx);
                 }
                 Some(FilesKind::Docker) => {
                     let Some((_, container, sftp)) = self.focused_docker(cx) else {
@@ -939,10 +956,23 @@ impl ContextPanel {
                         cx.notify();
                         return;
                     };
+                    let target = if sftp.is_some() {
+                        // Docker-over-SSH: must dial over SSH, never local docker.
+                        match self.focused_transfer_target(cx) {
+                            Some(t) => Some(t),
+                            None => {
+                                self.error = Some("SSH session unavailable".into());
+                                cx.notify();
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     self.start_uploads_docker(
                         pane_id,
                         container,
-                        sftp,
+                        target,
                         dest,
                         locals,
                         cx,
@@ -976,7 +1006,7 @@ impl ContextPanel {
             self.download_entry_docker(entry, open_after, dest_dir, cx);
             return;
         }
-        let Some((pane_id, sftp)) = self.focused_sftp(cx) else {
+        let Some((pane_id, target)) = self.focused_transfer(cx) else {
             self.error = Some("No SSH session".into());
             cx.notify();
             return;
@@ -1085,37 +1115,27 @@ impl ContextPanel {
 
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
-            if sftp
-                .request(SftpRequest::Download {
-                    id,
-                    remote,
-                    local,
-                    options,
-                    progress: progress_tx,
-                    reply: reply_tx,
-                    cancel,
-                })
-                .is_err()
-            {
-                this.update(cx, |this, cx| {
-                    this.fail_transfer(id, "SFTP unavailable".into());
-                    cx.notify();
-                })
-                .ok();
-                return;
-            }
+            let job = TransferJob::Download {
+                id,
+                remote,
+                local,
+                options,
+            };
+            spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
 
+            let mut progress_open = true;
             loop {
                 tokio::select! {
-                    p = progress_rx.recv_async() => {
+                    p = progress_rx.recv_async(), if progress_open => {
                         match p {
                             Ok(p) => {
                                 this.update(cx, |this, cx| {
                                     this.update_transfer_progress(p);
-                                    cx.notify();
+                                    Self::request_transfer_repaint(cx);
                                 }).ok();
                             }
-                            Err(_) => {}
+                            // Sender gone: disabling the branch keeps select! from spinning.
+                            Err(_) => progress_open = false,
                         }
                     }
                     result = reply_rx.recv_async() => {
@@ -1167,6 +1187,19 @@ impl ContextPanel {
             self.error = Some("Docker container unavailable".into());
             cx.notify();
             return;
+        };
+        let transfer_target = if sftp.is_some() {
+            match self.focused_transfer_target(cx) {
+                Some(t) => Some(t),
+                None => {
+                    // Docker-over-SSH without a dial target: never fall back to local docker.
+                    self.error = Some("SSH session unavailable".into());
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            None
         };
         if open_after && entry.is_dir {
             self.error = Some("Cannot open a remote folder this way".into());
@@ -1247,7 +1280,8 @@ impl ContextPanel {
                 if let Some(row) = this.find_transfer_mut(id) {
                     row.local_path = Some(local.clone());
                     row.status = TransferStatus::Queued;
-                    row.started_at = Some(std::time::Instant::now());
+                    // Elapsed starts on the first progress tick, not while queued.
+                    row.started_at = None;
                 }
                 cx.notify();
             })
@@ -1256,26 +1290,14 @@ impl ContextPanel {
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
 
-            if let Some(sftp) = sftp {
-                if sftp
-                    .request(SftpRequest::DockerDownload {
-                        id,
-                        container,
-                        remote,
-                        local,
-                        progress: progress_tx,
-                        reply: reply_tx,
-                        cancel,
-                    })
-                    .is_err()
-                {
-                    this.update(cx, |this, cx| {
-                        this.fail_transfer(id, "SSH session unavailable".into());
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
+            if let Some(target) = transfer_target {
+                let job = TransferJob::DockerDownload {
+                    id,
+                    container,
+                    remote,
+                    local,
+                };
+                spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
             } else {
                 let cancel_flag = cancel.clone();
                 std::thread::spawn(move || {
@@ -1291,14 +1313,19 @@ impl ContextPanel {
                 });
             }
 
+            let mut progress_open = true;
             loop {
                 tokio::select! {
-                    p = progress_rx.recv_async() => {
-                        if let Ok(p) = p {
-                            this.update(cx, |this, cx| {
-                                this.update_transfer_progress(p);
-                                cx.notify();
-                            }).ok();
+                    p = progress_rx.recv_async(), if progress_open => {
+                        match p {
+                            Ok(p) => {
+                                this.update(cx, |this, cx| {
+                                    this.update_transfer_progress(p);
+                                    Self::request_transfer_repaint(cx);
+                                }).ok();
+                            }
+                            // Sender gone: disabling the branch keeps select! from spinning.
+                            Err(_) => progress_open = false,
                         }
                     }
                     result = reply_rx.recv_async() => {
@@ -1440,7 +1467,7 @@ impl ContextPanel {
     fn start_uploads(
         &mut self,
         pane_id: Uuid,
-        sftp: SftpHandle,
+        target: TransferTarget,
         remote_dir: String,
         locals: Vec<PathBuf>,
         options: TransferOptions,
@@ -1449,7 +1476,7 @@ impl ContextPanel {
         for local in locals {
             self.start_one_upload(
                 pane_id,
-                sftp.clone(),
+                target.clone(),
                 remote_dir.clone(),
                 local,
                 options.clone(),
@@ -1461,7 +1488,7 @@ impl ContextPanel {
     fn start_one_upload(
         &mut self,
         pane_id: Uuid,
-        sftp: SftpHandle,
+        target: TransferTarget,
         remote_dir: String,
         local: PathBuf,
         options: TransferOptions,
@@ -1504,37 +1531,27 @@ impl ContextPanel {
         cx.spawn(async move |this, cx| {
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
-            if sftp
-                .request(SftpRequest::Upload {
-                    id,
-                    local,
-                    remote_dir,
-                    options,
-                    progress: progress_tx,
-                    reply: reply_tx,
-                    cancel,
-                })
-                .is_err()
-            {
-                this.update(cx, |this, cx| {
-                    this.fail_transfer(id, "SFTP unavailable".into());
-                    cx.notify();
-                })
-                .ok();
-                return;
-            }
+            let job = TransferJob::Upload {
+                id,
+                local,
+                remote_dir,
+                options,
+            };
+            spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
 
+            let mut progress_open = true;
             loop {
                 tokio::select! {
-                    p = progress_rx.recv_async() => {
+                    p = progress_rx.recv_async(), if progress_open => {
                         match p {
                             Ok(p) => {
                                 this.update(cx, |this, cx| {
                                     this.update_transfer_progress(p);
-                                    cx.notify();
+                                    Self::request_transfer_repaint(cx);
                                 }).ok();
                             }
-                            Err(_) => {}
+                            // Sender gone: disabling the branch keeps select! from spinning.
+                            Err(_) => progress_open = false,
                         }
                     }
                     result = reply_rx.recv_async() => {
@@ -1582,7 +1599,7 @@ impl ContextPanel {
         &mut self,
         pane_id: Uuid,
         container: String,
-        sftp: Option<SftpHandle>,
+        target: Option<TransferTarget>,
         remote_dir: String,
         locals: Vec<PathBuf>,
         cx: &mut Context<Self>,
@@ -1591,7 +1608,7 @@ impl ContextPanel {
             self.start_one_upload_docker(
                 pane_id,
                 container.clone(),
-                sftp.clone(),
+                target.clone(),
                 remote_dir.clone(),
                 local,
                 cx,
@@ -1603,7 +1620,7 @@ impl ContextPanel {
         &mut self,
         pane_id: Uuid,
         container: String,
-        sftp: Option<SftpHandle>,
+        transfer_target: Option<TransferTarget>,
         remote_dir: String,
         local: PathBuf,
         cx: &mut Context<Self>,
@@ -1626,7 +1643,7 @@ impl ContextPanel {
                 local_path: Some(local.clone()),
                 is_dir,
                 open_after: false,
-                started_at: Some(std::time::Instant::now()),
+                started_at: None,
                 elapsed: None,
                 bytes_done: 0,
                 bytes_total: None,
@@ -1639,26 +1656,14 @@ impl ContextPanel {
         cx.spawn(async move |this, cx| {
             let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
             let (reply_tx, reply_rx) = flume::bounded(1);
-            if let Some(sftp) = sftp {
-                if sftp
-                    .request(SftpRequest::DockerUpload {
-                        id,
-                        container,
-                        local,
-                        remote_dir,
-                        progress: progress_tx,
-                        reply: reply_tx,
-                        cancel,
-                    })
-                    .is_err()
-                {
-                    this.update(cx, |this, cx| {
-                        this.fail_transfer(id, "SSH session unavailable".into());
-                        cx.notify();
-                    })
-                    .ok();
-                    return;
-                }
+            if let Some(target) = transfer_target {
+                let job = TransferJob::DockerUpload {
+                    id,
+                    container,
+                    local,
+                    remote_dir,
+                };
+                spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
             } else {
                 let cancel_flag = cancel.clone();
                 std::thread::spawn(move || {
@@ -1674,14 +1679,19 @@ impl ContextPanel {
                 });
             }
 
+            let mut progress_open = true;
             loop {
                 tokio::select! {
-                    p = progress_rx.recv_async() => {
-                        if let Ok(p) = p {
-                            this.update(cx, |this, cx| {
-                                this.update_transfer_progress(p);
-                                cx.notify();
-                            }).ok();
+                    p = progress_rx.recv_async(), if progress_open => {
+                        match p {
+                            Ok(p) => {
+                                this.update(cx, |this, cx| {
+                                    this.update_transfer_progress(p);
+                                    Self::request_transfer_repaint(cx);
+                                }).ok();
+                            }
+                            // Sender gone: disabling the branch keeps select! from spinning.
+                            Err(_) => progress_open = false,
                         }
                     }
                     result = reply_rx.recv_async() => {
@@ -1766,6 +1776,21 @@ impl ContextPanel {
             // `None` clears a prior coarse phase once real SFTP ticks arrive.
             row.phase = p.phase;
         }
+    }
+
+    /// Progress ticks arrive per 64 KiB chunk (up to hundreds/sec per job). Repainting on
+    /// every tick would burn the UI thread once several transfers run in parallel, so coalesce
+    /// them to ~10 fps; the final state always comes from the reply path.
+    fn request_transfer_repaint(cx: &mut Context<Self>) {
+        const REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        let now = std::time::Instant::now();
+        if let Some(last) = *TRANSFER_REPAINT_AT.lock() {
+            if now.duration_since(last) < REPAINT_INTERVAL {
+                return;
+            }
+        }
+        *TRANSFER_REPAINT_AT.lock() = Some(now);
+        cx.notify();
     }
 
     fn finish_transfer(
@@ -2758,10 +2783,23 @@ impl ContextPanel {
                             cx.notify();
                             return;
                         };
-                        self.start_uploads_docker(pane_id, container, sftp, dest, locals, cx);
+                        let target = if sftp.is_some() {
+                            // Docker-over-SSH: must dial over SSH, never local docker.
+                            match self.focused_transfer_target(cx) {
+                                Some(t) => Some(t),
+                                None => {
+                                    self.error = Some("SSH session unavailable".into());
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        self.start_uploads_docker(pane_id, container, target, dest, locals, cx);
                     }
                     _ => {
-                        let Some((_, sftp)) = self.focused_sftp(cx) else {
+                        let Some((_, target)) = self.focused_transfer(cx) else {
                             self.error = Some("No SSH session".into());
                             cx.notify();
                             return;
@@ -2780,7 +2818,7 @@ impl ContextPanel {
                                     .into(),
                             ));
                         }
-                        self.start_uploads(pane_id, sftp, dest, locals, options, cx);
+                        self.start_uploads(pane_id, target, dest, locals, options, cx);
                     }
                 }
             }
@@ -6398,6 +6436,19 @@ impl ContextPanel {
                     }),
             )
     }
+}
+
+/// Spawn one transfer job: own SSH connection, per-host concurrency slot, then close.
+///
+/// `reply` receives exactly one outcome; progress arrives on the bounded `progress` channel.
+fn spawn_transfer_job(
+    target: TransferTarget,
+    job: TransferJob,
+    progress: flume::Sender<TransferProgress>,
+    cancel: TransferCancel,
+    reply: flume::Sender<anyhow::Result<crate::session::sftp::TransferOutcome>>,
+) {
+    crate::session::sftp::spawn_transfer(target, job, progress, cancel, reply);
 }
 
 fn default_local_home() -> String {

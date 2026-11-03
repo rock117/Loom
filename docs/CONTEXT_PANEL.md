@@ -65,8 +65,9 @@ Right-click an entry (or use prompts from the menu):
 ### Transfers footer
 
 Transfers are scoped per SSH pane (switching tabs shows that session’s list only).  
-Phases: **Queued** (waiting on the transfer lane) → **Scanning · N** → `m/n · size · rate · time` → **Done**.  
-**×** / **Clear** cancel the SFTP job (not UI-only) so the transfer lane is freed for the next task.  
+Phases: **Queued** (waiting for a per-host transfer slot, max 10 concurrent) → **Scanning · N** → `m/n · size · rate · time` → **Done**.  
+Each transfer opens its own SSH connection and closes it when done (see [SFTP_POOL.md](./SFTP_POOL.md)).  
+**×** / **Clear** cancel the job (not UI-only) so the host slot is freed for the next task.  
 Right-click → Reveal in File Explorer / Remove.  
 MVP: in-memory list for the panel lifetime; no separate Transfers tab.
 
@@ -103,7 +104,6 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 
 - Snippets as a default tab (optional later)
 - Full remote editor
-- Jump hosts / second SSH connection solely for SFTP (use same session channel)
 - Local multi-file copy/move as Transfers jobs
 
 ## Implementation map
@@ -111,17 +111,18 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 | Piece | Location |
 |-------|----------|
 | Doc | `docs/CONTEXT_PANEL.md`、`docs/SFTP_POOL.md` |
-| SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（同 SSH；浏览/传输分车道池；mkdir/remove/rename/chmod） |
+| SFTP bridge | `src/session/sftp.rs` + `ssh.rs`（浏览复用 shell 连接；传输一任务一短连接，每 host ≤ 10；mkdir/remove/rename/chmod） |
 | Local FS | `src/session/local_fs.rs` |
 | Docker FS | `src/session/docker_fs.rs`（本机）；`src/session/docker_ssh.rs`（经 SSH） |
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
 | UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs`、`src/ui/transfer_settings.rs` |
 | Transfer filter / archive | `src/session/transfer_filter.rs`、`src/session/transfer_archive.rs` |
 | Open path | `src/platform.rs` (`open_path` / `open_path_detached`) |
-| Pane handle | `PaneSession.ssh_sftp` |
+| Pane handle | `PaneSession.ssh_sftp`（浏览）、`PaneSession.ssh_transfer_target`（传输连接信息） |
 
 ## Stack
 
-- `russh` session already used for the shell
+- `russh` session already used for the shell (browse)
 - Extra channel + `request_subsystem("sftp")` + `russh-sftp::SftpSession`
+- Transfers: dedicated `russh` connection per job, closed when done
 - OS file drop → GPUI `ExternalPaths` on the Files list (SSH upload)

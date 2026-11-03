@@ -10,7 +10,9 @@ Loom supports **one** ProxyJump hop, equivalent to:
 ssh -J jumpuser@jumphost:jumpport targetuser@targethost:port
 ```
 
-This is **not** Local port forwarding (`-L`). The jump host opens a `direct-tcpip` channel to the target; the target SSH session (shell, SFTP, Local forwards) rides that tunnel. The jump `Handle` stays alive for the whole target session.
+This is **not** Local port forwarding (`-L`). The jump host opens a `direct-tcpip` channel to the target; the target SSH session (shell, SFTP browse, Local forwards) rides that tunnel. The jump `Handle` stays alive for the whole target session.
+
+**Transfers** (upload/download) dial their **own** connection, and reuse the same jump params, so each transfer also goes through the jump host's `direct-tcpip` — see [SFTP_POOL.md](./SFTP_POOL.md).
 
 ## Profile model
 

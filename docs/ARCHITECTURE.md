@@ -9,7 +9,7 @@ For **non-obvious GPUI/platform pitfalls** (including UI-thread freeze / deadloc
 For **自定义文本输入框（选区 / 拷贝粘贴 / IME）**, see [TEXT_FIELDS.md](./TEXT_FIELDS.md).  
 For **终端 IME / Ctrl+F 中文**, see [TERMINAL_IME.md](./TERMINAL_IME.md).  
 For **three-column context panel** (Files/SFTP + Info), see [CONTEXT_PANEL.md](./CONTEXT_PANEL.md).  
-For **SFTP 连接池 / 浏览与传输并行 / 资源回收**（中文规格）, see [SFTP_POOL.md](./SFTP_POOL.md).  
+For **SFTP 浏览连接 + 每任务独立传输连接 / 每 host 并发上限**（中文规格）, see [SFTP_POOL.md](./SFTP_POOL.md).  
 For **Docker 会话（exec + Files / docker cp）**（中文规格，尚未实现）, see [DOCKER_SESSION.md](./DOCKER_SESSION.md).  
 For **SSH 端口转发（Local / Remote / SOCKS）**（中文规格，尚未实现；非核心增强）, see [PORT_FORWARD.md](./PORT_FORWARD.md).  
 For **主题系统（可切换 Theme / CSD / 终端 palette）**（中文规格，尚未实现）, see [THEME.md](./THEME.md).  

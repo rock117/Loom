@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+﻿use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -46,6 +46,8 @@ pub struct PaneSession {
     pub ssh_shutdown: Option<flume::Sender<()>>,
     /// Same-session SFTP handle (SSH panes only).
     pub ssh_sftp: Option<crate::session::sftp::SftpHandle>,
+    /// Connect info for per-transfer SSH connections (SSH panes only).
+    pub ssh_transfer_target: Option<crate::session::sftp::TransferTarget>,
     /// Same-session Local port forwards (SSH panes only).
     pub ssh_forwards: Option<crate::session::forward::ForwardHandle>,
     /// Silent local/WSL auto-restarts left before we surface Failed (refills on Connected).
@@ -341,6 +343,7 @@ impl TabManager {
                         pty_killer: None,
                         ssh_shutdown: None,
                         ssh_sftp: None,
+                        ssh_transfer_target: None,
                         ssh_forwards: None,
                         local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
                         _term_subscriptions: Vec::new(),
@@ -459,6 +462,7 @@ impl TabManager {
                 pty_killer: None,
                 ssh_shutdown: None,
                 ssh_sftp: None,
+                ssh_transfer_target: None,
                 ssh_forwards: None,
                 local_auto_restarts_left: 0,
                 _term_subscriptions: Vec::new(),
@@ -630,6 +634,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_transfer_target: None,
             ssh_forwards: None,
             local_auto_restarts_left: 0,
             _term_subscriptions: Vec::new(),
@@ -670,6 +675,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_transfer_target: None,
             ssh_forwards: None,
             local_auto_restarts_left: 0,
             _term_subscriptions: Vec::new(),
@@ -822,6 +828,7 @@ impl TabManager {
                         pane._term_subscriptions = term_subs;
                         pane.ssh_shutdown = Some(handles.shutdown);
                         pane.ssh_sftp = Some(handles.sftp);
+                        pane.ssh_transfer_target = Some(handles.transfer_target);
                         let forwards = handles.forwards;
                         for rule in &auto_forwards {
                             if let Err(err) = forwards.start(rule.clone(), false) {
@@ -966,6 +973,7 @@ impl TabManager {
             pty_killer: None,
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_transfer_target: None,
             ssh_forwards: None,
             local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
             _term_subscriptions: Vec::new(),
@@ -1224,6 +1232,7 @@ impl TabManager {
             pty_killer: Some(killer),
             ssh_shutdown: None,
             ssh_sftp: None,
+            ssh_transfer_target: None,
             ssh_forwards: None,
             local_auto_restarts_left: LOCAL_AUTO_RESTART_BUDGET,
             _term_subscriptions: term_subs,
@@ -1404,6 +1413,7 @@ impl TabManager {
                             pty_killer: None,
                             ssh_shutdown: None,
                             ssh_sftp: None,
+                            ssh_transfer_target: None,
                             ssh_forwards: None,
                             local_auto_restarts_left: 0,
                             _term_subscriptions: Vec::new(),
@@ -1847,6 +1857,7 @@ impl TabManager {
                 let killer = pane.pty_killer.take();
                 drop(pane.ssh_forwards.take());
                 drop(pane.ssh_sftp.take());
+                drop(pane.ssh_transfer_target.take());
                 if let Some(tx) = pane.ssh_shutdown.take() {
                     let _ = tx.send(());
                 }
@@ -1881,6 +1892,7 @@ impl TabManager {
         let killer = pane.pty_killer.take();
         drop(pane.ssh_forwards.take());
         drop(pane.ssh_sftp.take());
+        drop(pane.ssh_transfer_target.take());
         if let Some(tx) = pane.ssh_shutdown.take() {
             let _ = tx.send(());
         }
@@ -2574,6 +2586,7 @@ impl TabManager {
                             pty_killer: None,
                             ssh_shutdown: None,
                             ssh_sftp: None,
+                            ssh_transfer_target: None,
                             ssh_forwards: None,
                             local_auto_restarts_left: 0,
                             _term_subscriptions: Vec::new(),
@@ -2823,6 +2836,7 @@ fn teardown_pane_io(pane: &mut PaneSession) {
     // Drop forward + SFTP handles first so workers shut down before SSH disconnect.
     drop(pane.ssh_forwards.take());
     drop(pane.ssh_sftp.take());
+    drop(pane.ssh_transfer_target.take());
     if let Some(tx) = pane.ssh_shutdown.take() {
         let _ = tx.send(());
     }

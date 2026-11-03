@@ -52,7 +52,12 @@ fn save(file: &KnownHostsFile) -> Result<()> {
 }
 
 /// Verify server key fingerprint. Unknown hosts are stored (TOFU). Mismatch fails.
+///
+/// Serialized: every SSH connection (shell, transfer, forward probe) verifies its host key
+/// from its own thread, and this is a read-modify-write of one JSON file.
 pub fn check_and_record(host: &str, port: u16, fingerprint: &str) -> Result<()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    let _guard = LOCK.lock();
     let key = host_key(host, port);
     let mut file = load();
     match file.hosts.get(&key) {

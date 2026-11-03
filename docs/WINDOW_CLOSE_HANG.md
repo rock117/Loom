@@ -129,11 +129,12 @@ Persistence::on_will_quit
 
 有过上传/下载、长跑一天，可能存在：
 
-- Transfer lane 卡在 `read`/`write`（网络半开）
-- `run_sftp_worker` 在 handle drop 后 **`await` browse/transfer task** 直到传完
-- `disconnect` 与仍占着的 SFTP channel 互相拖
+- 传输卡在 `read`/`write`（网络半开）
+- 旧方案：`run_sftp_worker` 在 handle drop 后 **`await` browse/transfer task** 直到传完
 
-这主要占 **SSH Tokio 线程**，一般 **不直接** 挡住 `should_close` 回调。更符合「退出后进程收尾脏 / 变慢」，对「点 X 窗立刻不消失」是 **次要**。关窗/teardown 时强制 cancel、避免无限 `await`，仍建议作为后续加固。
+**现行模型已消除该风险**（见 [SFTP_POOL.md](./SFTP_POOL.md)）：传输跑在自己的 OS 线程 + 独立 SSH 连接上，`run_sftp_worker` 只剩浏览请求，drop `ssh_sftp` 即结束，不再 `await` 传输任务；关窗/关 pane 时置 `TransferCancel`，传输线程读到时自行断开。剩余可能：卡住的传输线程（后台、不参与退出）。
+
+查找框：与长会话同时出现，**不视为根因**。
 
 查找框：与长会话同时出现，**不视为根因**。
 
@@ -181,7 +182,7 @@ Persistence::on_will_quit
 | flush | `flush_persist` / `flush_persist_for_quit`（不同步 Profile cwd） |
 | process cwd | `src/platform.rs`（仍用于 Files / 会话内 cwd 探测，**不**在关窗 flush） |
 | pane teardown | `src/ui/tab_manager.rs` (`teardown_pane_io`, `TabManager::Drop`) |
-| SFTP worker 收尾 | `src/session/sftp.rs` (`run_sftp_worker` 末尾 `await` lanes) |
+| SFTP worker 收尾 | `src/session/sftp.rs`（`run_sftp_worker` 仅服务浏览；传输在独立连接） |
 | 退出文档 | [PERSISTENCE_EVENTS.md](./PERSISTENCE_EVENTS.md) |
 | 冻结 checklist | [HARD_PROBLEMS.md](./HARD_PROBLEMS.md) |
 | 日志设计 | [LOGGING.md](./LOGGING.md) |

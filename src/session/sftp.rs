@@ -1,8 +1,9 @@
-//! SFTP requests served on the same russh session as the interactive shell.
+﻿//! SFTP requests served on the same russh session as the interactive shell.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use flume::{Receiver, Sender};
@@ -123,24 +124,6 @@ pub enum SftpRequest {
         path: String,
         reply: Sender<Result<Vec<RemoteEntry>>>,
     },
-    Download {
-        id: uuid::Uuid,
-        remote: String,
-        local: PathBuf,
-        options: TransferOptions,
-        progress: Sender<TransferProgress>,
-        reply: Sender<Result<TransferOutcome>>,
-        cancel: TransferCancel,
-    },
-    Upload {
-        id: uuid::Uuid,
-        local: PathBuf,
-        remote_dir: String,
-        options: TransferOptions,
-        progress: Sender<TransferProgress>,
-        reply: Sender<Result<TransferOutcome>>,
-        cancel: TransferCancel,
-    },
     /// Create a remote directory (browse lane).
     Mkdir {
         path: String,
@@ -209,25 +192,60 @@ pub enum SftpRequest {
         path: String,
         reply: Sender<Result<String, String>>,
     },
-    /// Stage with remote `docker cp`, then SFTP pull/push.
+}
+
+/// One file/folder upload or download.
+///
+/// Transfers never ride the interactive shell connection: each job opens its own SSH
+/// connection, runs the SFTP copy, then disconnects. See [`spawn_transfer`].
+pub enum TransferJob {
+    Download {
+        id: uuid::Uuid,
+        remote: String,
+        local: PathBuf,
+        options: TransferOptions,
+    },
+    Upload {
+        id: uuid::Uuid,
+        local: PathBuf,
+        remote_dir: String,
+        options: TransferOptions,
+    },
+    /// Stage with remote `docker cp`, then SFTP pull.
     DockerDownload {
         id: uuid::Uuid,
         container: String,
         remote: String,
         local: PathBuf,
-        progress: Sender<TransferProgress>,
-        reply: Sender<Result<TransferOutcome>>,
-        cancel: TransferCancel,
     },
+    /// Stage with SFTP push, then remote `docker cp`.
     DockerUpload {
         id: uuid::Uuid,
         container: String,
         local: PathBuf,
         remote_dir: String,
-        progress: Sender<TransferProgress>,
-        reply: Sender<Result<TransferOutcome>>,
-        cancel: TransferCancel,
     },
+}
+
+/// Everything needed to dial a fresh SSH connection for a transfer.
+///
+/// Cloned from the pane's live session so a transfer still works when the shell
+/// connection dies (and so it can run while the shell keeps streaming).
+#[derive(Clone)]
+pub struct TransferTarget {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub auth: super::ssh::SshAuthMaterial,
+    pub jump: Option<super::ssh::SshJumpParams>,
+}
+
+impl TransferTarget {
+    /// Concurrency key: one queue per SSH endpoint (account-independent — the server's
+    /// `MaxSessions` is per `sshd`, not per user).
+    fn host_key(&self) -> String {
+        format!("{}:{}", self.host.trim().to_ascii_lowercase(), self.port)
+    }
 }
 
 /// Cloneable handle used by the UI to talk to the SSH thread's SFTP pool.
@@ -249,9 +267,10 @@ pub fn channel_pair() -> (SftpHandle, Receiver<SftpRequest>) {
     (SftpHandle { tx }, rx)
 }
 
-/// Max concurrent SFTP subsystem channels across the whole app.
+/// Max concurrent **browse** SFTP channels across the whole app. Transfers use their own
+/// connections and are limited per host by `MAX_CONCURRENT_PER_HOST` instead.
 const GLOBAL_SFTP_CHANNEL_BUDGET: usize = 12;
-/// Close an idle lane session after this long with no requests.
+/// Close an idle browse session after this long with no requests.
 const LANE_IDLE_SECS: u64 = 90;
 
 static OPEN_SFTP_CHANNELS: std::sync::atomic::AtomicUsize =
@@ -287,24 +306,6 @@ impl Drop for ChannelBudgetGuard {
     }
 }
 
-#[derive(Clone, Copy)]
-enum LaneKind {
-    Browse,
-    Transfer,
-}
-
-fn is_browse_request(req: &SftpRequest) -> bool {
-    matches!(
-        req,
-        SftpRequest::Home { .. }
-            | SftpRequest::List { .. }
-            | SftpRequest::Mkdir { .. }
-            | SftpRequest::Remove { .. }
-            | SftpRequest::Rename { .. }
-            | SftpRequest::Chmod { .. }
-    )
-}
-
 fn is_host_probe(req: &SftpRequest) -> bool {
     matches!(req, SftpRequest::HostProbe { .. })
 }
@@ -323,25 +324,282 @@ fn is_docker_exec_request(req: &SftpRequest) -> bool {
     )
 }
 
-/// Dual-lane SFTP pool on one SSH handle: browse and transfer never block each other.
-/// Sessions are opened lazily and closed after idle; closing `req_rx` tears the pool down.
+/// Per-host transfer scheduler.
+///
+/// Browsing still shares the shell connection (one SFTP channel, lazy + idle-reclaimed);
+/// transfers each dial their own SSH connection, capped per host so a burst of downloads
+/// cannot exhaust the server's `MaxSessions`/`MaxStartups`. Excess jobs wait their turn.
+const MAX_CONCURRENT_PER_HOST: usize = 10;
+/// Timeout for the per-transfer SSH handshake (connect + auth, jump hops included).
+const TRANSFER_CONNECT_TIMEOUT_SECS: u64 = 45;
+
+/// Shared runtime for transfers. Jobs are queued as tasks (no thread per waiting job).
+fn transfer_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    static RT: std::sync::OnceLock<Option<tokio::runtime::Runtime>> =
+        std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            // One worker per allowed concurrent transfer: SFTP framing + crypto is CPU work
+            // that must not starve the other in-flight jobs.
+            .worker_threads(MAX_CONCURRENT_PER_HOST)
+            .thread_name("loom-transfer")
+            .build()
+            .ok()
+    })
+    .as_ref()
+    .ok_or_else(|| anyhow::anyhow!("transfer runtime unavailable"))
+}
+
+/// One semaphore per SSH endpoint. Keyed by host:port (not per user) because the server's
+/// `MaxSessions` limit applies per `sshd` process.
+///
+/// Entries are intentionally never evicted: the map is bounded by the number of distinct
+/// hosts the user connects to, and removing a semaphore while jobs wait on it would let a
+/// later job bypass the cap.
+fn host_semaphore(key: &str) -> Arc<tokio::sync::Semaphore> {
+    static HOST_SEMAPHORES: parking_lot::Mutex<
+        Option<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    > = parking_lot::Mutex::new(None);
+    let mut guard = HOST_SEMAPHORES.lock();
+    guard
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PER_HOST)))
+        .clone()
+}
+
+/// Wait for a concurrency slot on this host. `cancel` (or a closed progress channel, i.e.
+/// the UI abandoned the job) aborts a queued job.
+async fn acquire_host_slot(
+    key: &str,
+    cancel: &TransferCancel,
+    progress: &Sender<TransferProgress>,
+) -> Result<tokio::sync::OwnedSemaphorePermit> {
+    let sem = host_semaphore(key);
+    loop {
+        ensure_not_cancelled(cancel)?;
+        if progress.is_disconnected() {
+            bail!("cancelled");
+        }
+        match Arc::clone(&sem).try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                // Queued: wait for a slot, but wake periodically to honor cancel.
+                tokio::select! {
+                    res = Arc::clone(&sem).acquire_owned() => {
+                        return res.map_err(|_| anyhow::anyhow!("transfer queue closed"));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                bail!("transfer queue closed");
+            }
+        }
+    }
+}
+
+/// Run one transfer on its own SSH connection, then close it.
+///
+/// Spawns onto the shared transfer runtime and reports back through `reply`, so a queued
+/// job costs no OS thread. Never call this from the UI thread's executor.
+pub fn spawn_transfer(
+    target: TransferTarget,
+    job: TransferJob,
+    progress: Sender<TransferProgress>,
+    cancel: TransferCancel,
+    reply: Sender<Result<TransferOutcome>>,
+) {
+    let key = target.host_key();
+    let runtime = match transfer_runtime() {
+        Ok(rt) => rt,
+        Err(err) => {
+            let _ = reply.send(Err(err));
+            return;
+        }
+    };
+    let cancel_task = Arc::clone(&cancel);
+    runtime.spawn(async move {
+        let outcome = run_transfer(&key, target, job, progress, cancel_task).await;
+        let _ = reply.send(outcome);
+    });
+}
+
+async fn run_transfer(
+    key: &str,
+    target: TransferTarget,
+    job: TransferJob,
+    progress: Sender<TransferProgress>,
+    cancel: TransferCancel,
+) -> Result<TransferOutcome> {
+    // Queue first: no socket / handshake until this host has a free slot.
+    let _slot = acquire_host_slot(key, &cancel, &progress).await?;
+    let id = job.id();
+
+    let config = Arc::new(client::Config {
+        inactivity_timeout: None,
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
+    // A dial/auth failure happens before we own a session, so there is nothing to close.
+    // Bounded: an unreachable host must not pin the host slot forever.
+    let connected = tokio::time::timeout(
+        Duration::from_secs(TRANSFER_CONNECT_TIMEOUT_SECS),
+        super::ssh::connect_handles(
+            config,
+            &target.host,
+            target.port,
+            &target.user,
+            target.auth,
+            target.jump,
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "connect to {}:{} timed out after {TRANSFER_CONNECT_TIMEOUT_SECS}s",
+            target.host,
+            target.port
+        )
+    })?;
+    let (session, _jump) = connected?;
+    let session = Arc::new(session);
+
+    let transfer = async {
+        let sftp = open_sftp(&session).await?;
+        match job {
+            TransferJob::Download {
+                remote,
+                local,
+                options,
+                ..
+            } => {
+                download_path(
+                    &session,
+                    &sftp,
+                    id,
+                    &remote,
+                    &local,
+                    &options,
+                    &progress,
+                    &cancel,
+                )
+                .await
+            }
+            TransferJob::Upload {
+                local,
+                remote_dir,
+                options,
+                ..
+            } => upload_path(&sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
+            TransferJob::DockerDownload {
+                container,
+                remote,
+                local,
+                ..
+            } => {
+                docker_download_staged(
+                    &session,
+                    &sftp,
+                    id,
+                    &container,
+                    &remote,
+                    &local,
+                    progress,
+                    Arc::clone(&cancel),
+                )
+                .await
+            }
+            TransferJob::DockerUpload {
+                container,
+                local,
+                remote_dir,
+                ..
+            } => {
+                docker_upload_staged(
+                    &session,
+                    &sftp,
+                    id,
+                    &container,
+                    &local,
+                    &remote_dir,
+                    progress,
+                    Arc::clone(&cancel),
+                )
+                .await
+            }
+        }
+    };
+
+    // Cancel must win even mid-`read`: a half-open socket would otherwise hold this host
+    // slot (and the connection) until the OS gives up. The flag alone is only checked
+    // between chunks.
+    let result = tokio::select! {
+        res = transfer => res,
+        _ = wait_cancelled(&cancel) => Err(anyhow::anyhow!("cancelled")),
+    };
+
+    // Close this job's connection (and jump tunnel) regardless of outcome.
+    // Bounded wait: a half-open socket must not pin the host slot forever.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.disconnect(russh::Disconnect::ByApplication, "transfer done", ""),
+    )
+    .await;
+    result
+}
+
+/// Resolve once `cancel` is set. Polls (10 Hz) because the flag is a plain atomic shared
+/// with the UI thread — no async primitive to await on.
+async fn wait_cancelled(cancel: &TransferCancel) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+impl TransferJob {
+    fn id(&self) -> uuid::Uuid {
+        match self {
+            Self::Download { id, .. }
+            | Self::Upload { id, .. }
+            | Self::DockerDownload { id, .. }
+            | Self::DockerUpload { id, .. } => *id,
+        }
+    }
+}
+
+/// Browse-only SFTP worker on the shell connection.
+///
+/// One lazily opened subsystem channel, reopened after idling, closed with the session.
 pub async fn run_sftp_worker(
     session: Arc<client::Handle<ClientHandler>>,
     req_rx: Receiver<SftpRequest>,
 ) {
-    let (browse_tx, browse_rx) = flume::unbounded::<SftpRequest>();
-    let (transfer_tx, transfer_rx) = flume::unbounded::<SftpRequest>();
+    let mut sftp: Option<(SftpSession, ChannelBudgetGuard)> = None;
+    let idle = std::time::Duration::from_secs(LANE_IDLE_SECS);
 
-    let browse_session = Arc::clone(&session);
-    let transfer_session = Arc::clone(&session);
-    let browse_task = tokio::spawn(async move {
-        run_lane(browse_session, browse_rx, LaneKind::Browse).await;
-    });
-    let transfer_task = tokio::spawn(async move {
-        run_lane(transfer_session, transfer_rx, LaneKind::Transfer).await;
-    });
+    loop {
+        let req = if sftp.is_some() {
+            tokio::select! {
+                biased;
+                msg = req_rx.recv_async() => match msg {
+                    Ok(req) => req,
+                    Err(_) => break,
+                },
+                _ = tokio::time::sleep(idle) => {
+                    // Idle reclaim: drop the channel and return global budget.
+                    sftp = None;
+                    continue;
+                }
+            }
+        } else {
+            match req_rx.recv_async().await {
+                Ok(req) => req,
+                Err(_) => break,
+            }
+        };
 
-    while let Ok(req) = req_rx.recv_async().await {
         if is_host_probe(&req) {
             let SftpRequest::HostProbe { reply } = req else {
                 continue;
@@ -360,83 +618,25 @@ pub async fn run_sftp_worker(
             });
             continue;
         }
-        if is_browse_request(&req) {
-            if browse_tx.send(req).is_err() {
-                break;
-            }
-        } else if transfer_tx.send(req).is_err() {
-            break;
+        if let Err(err) = ensure_session(&session, &mut sftp).await {
+            reply_open_err(&req, err);
+            continue;
         }
+        let Some((ref s, _)) = sftp else { continue };
+        dispatch_request(s, req).await;
     }
-
-    // Dropping senders ends both lanes; await so channels are closed before SSH teardown races.
-    drop(browse_tx);
-    drop(transfer_tx);
-    let _ = browse_task.await;
-    let _ = transfer_task.await;
-}
-
-async fn run_lane(
-    session: Arc<client::Handle<ClientHandler>>,
-    req_rx: Receiver<SftpRequest>,
-    kind: LaneKind,
-) {
-    let idle = std::time::Duration::from_secs(LANE_IDLE_SECS);
-    let mut sftp: Option<(SftpSession, ChannelBudgetGuard)> = None;
-
-    loop {
-        if sftp.is_some() {
-            tokio::select! {
-                biased;
-                msg = req_rx.recv_async() => {
-                    match msg {
-                        Ok(req) => {
-                            if let Err(err) = ensure_session(&session, &mut sftp, kind).await {
-                                reply_open_err(&req, err);
-                                continue;
-                            }
-                            let Some((ref s, _)) = sftp else { continue };
-                            dispatch_request(&session, s, req).await;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                _ = tokio::time::sleep(idle) => {
-                    // Idle reclaim: drop session and return global budget.
-                    sftp = None;
-                }
-            }
-        } else {
-            let Ok(req) = req_rx.recv_async().await else {
-                break;
-            };
-            if let Err(err) = ensure_session(&session, &mut sftp, kind).await {
-                reply_open_err(&req, err);
-                continue;
-            }
-            let Some((ref s, _)) = sftp else { continue };
-            dispatch_request(&session, s, req).await;
-        }
-    }
-
-    // Lane ends when req_rx closes; budget returns via ChannelBudgetGuard::drop.
 }
 
 async fn ensure_session(
     session: &client::Handle<ClientHandler>,
     sftp: &mut Option<(SftpSession, ChannelBudgetGuard)>,
-    kind: LaneKind,
 ) -> Result<()> {
     if sftp.is_some() {
         return Ok(());
     }
     if !try_acquire_channel_budget() {
-        let label = match kind {
-            LaneKind::Browse => "browse",
-            LaneKind::Transfer => "transfer",
-        };
         bail!(
-            "SFTP {label} unavailable: too many open SFTP channels (max {GLOBAL_SFTP_CHANNEL_BUDGET})"
+            "SFTP unavailable: too many open SFTP channels (max {GLOBAL_SFTP_CHANNEL_BUDGET})"
         );
     }
     let guard = ChannelBudgetGuard;
@@ -452,11 +652,7 @@ async fn ensure_session(
     }
 }
 
-async fn dispatch_request(
-    session: &client::Handle<ClientHandler>,
-    sftp: &SftpSession,
-    req: SftpRequest,
-) {
+async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
     match req {
         SftpRequest::Home { reply } => {
             let _ = reply.send(
@@ -467,33 +663,6 @@ async fn dispatch_request(
         }
         SftpRequest::List { path, reply } => {
             let _ = reply.send(list_dir(sftp, &path).await);
-        }
-        SftpRequest::Download {
-            id,
-            remote,
-            local,
-            options,
-            progress,
-            reply,
-            cancel,
-        } => {
-            let _ = reply.send(
-                download_path(session, sftp, id, &remote, &local, &options, &progress, &cancel)
-                    .await,
-            );
-        }
-        SftpRequest::Upload {
-            id,
-            local,
-            remote_dir,
-            options,
-            progress,
-            reply,
-            cancel,
-        } => {
-            let _ = reply.send(
-                upload_path(sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
-            );
         }
         SftpRequest::Mkdir { path, reply } => {
             let _ = reply.send(
@@ -523,38 +692,6 @@ async fn dispatch_request(
             let _ = reply.send(Err(anyhow::anyhow!(
                 "host probe must not run on SFTP lane"
             )));
-        }
-        SftpRequest::DockerDownload {
-            id,
-            container,
-            remote,
-            local,
-            progress,
-            reply,
-            cancel,
-        } => {
-            let _ = reply.send(
-                docker_download_staged(
-                    session, sftp, id, &container, &remote, &local, progress, cancel,
-                )
-                .await,
-            );
-        }
-        SftpRequest::DockerUpload {
-            id,
-            container,
-            local,
-            remote_dir,
-            progress,
-            reply,
-            cancel,
-        } => {
-            let _ = reply.send(
-                docker_upload_staged(
-                    session, sftp, id, &container, &local, &remote_dir, progress, cancel,
-                )
-                .await,
-            );
         }
         SftpRequest::DockerHome { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(
@@ -766,12 +903,6 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::List { reply, .. } | SftpRequest::DockerList { reply, .. } => {
-            let _ = reply.send(Err(anyhow::anyhow!(msg)));
-        }
-        SftpRequest::Download { reply, .. }
-        | SftpRequest::Upload { reply, .. }
-        | SftpRequest::DockerDownload { reply, .. }
-        | SftpRequest::DockerUpload { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::Mkdir { reply, .. }

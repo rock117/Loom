@@ -103,7 +103,7 @@ quit: cx.quit
 | --- | --- |
 | 生命周期 | 启动、`WillQuit`、flush、quit |
 | 会话 | SSH connect 成功/失败/超时、disconnect |
-| SFTP | 开 channel 失败、超预算、transfer 起止/取消 |
+| SFTP | 浏览开 channel 失败、超预算；传输连接建立/断开、起止/取消、排队等待 |
 | 持久化 | `persist_now` 失败（已有 eprintln，可迁到 `log::error!`） |
 
 不要：每次 keystroke、每次 forward `changes` notify、全量终端字节。
