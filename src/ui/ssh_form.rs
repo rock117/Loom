@@ -31,6 +31,8 @@ pub enum SshFormEvent {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FwdCopyFlash {
+    /// Base connect line (`ssh [-J …] [-i …] [-p …] user@host`), no `-L`.
+    Base,
     All,
     Rule(Uuid),
 }
@@ -1025,7 +1027,7 @@ impl SshForm {
         cx.notify();
     }
 
-    /// Connection bits for `ssh -L …` from the form fields.
+    /// Connection bits for OpenSSH paste (`ssh …` / `ssh -L …`) from the form fields.
     fn open_ssh_target(&self) -> (String, String, u16, Option<PathBuf>) {
         let user = self.user.text.trim().to_string();
         let host = self.host.text.trim().to_string();
@@ -1046,6 +1048,25 @@ impl SshForm {
             None
         };
         (user, host, port, identity)
+    }
+
+    /// Optional ProxyJump hop for `format_open_ssh_command` (`-J user@host:port`).
+    fn open_ssh_jump(&self) -> Option<(String, String, u16)> {
+        if !self.jump_enabled {
+            return None;
+        }
+        let jh = self.jump_host.text.trim();
+        let ju = self.jump_user.text.trim();
+        if jh.is_empty() || ju.is_empty() {
+            return None;
+        }
+        let jp = self.jump_port.text.trim().parse::<u16>().unwrap_or(22);
+        Some((ju.to_string(), jh.to_string(), jp))
+    }
+
+    /// Copy `ssh [-J …] [-i …] [-p …] user@host` (no port-forward flags).
+    fn copy_base_open_ssh(&mut self, cx: &mut Context<Self>) {
+        self.copy_open_ssh_for_rules(&[], FwdCopyFlash::Base, cx);
     }
 
     fn render_jump_section(
@@ -1256,7 +1277,8 @@ impl SshForm {
         flash: FwdCopyFlash,
         cx: &mut Context<Self>,
     ) {
-        if rules.is_empty() {
+        // Base copy allows empty rules; forward Copy ssh still needs at least one.
+        if rules.is_empty() && !matches!(flash, FwdCopyFlash::Base) {
             return;
         }
         let (user, host, port, identity) = self.open_ssh_target();
@@ -1265,18 +1287,7 @@ impl SshForm {
             return;
         }
         let flags: Vec<String> = rules.iter().map(|r| r.open_ssh_flag()).collect();
-        let jump = if self.jump_enabled {
-            let jh = self.jump_host.text.trim();
-            let ju = self.jump_user.text.trim();
-            if !jh.is_empty() && !ju.is_empty() {
-                let jp = self.jump_port.text.trim().parse::<u16>().unwrap_or(22);
-                Some((ju.to_string(), jh.to_string(), jp))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let jump = self.open_ssh_jump();
         let cmd = format_open_ssh_command(
             &user,
             &host,
@@ -2589,64 +2600,100 @@ impl Render for SshForm {
                                 .child(msg),
                         )
                     })
-                    .child(
+                    .child({
+                        let can_copy = !self.host.text.trim().is_empty();
+                        let base_copied = self.fwd_copy_flash == Some(FwdCopyFlash::Base);
+                        let copy_label = if base_copied { "Copied" } else { "Copy ssh" };
+                        let copy_color = if base_copied {
+                            theme::SUCCESS
+                        } else {
+                            theme::TEXT_MUTED
+                        };
                         div()
                             .flex()
-                            .justify_end()
+                            .items_center()
+                            .justify_between()
                             .gap_2()
                             .mt_2()
                             .child(
                                 div()
-                                    .id("ssh-cancel")
+                                    .id("ssh-copy-cmd")
                                     .px_3()
                                     .py_1()
                                     .rounded(px(theme::RADIUS_SM))
                                     .text_sm()
-                                    .text_color(theme::TEXT_MUTED)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::HOVER))
-                                    .child("Cancel")
-                                    .on_click(cx.listener(|_, _, _, cx| {
-                                        cx.emit(SshFormEvent::Close);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("ssh-save")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .bg(theme::ELEVATED)
-                                    .text_sm()
-                                    .text_color(theme::TEXT)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::HOVER))
-                                    .child("Save")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit(false, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("ssh-connect")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .bg(theme::ACCENT)
-                                    .text_sm()
-                                    .text_color(rgb(0xffffff))
-                                    .cursor_pointer()
-                                    .hover(|s| s.opacity(0.9))
-                                    .child(if editing {
-                                        "Save & Connect"
+                                    .text_color(if can_copy {
+                                        copy_color
                                     } else {
-                                        "Save & Connect"
+                                        theme::TEXT_DISABLED
                                     })
+                                    .when(can_copy, |d| {
+                                        d.cursor_pointer().hover(|s| {
+                                            s.bg(theme::HOVER).text_color(theme::TEXT)
+                                        })
+                                    })
+                                    .child(copy_label)
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit(true, cx);
+                                        this.copy_base_open_ssh(cx);
                                     })),
-                            ),
-                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("ssh-cancel")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .text_sm()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::HOVER))
+                                            .child("Cancel")
+                                            .on_click(cx.listener(|_, _, _, cx| {
+                                                cx.emit(SshFormEvent::Close);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ssh-save")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(theme::ELEVATED)
+                                            .text_sm()
+                                            .text_color(theme::TEXT)
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(theme::HOVER))
+                                            .child("Save")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit(false, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("ssh-connect")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded(px(theme::RADIUS_SM))
+                                            .bg(theme::ACCENT)
+                                            .text_sm()
+                                            .text_color(rgb(0xffffff))
+                                            .cursor_pointer()
+                                            .hover(|s| s.opacity(0.9))
+                                            .child(if editing {
+                                                "Save & Connect"
+                                            } else {
+                                                "Save & Connect"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit(true, cx);
+                                            })),
+                                    ),
+                            )
+                    }),
             )
     }
 }
