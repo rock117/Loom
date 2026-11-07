@@ -15,6 +15,7 @@ use crate::platform;
 use crate::session::credentials;
 use crate::session::forward::ForwardHandle;
 use crate::session::local::{LocalPty, resolve_shell, teardown_pty};
+use crate::session::known_hosts::HostKeyMismatch;
 use crate::session::ssh::{self, SshAuthMaterial, SshConnectParams, SshJumpParams};
 use crate::session::wsl;
 use crate::shared::theme;
@@ -854,7 +855,21 @@ impl TabManager {
                     }
                     Ok(Err(err)) => {
                         pane.state = ConnectionState::Failed;
-                        pane.status_message = format!("{err:#}");
+                        if let Some(mismatch) = err.downcast_ref::<HostKeyMismatch>() {
+                            pane.status_message = format!(
+                                "Host key changed for {} — confirm to trust",
+                                mismatch.endpoint()
+                            );
+                            let mismatch = mismatch.clone();
+                            let bus = this.app_bus.clone();
+                            AppBus::emit(
+                                &bus,
+                                AppBusEvent::HostKeyChanged { pane_id, mismatch },
+                                cx,
+                            );
+                        } else {
+                            pane.status_message = format!("{err:#}");
+                        }
                     }
                     Err(_) => {
                         pane.state = ConnectionState::Failed;

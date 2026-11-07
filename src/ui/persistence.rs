@@ -34,6 +34,7 @@ impl Persistence {
                 AppBusEvent::SplitPane { .. } => {}
                 AppBusEvent::ReconnectPane { .. } => {}
                 AppBusEvent::DuplicateActiveTab => {}
+                AppBusEvent::HostKeyChanged { .. } => {}
                 AppBusEvent::Toast(_) => {}
             }
         });

@@ -4,9 +4,11 @@ use gpui::*;
 use crate::model::{ProfileKind, export_workspace_to, import_workspace_from};
 use crate::shared::actions::*;
 use crate::shared::theme;
+use crate::session::known_hosts::{self, HostKeyMismatch};
 use crate::ui::app_bus::{AppBus, AppBusEvent};
 use crate::ui::context_panel::{ContextPanel, ContextPanelEvent};
 use crate::ui::docker_picker::{DockerPicker, DockerPickerEvent};
+use crate::ui::host_key_prompt::{HostKeyPrompt, HostKeyPromptEvent};
 use crate::ui::local_form::{LocalForm, LocalFormEvent};
 use crate::ui::password_prompt::{PasswordPrompt, PasswordPromptEvent, SshPasswordRole};
 use crate::ui::persistence::Persistence;
@@ -61,6 +63,7 @@ pub struct WorkspaceView {
     docker_picker: Entity<DockerPicker>,
     local_form: Entity<LocalForm>,
     password_prompt: Option<Entity<PasswordPrompt>>,
+    host_key_prompt: Option<Entity<HostKeyPrompt>>,
     pending_password: Option<PendingPasswordAction>,
     /// Oneshot passwords collected across sequential jump/target prompts (not keyring).
     password_oneshot_target: Option<String>,
@@ -157,6 +160,7 @@ impl WorkspaceView {
             docker_picker: docker_picker.clone(),
             local_form: local_form.clone(),
             password_prompt: None,
+            host_key_prompt: None,
             pending_password: None,
             password_oneshot_target: None,
             password_oneshot_jump: None,
@@ -191,6 +195,11 @@ impl WorkspaceView {
                 }
                 AppBusEvent::DuplicateActiveTab => {
                     this.request_duplicate_tab(window, cx);
+                }
+                AppBusEvent::HostKeyChanged { pane_id, mismatch } => {
+                    let pane_id = *pane_id;
+                    let mismatch = mismatch.clone();
+                    this.show_host_key_prompt(pane_id, mismatch, window, cx);
                 }
                 AppBusEvent::Toast(msg) => {
                     this.set_toast(msg.clone(), cx);
@@ -656,6 +665,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.host_key_prompt = None;
         let keep_docker_picker =
             matches!(&action, PendingPasswordAction::DockerList { .. });
         self.pending_password.replace(action);
@@ -958,6 +968,56 @@ impl WorkspaceView {
         let store = self.store.clone();
         self.tabs.update(cx, |m, cx| {
             m.reconnect(tab_id, &store, window, cx);
+        });
+    }
+
+    fn show_host_key_prompt(
+        &mut self,
+        pane_id: uuid::Uuid,
+        mismatch: HostKeyMismatch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.password_prompt = None;
+        let prompt = cx.new(|cx| HostKeyPrompt::new(pane_id, mismatch, cx));
+        self._subscriptions.push(cx.subscribe_in(
+            &prompt,
+            window,
+            move |this, _, event: &HostKeyPromptEvent, window, cx| match event {
+                HostKeyPromptEvent::Cancel => {
+                    this.host_key_prompt = None;
+                    cx.notify();
+                }
+                HostKeyPromptEvent::Trust { pane_id, mismatch } => {
+                    let pane_id = *pane_id;
+                    // Tiny JSON write; shared KNOWN_HOSTS_LOCK with SSH check path.
+                    match known_hosts::trust_host(
+                        &mismatch.host,
+                        mismatch.port,
+                        &mismatch.offered,
+                    ) {
+                        Ok(()) => {
+                            this.host_key_prompt = None;
+                            this.set_toast(
+                                format!("Trusted new host key for {}", mismatch.endpoint()),
+                                cx,
+                            );
+                            this.request_reconnect_pane(pane_id, window, cx);
+                        }
+                        Err(err) => {
+                            this.set_toast(format!("Could not update known_hosts: {err:#}"), cx);
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+        ));
+        self.host_key_prompt = Some(prompt);
+        cx.notify();
+        cx.defer_in(window, |this, window, cx| {
+            if let Some(prompt) = this.host_key_prompt.as_ref() {
+                prompt.read(cx).focus(window);
+            }
         });
     }
 
@@ -1626,6 +1686,7 @@ impl Render for WorkspaceView {
             .when(self.show_docker_picker, |d| d.child(self.docker_picker.clone()))
             .when(self.show_local_form, |d| d.child(self.local_form.clone()))
             .when_some(self.password_prompt.clone(), |d, prompt| d.child(prompt))
+            .when_some(self.host_key_prompt.clone(), |d, prompt| d.child(prompt))
             // Full-window backdrop under TabBar menus (priority 0); menu uses priority 1.
             .when(tab_menus_open, |d| {
                 d.child(

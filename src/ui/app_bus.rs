@@ -3,6 +3,7 @@
 use gpui::*;
 use uuid::Uuid;
 
+use crate::session::known_hosts::HostKeyMismatch;
 use crate::ui::pane_layout::SplitDirection;
 
 /// Lifecycle / persistence facts emitted by [`AppBus`].
@@ -21,6 +22,11 @@ pub enum AppBusEvent {
     ReconnectPane { pane_id: Uuid },
     /// Duplicate the active tab (from terminal context menu).
     DuplicateActiveTab,
+    /// SSH host key no longer matches known_hosts — show trust dialog.
+    HostKeyChanged {
+        pane_id: Uuid,
+        mismatch: HostKeyMismatch,
+    },
     /// Brief status-bar toast (e.g. invalid shell fallback).
     Toast(SharedString),
 }

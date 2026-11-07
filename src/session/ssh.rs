@@ -9,12 +9,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use flume::{Receiver, Sender};
+use parking_lot::Mutex;
 use russh::client::{self, KeyboardInteractiveAuthResponse};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key};
 use russh::{ChannelMsg, Disconnect};
 use tokio::runtime::Builder as RtBuilder;
 
-use super::known_hosts;
+use super::known_hosts::{self, HostKeyMismatch};
 
 /// Auth material resolved before connect (password never written to profile JSON).
 #[derive(Debug, Clone)]
@@ -116,6 +117,37 @@ impl Write for ChannelWriter {
 pub(crate) struct ClientHandler {
     host: String,
     port: u16,
+    /// Filled when [`check_server_key`] rejects so callers can surface [`HostKeyMismatch`].
+    reject: Arc<Mutex<Option<HostKeyMismatch>>>,
+}
+
+impl ClientHandler {
+    fn new(host: impl Into<String>, port: u16) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            reject: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn reject_slot(&self) -> Arc<Mutex<Option<HostKeyMismatch>>> {
+        Arc::clone(&self.reject)
+    }
+}
+
+/// Prefer a recorded [`HostKeyMismatch`] over russh's generic "Unknown server key".
+///
+/// Returns the mismatch **without** wrapping context so UI can `downcast_ref` it.
+fn map_key_reject(
+    reject: &Mutex<Option<HostKeyMismatch>>,
+    err: impl Into<anyhow::Error>,
+    context: impl FnOnce() -> String,
+) -> anyhow::Error {
+    if let Some(mismatch) = reject.lock().take() {
+        anyhow::Error::new(mismatch)
+    } else {
+        err.into().context(context())
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -130,6 +162,9 @@ impl client::Handler for ClientHandler {
             Ok(()) => Ok(true),
             Err(err) => {
                 eprintln!("loom: SSH host key rejected: {err:#}");
+                if let Some(mismatch) = err.downcast_ref::<HostKeyMismatch>() {
+                    *self.reject.lock() = Some(mismatch.clone());
+                }
                 Ok(false)
             }
         }
@@ -203,9 +238,9 @@ pub fn connect_blocking(params: SshConnectParams) -> Result<SshSessionHandles> {
                         let _ = stdout_tx.send(Vec::new());
                     }
                     Err(err) => {
-                        let _ = ready_tx.send(Err(anyhow::anyhow!("{err:#}")));
+                        // Preserve typed errors (e.g. HostKeyMismatch) for the UI.
+                        let _ = ready_tx.send(Err(err));
                         let _ = stdout_tx.send(Vec::new());
-                        eprintln!("loom: SSH session ended: {err:#}");
                     }
                 }
             });
@@ -252,30 +287,38 @@ pub(crate) async fn connect_handles(
     Option<client::Handle<ClientHandler>>,
 )> {
     let Some(jump) = jump else {
-        let handler = ClientHandler {
-            host: host.to_string(),
-            port,
+        let handler = ClientHandler::new(host, port);
+        let reject = handler.reject_slot();
+        let mut session = match client::connect(Arc::clone(&config), (host, port), handler).await {
+            Ok(s) => s,
+            Err(err) => {
+                return Err(map_key_reject(&reject, err, || {
+                    format!("connect to {host}:{port}")
+                }));
+            }
         };
-        let mut session = client::connect(Arc::clone(&config), (host, port), handler)
-            .await
-            .with_context(|| format!("connect to {host}:{port}"))?;
         authenticate(&mut session, user, auth)
             .await
             .context("SSH authentication")?;
         return Ok((session, None));
     };
 
-    let jump_handler = ClientHandler {
-        host: jump.host.clone(),
-        port: jump.port,
-    };
-    let mut jump_session = client::connect(
+    let jump_handler = ClientHandler::new(jump.host.clone(), jump.port);
+    let jump_reject = jump_handler.reject_slot();
+    let mut jump_session = match client::connect(
         Arc::clone(&config),
         (jump.host.as_str(), jump.port),
         jump_handler,
     )
     .await
-    .with_context(|| format!("connect to jump {0}:{1}", jump.host, jump.port))?;
+    {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(map_key_reject(&jump_reject, err, || {
+                format!("connect to jump {}:{}", jump.host, jump.port)
+            }));
+        }
+    };
 
     authenticate(&mut jump_session, &jump.user, jump.auth)
         .await
@@ -299,13 +342,17 @@ pub(crate) async fn connect_handles(
         })?;
 
     let stream = tunnel.into_stream();
-    let target_handler = ClientHandler {
-        host: host.to_string(),
-        port,
+    let target_handler = ClientHandler::new(host, port);
+    let target_reject = target_handler.reject_slot();
+    let mut target = match client::connect_stream(Arc::clone(&config), stream, target_handler).await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(map_key_reject(&target_reject, err, || {
+                format!("SSH handshake to {host}:{port} via jump")
+            }));
+        }
     };
-    let mut target = client::connect_stream(Arc::clone(&config), stream, target_handler)
-        .await
-        .with_context(|| format!("SSH handshake to {host}:{port} via jump"))?;
 
     authenticate(&mut target, user, auth)
         .await
@@ -570,13 +617,16 @@ async fn exec_once_async(
         keepalive_interval: Some(Duration::from_secs(30)),
         ..Default::default()
     });
-    let handler = ClientHandler {
-        host: host.to_string(),
-        port,
+    let handler = ClientHandler::new(host, port);
+    let reject = handler.reject_slot();
+    let mut session = match client::connect(config, (host, port), handler).await {
+        Ok(s) => s,
+        Err(err) => {
+            return Err(map_key_reject(&reject, err, || {
+                format!("connect to {host}:{port}")
+            }));
+        }
     };
-    let mut session = client::connect(config, (host, port), handler)
-        .await
-        .with_context(|| format!("connect to {host}:{port}"))?;
     authenticate(&mut session, user, auth)
         .await
         .context("SSH authentication")?;

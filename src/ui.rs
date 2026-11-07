@@ -4,6 +4,7 @@ pub mod app_bus;
 pub mod context_panel;
 pub mod docker_picker;
 pub mod file_icon;
+pub mod host_key_prompt;
 pub mod local_form;
 pub mod password_prompt;
 pub mod pane_layout;

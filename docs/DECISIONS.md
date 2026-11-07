@@ -127,7 +127,7 @@ Zed does **not** use `gpui-terminal`; it owns `crates/terminal` and always `writ
 
 **Why:** Keeps MIT-friendly Rust stack, matches Local session I/O shape, avoids plaintext secrets on disk.
 
-**Consequences / follow-ups:** One-hop ProxyJump shipped — see below / [SSH_JUMP.md](./SSH_JUMP.md). Agent forwarding / passphrase UI later. Host-key change requires manual known_hosts edit for now.
+**Consequences / follow-ups:** One-hop ProxyJump shipped — see below / [SSH_JUMP.md](./SSH_JUMP.md). Agent forwarding / passphrase UI later. Host-key change shows a trust dialog (fingerprints + Trust and reconnect); still no silent auto-overwrite.
 
 ---
 
