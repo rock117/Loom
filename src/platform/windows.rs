@@ -83,14 +83,25 @@ pub fn native_open_path(path: &std::path::Path) -> std::io::Result<()> {
     }
 }
 
-pub fn native_open_url(url: &str) -> std::io::Result<()> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
-
+/// Grant other processes a short window to take foreground.
+///
+/// Call from the **UI / click thread** before [`crate::platform::open_url_detached`]
+/// so a background `ShellExecuteW` can still raise the browser. Harmless if
+/// foreground rules deny it.
+pub fn allow_set_foreground_any() {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn AllowSetForegroundWindow(dw_process_id: u32) -> i32;
     }
+    const ASFW_ANY: u32 = u32::MAX;
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+}
+
+pub fn native_open_url(url: &str) -> std::io::Result<()> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
 
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -104,7 +115,6 @@ pub fn native_open_url(url: &str) -> std::io::Result<()> {
         ) -> isize;
     }
 
-    const ASFW_ANY: u32 = u32::MAX;
     const SW_SHOWNORMAL: i32 = 1;
 
     let operation: Vec<u16> = OsStr::new("open")
@@ -116,9 +126,9 @@ pub fn native_open_url(url: &str) -> std::io::Result<()> {
         .chain(std::iter::once(0))
         .collect();
 
-    unsafe {
-        let _ = AllowSetForegroundWindow(ASFW_ANY);
-    }
+    // Best-effort if the caller forgot; preferred call site is the UI thread
+    // via [`allow_set_foreground_any`] before detaching.
+    allow_set_foreground_any();
 
     let ret = unsafe {
         ShellExecuteW(

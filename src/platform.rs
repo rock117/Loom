@@ -103,6 +103,10 @@ pub fn open_path_detached(path: std::path::PathBuf) {
 ///
 /// Refuses empty / oversized / control-character strings and unknown schemes so
 /// a Ctrl+click cannot feed the shell opener arbitrary input.
+///
+/// **Do not call from the UI / click path** — `ShellExecuteW` / `xdg-open` can
+/// block for seconds (cold browser, UAC, association dialog). Use
+/// [`open_url_detached`] instead.
 pub fn open_url(url: &str) -> std::io::Result<()> {
     if !is_safe_open_url(url) {
         return Err(std::io::Error::new(
@@ -111,6 +115,29 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
         ));
     }
     native_open_url(url)
+}
+
+/// Open a URL on a background thread so ShellExecute / `xdg-open` never stalls GPUI.
+///
+/// Validates on the caller thread first (cheap); only then spawns. Errors are
+/// logged — Ctrl+click has no toast surface.
+pub fn open_url_detached(url: String) {
+    if !is_safe_open_url(&url) {
+        eprintln!("loom: refusing to open unsafe or unsupported URL");
+        return;
+    }
+    // On Windows, grant foreground from this (UI) thread before the worker
+    // calls ShellExecute — otherwise the browser often only flashes the taskbar.
+    #[cfg(windows)]
+    allow_set_foreground_any();
+    std::thread::Builder::new()
+        .name("loom-open-url".into())
+        .spawn(move || {
+            if let Err(err) = native_open_url(&url) {
+                eprintln!("loom: failed to open URL {url}: {err}");
+            }
+        })
+        .ok();
 }
 
 const OPEN_URL_SCHEMES: &[&str] = &[

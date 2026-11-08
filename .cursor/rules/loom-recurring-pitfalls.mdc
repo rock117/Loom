@@ -17,7 +17,7 @@ Before UI / terminal / session changes, skim:
 - Bare `String` input with only push/pop and no selection
 - New focusable editor without wiring `handle_input` to the same focus (CJK silent drop)
 - `with_term*` while paint already holds `term_arc`
-- Sync SSH / disk / `recv` / keyring on the UI thread
+- Sync SSH / disk / `recv` / keyring / `ShellExecuteW` (URL Ctrl+click, Reveal) on the UI thread
 - Windows **background** helpers via bare `Command::new` / `std::process::Command::new` for console apps (`wsl.exe`, `powershell`, `cmd`, `nvidia-smi`, `where`, …) — use `crate::platform::new_command` instead (sets `CREATE_NO_WINDOW`). Double-click release must not pop visible terminals.
 - Reading `TerminalView::working_directory()` / pane `kind.cwd` as **ground truth for a user Save / Copy Path / Reveal** without `refresh_working_directory()` first (OSC/`cd` often never updates the cache)
 

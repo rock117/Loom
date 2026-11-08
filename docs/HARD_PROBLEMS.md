@@ -56,6 +56,7 @@ GPUI runs layout → prepaint → paint and input dispatch on the **window / UI 
 | PTY spawn + waiting for first output synchronously in open handler | Shell startup blocks open | Spawn async; show tab in Connecting; attach terminal when ready |
 | Per-chunk `cx.notify()` on PTY flood (`yes` / huge `cat`) | UI drown in updates; soft freeze | Drain pending chunks, one `process_bytes` + one notify — see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md). **Never drop bytes** |
 | Lock order inversion (e.g. store lock then term lock vs reverse) | Cross-thread or same-thread deadlock | Document order: prefer **no nested locks**; if needed, fixed global order |
+| Ctrl+click URL / Reveal / Open via sync `ShellExecuteW` on UI thread | Cold browser, missing association, or shell dialog blocks the click path → frozen / “hung” window | [`platform::open_url_detached`](../src/platform.rs) / `open_path_detached` (same class as path open) |
 
 **Loom rules of thumb:**
 

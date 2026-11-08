@@ -1381,9 +1381,11 @@ impl TerminalView {
 
     /// Ctrl/Cmd+click: open http(s)/… URL under the cell, if any.
     ///
-    /// Opens **synchronously on the UI thread** via [`platform::open_url`].
-    /// GPUI's `cx.open_url` runs on a background executor, which on Windows
-    /// often prevents the browser from taking foreground (taskbar flash only).
+    /// Open runs on a **background thread** ([`platform::open_url_detached`]).
+    /// Calling `ShellExecuteW` on the UI thread used to freeze / kill the window
+    /// when the default browser was slow, missing, or waiting on a dialog.
+    /// (GPUI's `cx.open_url` is also async, but often loses foreground on Windows;
+    /// our detached path still calls `AllowSetForegroundWindow` before launch.)
     fn open_url_at(&self, position: Point<Pixels>, _cx: &App) -> bool {
         let Some((point, _)) = self.cell_at(position) else {
             return false;
@@ -1394,9 +1396,7 @@ impl TerminalView {
         if !hyperlink::is_safe_open_url(&url) {
             return false;
         }
-        if let Err(err) = platform::open_url(&url) {
-            eprintln!("loom: failed to open URL {url}: {err}");
-        }
+        platform::open_url_detached(url);
         // Consume the click either way so we don't start a selection mid-Ctrl.
         true
     }
