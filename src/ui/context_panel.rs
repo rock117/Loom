@@ -198,8 +198,6 @@ pub struct ContextPanel {
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
     prompt: Option<FilesPrompt>,
-    /// Remember compress checkbox across transfers in this session.
-    last_compress: bool,
     /// Last local download destination directory.
     last_download_dir: Option<String>,
     /// Address-bar editor for the Files cwd (copy / paste / Enter to navigate).
@@ -243,6 +241,8 @@ pub struct ContextPanel {
 #[derive(Clone, Debug)]
 pub enum ContextPanelEvent {
     Toast(SharedString),
+    /// Files banner asked to reconnect the focused SSH/Docker pane.
+    ReconnectPane(Uuid),
 }
 
 impl ContextPanel {
@@ -279,7 +279,6 @@ impl ContextPanel {
             transfer_menu: None,
             entry_menu: None,
             prompt: None,
-            last_compress: false,
             last_download_dir: None,
             path_edit: RenameEdit::new(""),
             editing_path: false,
@@ -331,6 +330,9 @@ impl ContextPanel {
     }
 
     /// SSH SFTP, Docker container FS, or a Local profile pane for filesystem browsing.
+    ///
+    /// SSH panes stay bound even while Connecting / Disconnected (`sftp` may be `None`)
+    /// so the Files tab can show a real status instead of the empty-session copy.
     fn focused_files(&self, cx: &App) -> Option<(Uuid, FilesKind, Option<SftpHandle>)> {
         let tab = self.tabs.read(cx).active_tab()?;
         let pane = tab.focused_pane()?;
@@ -342,13 +344,18 @@ impl ContextPanel {
         if pane.kind.is_docker_ssh() {
             return Some((id, FilesKind::Docker, pane.ssh_sftp.clone()));
         }
-        if let Some(sftp) = pane.ssh_sftp.clone() {
-            return Some((id, FilesKind::Sftp, Some(sftp)));
+        if matches!(pane.kind, ProfileKind::Ssh { .. }) {
+            return Some((id, FilesKind::Sftp, pane.ssh_sftp.clone()));
         }
         if pane.kind.is_local() {
             return Some((id, FilesKind::Local, None));
         }
         None
+    }
+
+    fn focused_pane_state(&self, cx: &App) -> Option<(Uuid, ConnectionState)> {
+        let pane = self.tabs.read(cx).active_tab()?.focused_pane()?;
+        Some((pane.id, pane.state))
     }
 
     /// `(pane_id, container_id, optional SFTP handle for Docker-over-SSH)`.
@@ -478,6 +485,14 @@ impl ContextPanel {
             && self.files_kind == Some(kind)
             && self.bound_sftp_alive == sftp_alive
         {
+            // SFTP handle still missing: refresh Connecting / Disconnected banner.
+            if !sftp_alive && kind == FilesKind::Sftp {
+                let msg = self.sftp_unavailable_message(cx);
+                if self.error.as_ref() != Some(&msg) {
+                    self.error = Some(msg);
+                    cx.notify();
+                }
+            }
             return;
         }
         self.bound_pane = Some(pane_id);
@@ -489,7 +504,8 @@ impl ContextPanel {
                 if let Some(sftp) = sftp {
                     self.go_home_sftp(sftp, cx);
                 } else {
-                    self.error = Some("SFTP unavailable".into());
+                    self.error = Some(self.sftp_unavailable_message(cx));
+                    cx.notify();
                 }
             }
             FilesKind::Docker => self.go_home_docker(cx),
@@ -497,10 +513,27 @@ impl ContextPanel {
         }
     }
 
+    fn sftp_unavailable_message(&self, cx: &App) -> String {
+        match self.focused_pane_state(cx).map(|(_, s)| s) {
+            Some(ConnectionState::Connecting) => "Connecting…".into(),
+            Some(ConnectionState::Disconnected) | Some(ConnectionState::Failed) => {
+                "Disconnected — reconnect to browse files".into()
+            }
+            _ => "SFTP unavailable".into(),
+        }
+    }
+
+    fn files_can_reconnect(&self, cx: &App) -> bool {
+        matches!(
+            self.focused_pane_state(cx).map(|(_, s)| s),
+            Some(ConnectionState::Disconnected | ConnectionState::Failed)
+        )
+    }
+
     fn go_home_sftp(&mut self, sftp: SftpHandle, cx: &mut Context<Self>) {
         let (tx, rx) = flume::bounded(1);
         if sftp.request(SftpRequest::Home { reply: tx }).is_err() {
-            self.error = Some("SFTP unavailable".into());
+            self.error = Some(self.sftp_unavailable_message(cx));
             return;
         }
         self.listing = true;
@@ -921,8 +954,7 @@ impl ContextPanel {
             );
             return;
         }
-        let form =
-            TransferSettingsForm::for_download(entry, dest, self.last_compress);
+        let form = TransferSettingsForm::for_download(entry, dest);
         self.prompt = Some(FilesPrompt::TransferSettings(form));
         self.start_prompt_caret_blink(cx);
         cx.notify();
@@ -982,8 +1014,7 @@ impl ContextPanel {
             }
             return;
         }
-        let form =
-            TransferSettingsForm::for_upload(pane_id, locals, dest, self.last_compress);
+        let form = TransferSettingsForm::for_upload(pane_id, locals, dest);
         self.prompt = Some(FilesPrompt::TransferSettings(form));
         self.start_prompt_caret_blink(cx);
         cx.notify();
@@ -1018,8 +1049,6 @@ impl ContextPanel {
         let is_dir = entry.is_dir;
         let id = Uuid::new_v4();
         let cancel = transfer_cancel_flag();
-        let compress = options.compress;
-        // Real archive name is set once remote packing finishes (via progress.label).
         let label = name.clone();
 
         self.pane_transfers_mut(pane_id).insert(
@@ -1030,17 +1059,12 @@ impl ContextPanel {
                 direction: TransferDir::Download,
                 status: TransferStatus::Queued,
                 local_path: None,
-                // Compressed download is always a single archive file.
-                is_dir: is_dir && !compress,
+                is_dir,
                 open_after,
                 started_at: None,
                 elapsed: None,
                 bytes_done: 0,
-                bytes_total: if is_dir || compress {
-                    None
-                } else {
-                    Some(entry.size)
-                },
+                bytes_total: if is_dir { None } else { Some(entry.size) },
                 phase: None,
                 cancel: cancel.clone(),
             },
@@ -1048,10 +1072,6 @@ impl ContextPanel {
         if open_after {
             cx.emit(ContextPanelEvent::Toast(
                 format!("Downloading “{name}” — opens when ready").into(),
-            ));
-        } else if compress {
-            cx.emit(ContextPanelEvent::Toast(
-                format!("Compressing “{name}” on remote, then downloading archive…").into(),
             ));
         }
         cx.notify();
@@ -1070,13 +1090,7 @@ impl ContextPanel {
                     }
                 }
             } else if let Some(dir) = dest_dir {
-                // Compress: `local` is the destination folder; archive is written inside it.
-                // Plain: place entry at dest/name.
-                if options.compress {
-                    Some(dir)
-                } else {
-                    Some(dir.join(&name))
-                }
+                Some(dir.join(&name))
             } else if is_dir {
                 rfd::AsyncFileDialog::new()
                     .set_title("Download folder to…")
@@ -1150,6 +1164,7 @@ impl ContextPanel {
                                             files,
                                             Some(outcome.bytes),
                                             outcome.saved_as,
+                                            cx,
                                         );
                                     }
                                     Ok(Err(err)) => {
@@ -1340,6 +1355,7 @@ impl ContextPanel {
                                             files,
                                             Some(outcome.bytes),
                                             outcome.saved_as,
+                                            cx,
                                         );
                                     }
                                     Ok(Err(err)) => {
@@ -1496,13 +1512,8 @@ impl ContextPanel {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| local.display().to_string());
-        let compress = options.compress;
-        let label = if compress {
-            format!("{base_name}.zip")
-        } else {
-            base_name
-        };
-        let is_dir = local.is_dir() && !compress;
+        let label = base_name;
+        let is_dir = local.is_dir();
         let cancel = transfer_cancel_flag();
 
         self.pane_transfers_mut(pane_id).insert(
@@ -1566,6 +1577,7 @@ impl ContextPanel {
                                             files,
                                             Some(outcome.bytes),
                                             outcome.saved_as,
+                                            cx,
                                         );
                                         if let Some(cwd) = this.cwd.clone() {
                                             this.load_dir(cwd, cx);
@@ -1706,6 +1718,7 @@ impl ContextPanel {
                                             files,
                                             Some(outcome.bytes),
                                             outcome.saved_as,
+                                            cx,
                                         );
                                         if let Some(cwd) = this.cwd.clone() {
                                             this.load_dir(cwd, cx);
@@ -1796,8 +1809,10 @@ impl ContextPanel {
         files: Option<u32>,
         bytes: Option<u64>,
         saved_as: Option<PathBuf>,
+        cx: &mut Context<Self>,
     ) {
         let mut open_path: Option<PathBuf> = None;
+        let mut toast: Option<String> = None;
         if let Some(row) = self.find_transfer_mut(id) {
             let files = files.or_else(|| match &row.status {
                 TransferStatus::Running { files_done, .. } if row.is_dir => *files_done,
@@ -1824,11 +1839,21 @@ impl ContextPanel {
             row.phase = None;
             if row.open_after {
                 open_path = row.local_path.clone();
+            } else if matches!(row.direction, TransferDir::Download) {
+                let where_to = row
+                    .local_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| row.label.clone());
+                toast = Some(format!("Downloaded · {where_to}"));
             }
             row.status = TransferStatus::Done { files };
         }
         if let Some(path) = open_path {
             platform::open_path_detached(path);
+        }
+        if let Some(msg) = toast {
+            cx.emit(ContextPanelEvent::Toast(msg.into()));
         }
     }
 
@@ -2836,7 +2861,6 @@ impl ContextPanel {
             return;
         }
         let options = form.build_options();
-        self.last_compress = options.compress;
 
         match form.pending {
             PendingTransfer::Download { entry } => {
@@ -2873,20 +2897,6 @@ impl ContextPanel {
                             cx.notify();
                             return;
                         };
-                        if options.compress {
-                            let names: Vec<String> = locals
-                                .iter()
-                                .filter_map(|p| {
-                                    p.file_name().map(|s| s.to_string_lossy().into_owned())
-                                })
-                                .collect();
-                            let preview =
-                                names.first().cloned().unwrap_or_else(|| "files".into());
-                            cx.emit(ContextPanelEvent::Toast(
-                                format!("Zipping “{preview}” locally, then uploading .zip…")
-                                    .into(),
-                            ));
-                        }
                         self.start_uploads(pane_id, target, dest, locals, options, cx);
                     }
                 }
@@ -3716,6 +3726,11 @@ impl ContextPanel {
         });
         let listing = self.listing;
         let error = self.error.clone();
+        let can_reconnect = self.files_can_reconnect(cx);
+        let reconnect_pane = self.focused_pane_state(cx).map(|(id, _)| id);
+        let connecting_msg = error
+            .as_ref()
+            .is_some_and(|e| e.starts_with("Connecting"));
         let search_query = self.search_edit.text.clone();
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
@@ -3939,10 +3954,43 @@ impl ContextPanel {
             .when_some(error, |d, err| {
                 d.child(
                     div()
+                        .flex()
+                        .items_center()
+                        .gap(px(theme::SPACE_2))
                         .px(px(theme::SPACE_2))
-                        .text_xs()
-                        .text_color(theme::DANGER)
-                        .child(err),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(if connecting_msg {
+                                    theme::TEXT_MUTED
+                                } else {
+                                    theme::DANGER
+                                })
+                                .child(err),
+                        )
+                        .when(can_reconnect, |row| {
+                            row.child(
+                                div()
+                                    .id("ctx-files-reconnect")
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .text_xs()
+                                    .bg(theme::ACCENT)
+                                    .text_color(theme::TEXT)
+                                    .cursor_pointer()
+                                    .child("Reconnect")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(id) = reconnect_pane.or(this.bound_pane) {
+                                            cx.emit(ContextPanelEvent::ReconnectPane(id));
+                                        }
+                                        this.entry_menu = None;
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
             })
             .when(listing, |d| {
@@ -4076,7 +4124,6 @@ impl ContextPanel {
         let dest_label = form.dest_label();
         let is_download = form.is_download();
         let focus = form.focus;
-        let compress = form.compress;
         let presets: Vec<(String, bool)> = form.exclude_presets.clone();
         let dest_el = form.dest.into_element();
         let include_el = form.include.into_element();
@@ -4248,44 +4295,6 @@ impl ContextPanel {
                 )
                 .child(
                     div()
-                        .id("xfer-compress")
-                        .flex()
-                        .items_center()
-                        .gap(px(theme::SPACE_1))
-                        .px(px(theme::SPACE_2))
-                        .py(px(theme::SPACE_1))
-                        .rounded(px(theme::RADIUS_SM))
-                        .cursor_pointer()
-                        .bg(if compress {
-                            theme::ACCENT.opacity(0.3)
-                        } else {
-                            theme::HOVER
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(FilesPrompt::TransferSettings(form)) =
-                                    this.prompt.as_mut()
-                                {
-                                    form.compress = !form.compress;
-                                }
-                                cx.notify();
-                            }),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::TEXT)
-                                .child(if compress {
-                                    "☑ Compress ON — upload as .zip / download archive"
-                                } else {
-                                    "☐ Compress OFF — transfer files as-is"
-                                }),
-                        ),
-                )
-                .child(
-                    div()
                         .flex()
                         .gap(px(theme::SPACE_1))
                         .child(
@@ -4298,11 +4307,7 @@ impl ContextPanel {
                                 .bg(theme::ACCENT)
                                 .text_color(theme::TEXT)
                                 .cursor_pointer()
-                                .child(if compress {
-                                    "Start (compressed)"
-                                } else {
-                                    "Start"
-                                })
+                                .child("Start")
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
                         )
                         .child(
@@ -4979,10 +4984,10 @@ impl ContextPanel {
                                     this.entry_menu = None;
                                 },
                             ))
-                            .when(!is_dir, |d| {
+                            .when(!is_dir && is_local, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-open",
-                                    if is_local { "Open" } else { "Download…" },
+                                    "Open",
                                     true,
                                     cx,
                                     |this, _, cx| {

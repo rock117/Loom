@@ -1,4 +1,4 @@
-//! Pre-transfer settings form (dest path, include/exclude globs, compress).
+//! Pre-transfer settings form (dest path, include/exclude globs).
 
 use std::path::PathBuf;
 
@@ -35,12 +35,11 @@ pub struct TransferSettingsForm {
     pub exclude_extra: RenameEdit,
     /// Preset exclude names with checkbox state (checked = excluded).
     pub exclude_presets: Vec<(String, bool)>,
-    pub compress: bool,
     pub focus: TransferField,
 }
 
 impl TransferSettingsForm {
-    pub fn for_download(entry: RemoteEntry, default_dest: String, last_compress: bool) -> Self {
+    pub fn for_download(entry: RemoteEntry, default_dest: String) -> Self {
         let mut dest = RenameEdit::new(default_dest);
         dest.select_all();
         Self {
@@ -49,17 +48,11 @@ impl TransferSettingsForm {
             include: RenameEdit::new(""),
             exclude_extra: RenameEdit::new(""),
             exclude_presets: default_preset_checks(),
-            compress: last_compress,
             focus: TransferField::Dest,
         }
     }
 
-    pub fn for_upload(
-        pane_id: Uuid,
-        locals: Vec<PathBuf>,
-        default_dest: String,
-        last_compress: bool,
-    ) -> Self {
+    pub fn for_upload(pane_id: Uuid, locals: Vec<PathBuf>, default_dest: String) -> Self {
         let mut dest = RenameEdit::new(default_dest);
         dest.select_all();
         Self {
@@ -68,7 +61,6 @@ impl TransferSettingsForm {
             include: RenameEdit::new(""),
             exclude_extra: RenameEdit::new(""),
             exclude_presets: default_preset_checks(),
-            compress: last_compress,
             focus: TransferField::Dest,
         }
     }
@@ -127,7 +119,7 @@ impl TransferSettingsForm {
         let include = parse_pattern_list(&self.include.text);
         TransferOptions {
             filter: TransferFilter::from_lists(include, exclude),
-            compress: self.compress,
+            compress: false,
         }
     }
 }

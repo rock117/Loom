@@ -208,6 +208,30 @@ pub fn resolve_existing_path(path: &str) -> Result<ResolvedPath, String> {
     }
 }
 
+/// If `path` already exists, return `stem (1).ext`, `stem (2).ext`, … (Explorer-style).
+pub fn unique_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str());
+    for n in 1u32.. {
+        let name = match ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    path.to_path_buf()
+}
+
 pub fn create_dir(path: &Path) -> Result<()> {
     std::fs::create_dir(path).with_context(|| format!("mkdir {}", path.display()))
 }

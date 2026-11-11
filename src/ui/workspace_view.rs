@@ -1,7 +1,9 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::model::{ProfileKind, export_workspace_to, import_workspace_from};
+use crate::model::{
+    ConnectionState, ProfileKind, export_workspace_to, import_workspace_from,
+};
 use crate::shared::actions::*;
 use crate::shared::theme;
 use crate::session::known_hosts::{self, HostKeyMismatch};
@@ -179,6 +181,10 @@ impl WorkspaceView {
             restore_tabs,
             _subscriptions: Vec::new(),
         };
+
+        view._subscriptions.push(cx.observe(&tabs, |this, _tabs, cx| {
+            this.maybe_auto_show_files_for_ssh(cx);
+        }));
 
         view._subscriptions.push(cx.subscribe_in(
             &app_bus,
@@ -488,9 +494,12 @@ impl WorkspaceView {
         view._subscriptions.push(cx.subscribe_in(
             &context_panel,
             window,
-            |this, _, event, _window, cx| match event {
+            |this, _, event, window, cx| match event {
                 ContextPanelEvent::Toast(msg) => {
                     this.set_toast(msg.clone(), cx);
+                }
+                ContextPanelEvent::ReconnectPane(pane_id) => {
+                    this.request_reconnect_pane(*pane_id, window, cx);
                 }
             },
         ));
@@ -933,7 +942,7 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let candidates: Vec<(uuid::Uuid, String, bool)> = {
+        let candidates: Vec<(uuid::Uuid, String, bool, bool)> = {
             let tabs = self.tabs.read(cx);
             let Some(tab) = tabs.tabs.iter().find(|t| t.id == tab_id) else {
                 return;
@@ -941,15 +950,21 @@ impl WorkspaceView {
             tab.panes
                 .values()
                 .filter_map(|p| {
-                    p.credentials_profile_id()
-                        .map(|pid| (pid, p.label.clone(), p.session_password.is_some()))
+                    p.credentials_profile_id().map(|pid| {
+                        (
+                            pid,
+                            p.label.clone(),
+                            p.session_password.is_some(),
+                            p.session_jump_password.is_some(),
+                        )
+                    })
                 })
                 .collect()
         };
-        for (pid, _label, have_session_pw) in candidates {
+        for (pid, _label, have_session_pw, have_jump_pw) in candidates {
             if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
                 if let Some(role) =
-                    TabManager::ssh_password_need(&profile, false, have_session_pw)
+                    TabManager::ssh_password_need(&profile, have_jump_pw, have_session_pw)
                 {
                     self.password_oneshot_target = None;
                     self.password_oneshot_jump = None;
@@ -1031,14 +1046,20 @@ impl WorkspaceView {
             let tabs = self.tabs.read(cx);
             tabs.tabs.iter().find_map(|t| {
                 let p = t.panes.get(&pane_id)?;
-                p.credentials_profile_id()
-                    .map(|pid| (pid, p.label.clone(), p.session_password.is_some()))
+                p.credentials_profile_id().map(|pid| {
+                    (
+                        pid,
+                        p.label.clone(),
+                        p.session_password.is_some(),
+                        p.session_jump_password.is_some(),
+                    )
+                })
             })
         };
-        if let Some((pid, _label, have_session_pw)) = prompt {
+        if let Some((pid, _label, have_session_pw, have_jump_pw)) = prompt {
             if let Some(profile) = self.store.read(cx).workspace.find_profile(pid).cloned() {
                 if let Some(role) =
-                    TabManager::ssh_password_need(&profile, false, have_session_pw)
+                    TabManager::ssh_password_need(&profile, have_jump_pw, have_session_pw)
                 {
                     self.password_oneshot_target = None;
                     self.password_oneshot_jump = None;
@@ -1316,6 +1337,38 @@ impl WorkspaceView {
         {
             term.read(cx).focus_handle().focus(window);
         }
+        cx.notify();
+    }
+
+    /// One-time: first Connected SSH session opens the Files panel with a short tip.
+    fn maybe_auto_show_files_for_ssh(&mut self, cx: &mut Context<Self>) {
+        if self.store.read(cx).ui_state.files_intro_shown {
+            return;
+        }
+        let is_ssh_connected = self.tabs.read(cx).active_tab().is_some_and(|t| {
+            t.focused_pane().is_some_and(|p| {
+                matches!(p.kind, crate::model::ProfileKind::Ssh { .. })
+                    && matches!(p.state, ConnectionState::Connected)
+            })
+        });
+        if !is_ssh_connected {
+            return;
+        }
+        self.store.update(cx, |s, _| {
+            s.ui_state.files_intro_shown = true;
+            s.mark_dirty();
+        });
+        if !self.context_panel_visible {
+            self.context_panel_visible = true;
+            self.store.update(cx, |s, _| {
+                s.ui_state.context_panel_visible = true;
+            });
+        }
+        self.set_toast(
+            "Files panel — browse & transfer over SFTP (Ctrl+Shift+B to hide)",
+            cx,
+        );
+        self.persist_tabs(cx);
         cx.notify();
     }
 

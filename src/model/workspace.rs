@@ -661,6 +661,9 @@ pub struct UiStateFile {
     /// When false, the context panel is hidden.
     #[serde(default = "default_context_panel_visible")]
     pub context_panel_visible: bool,
+    /// First successful SSH connect already auto-opened Files once (one-time tip).
+    #[serde(default)]
+    pub files_intro_shown: bool,
     /// Share of Files tab height for the file list (rest is Transfers).
     #[serde(default = "default_context_files_list_ratio")]
     pub context_files_list_ratio: f32,
@@ -693,6 +696,7 @@ impl Default for UiStateFile {
             sidebar_visible: true,
             context_panel_width: 280.0,
             context_panel_visible: false,
+            files_intro_shown: false,
             context_files_list_ratio: 0.72,
             font_size: 14.0,
             open_tabs: Vec::new(),

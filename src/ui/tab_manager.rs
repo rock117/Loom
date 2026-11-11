@@ -35,6 +35,9 @@ pub struct PaneSession {
     /// In-memory SSH password for this pane only (never persisted).
     /// Set on successful resolve; cloned on Split / Duplicate so siblings need not re-prompt.
     pub session_password: Option<String>,
+    /// In-memory jump-host password for this pane only (never persisted).
+    /// Same lifetime rules as [`Self::session_password`].
+    pub session_jump_password: Option<String>,
     /// Connection snapshot for spawn / reconnect / Save to….
     pub kind: ProfileKind,
     /// Display name (profile name or ephemeral label).
@@ -71,6 +74,11 @@ fn session_password_from_auth(auth: &SshAuthMaterial) -> Option<String> {
         SshAuthMaterial::Password(p) => Some(p.clone()),
         SshAuthMaterial::PrivateKey { .. } => None,
     }
+}
+
+fn session_jump_password_from(jump: &Option<SshJumpParams>) -> Option<String> {
+    jump.as_ref()
+        .and_then(|j| session_password_from_auth(&j.auth))
 }
 
 pub struct TabSession {
@@ -215,11 +223,11 @@ impl TabManager {
         font_family: &str,
         store: &Entity<WorkspaceStore>,
         cwd_override: Option<String>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match &profile.kind {
-            ProfileKind::Local { .. } if profile.kind.local_has_args() => {
+            ProfileKind::Local { .. } => {
                 let cwd = cwd_override
                     .filter(|s| !s.trim().is_empty())
                     .map(std::path::PathBuf::from)
@@ -227,6 +235,7 @@ impl TabManager {
                         ProfileKind::Local { cwd, .. } => cwd.clone(),
                         _ => None,
                     });
+                // Always Connecting → background spawn (parity with SSH / WSL).
                 self.begin_local_async(
                     Some(profile.id),
                     &profile.kind,
@@ -237,32 +246,6 @@ impl TabManager {
                     cwd,
                     cx,
                 );
-            }
-            ProfileKind::Local { .. } => {
-                let cwd = cwd_override
-                    .filter(|s| !s.trim().is_empty())
-                    .map(std::path::PathBuf::from);
-                match self.spawn_local(
-                    Some(profile.id),
-                    &profile.kind,
-                    &profile.name,
-                    default_shell,
-                    font_family,
-                    store,
-                    cwd,
-                    window,
-                    cx,
-                ) {
-                    Ok(pane) => {
-                        let title = self.unique_tab_title(&profile.name);
-                        let tab = wrap_pane_as_tab(title, pane);
-                        let id = tab.id;
-                        self.tabs.push(tab);
-                        self.active = Some(id);
-                        cx.notify();
-                    }
-                    Err(err) => self.push_failed(profile, format!("{err:#}"), cx),
-                }
             }
             ProfileKind::Ssh { .. } => {
                 let cwd = cwd_override
@@ -335,6 +318,7 @@ impl TabManager {
                         profile_id: Some(profile.id),
                         auth_profile_id: None,
                         session_password: None,
+                        session_jump_password: None,
                         kind: profile.kind.clone(),
                         label: profile.name.clone(),
                         state: ConnectionState::Connecting,
@@ -454,6 +438,7 @@ impl TabManager {
                 profile_id: Some(profile.id),
                 auth_profile_id: None,
                 session_password: session_password.clone(),
+                session_jump_password: session_jump_password_from(&jump),
                 kind: profile.kind.clone(),
                 label: profile.name.clone(),
                 state: ConnectionState::Connecting,
@@ -626,6 +611,7 @@ impl TabManager {
             profile_id: Some(profile.id),
             auth_profile_id: None,
             session_password: None,
+            session_jump_password: None,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Failed,
@@ -662,11 +648,13 @@ impl TabManager {
 
         let pane_id = Uuid::new_v4();
         let session_password = session_password_from_auth(&auth);
+        let session_jump_password = session_jump_password_from(&jump);
         let pane = PaneSession {
             id: pane_id,
             profile_id: Some(profile.id),
             auth_profile_id: None,
             session_password,
+            session_jump_password,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Connecting,
@@ -979,6 +967,7 @@ impl TabManager {
             profile_id,
             auth_profile_id: None,
             session_password: None,
+            session_jump_password: None,
             kind: kind.clone(),
             label: label.to_string(),
             state: ConnectionState::Connecting,
@@ -1238,6 +1227,7 @@ impl TabManager {
             profile_id,
             auth_profile_id: None,
             session_password: None,
+            session_jump_password: None,
             kind,
             label: label.to_string(),
             state: ConnectionState::Connected,
@@ -1342,6 +1332,7 @@ impl TabManager {
                 p.label.clone(),
                 p.credentials_profile_id(),
                 p.session_password.clone(),
+                p.session_jump_password.clone(),
                 p.ssh_forwards.clone(),
                 p.terminal
                     .as_ref()
@@ -1350,7 +1341,8 @@ impl TabManager {
         }) else {
             return SessionOpResult::Done;
         };
-        let (kind, label, auth_profile_id, source_password, source_forwards, live_cwd) = source;
+        let (kind, label, auth_profile_id, source_password, source_jump_password, source_forwards, live_cwd) =
+            source;
 
         let (default_shell, font_family) = {
             let s = store.read(cx);
@@ -1405,9 +1397,10 @@ impl TabManager {
                 };
                 // override → source session_password → keyring
                 let effective_password = password.or(source_password);
+                let effective_jump = jump_password.or(source_jump_password);
                 match (
                     resolve_ssh_auth(&pseudo, effective_password),
-                    resolve_jump_params(&pseudo, jump_password),
+                    resolve_jump_params(&pseudo, effective_jump),
                 ) {
                     (Ok(Some(auth)), Ok(jump))
                         if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
@@ -1419,6 +1412,7 @@ impl TabManager {
                             // Keep Bound credentials so password SSH split/reconnect still works.
                             auth_profile_id,
                             session_password: session_password_from_auth(&auth),
+                            session_jump_password: session_jump_password_from(&jump),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
@@ -1698,17 +1692,23 @@ impl TabManager {
         };
 
         for pane_id in pane_ids {
-            let Some((profile_id, auth_profile_id, session_password, kind_snap, label_snap)) =
-                self.tabs[idx].panes.get(&pane_id).map(|p| {
-                    (
-                        p.profile_id,
-                        p.credentials_profile_id(),
-                        p.session_password.clone(),
-                        p.kind.clone(),
-                        p.label.clone(),
-                    )
-                })
-            else {
+            let Some((
+                profile_id,
+                auth_profile_id,
+                session_password,
+                session_jump_password,
+                kind_snap,
+                label_snap,
+            )) = self.tabs[idx].panes.get(&pane_id).map(|p| {
+                (
+                    p.profile_id,
+                    p.credentials_profile_id(),
+                    p.session_password.clone(),
+                    p.session_jump_password.clone(),
+                    p.kind.clone(),
+                    p.label.clone(),
+                )
+            }) else {
                 continue;
             };
 
@@ -1796,9 +1796,11 @@ impl TabManager {
                         panes: None,
                     };
                     let effective_password = password.clone().or(session_password);
+                    let effective_jump =
+                        jump_password.clone().or(session_jump_password.clone());
                     match (
                         resolve_ssh_auth(&pseudo, effective_password),
-                        resolve_jump_params(&pseudo, jump_password.clone()),
+                        resolve_jump_params(&pseudo, effective_jump),
                     ) {
                         (Ok(Some(auth)), Ok(jump))
                             if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
@@ -1808,6 +1810,8 @@ impl TabManager {
                                 pane.auth_profile_id =
                                     auth_profile_id.filter(|_| profile_id.is_none());
                                 pane.session_password = session_password_from_auth(&auth);
+                                pane.session_jump_password =
+                                    session_jump_password_from(&jump);
                                 pane.state = ConnectionState::Connecting;
                                 pane.status_message = kind.ssh_connecting_status();
                             }
@@ -2444,7 +2448,7 @@ impl TabManager {
     pub fn open_ephemeral_local(
         &mut self,
         store: &Entity<WorkspaceStore>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (default_shell, font_family) = {
@@ -2457,30 +2461,16 @@ impl TabManager {
             env: Vec::new(),
             args: Vec::new(),
         };
-        let label = "Shell";
-        match self.spawn_local(
+        self.begin_local_async(
             None,
             &kind,
-            label,
+            "Shell",
             default_shell.as_deref(),
             &font_family,
             store,
             None,
-            window,
             cx,
-        ) {
-            Ok(pane) => {
-                let title = self.unique_tab_title(label);
-                let tab = wrap_pane_as_tab(title, pane);
-                let id = tab.id;
-                self.tabs.push(tab);
-                self.active = Some(id);
-                cx.notify();
-            }
-            Err(err) => {
-                eprintln!("loom: ephemeral local failed: {err:#}");
-            }
-        }
+        );
     }
 
     /// Ephemeral Docker exec Tab (from Docker picker). Not in sidebar.
@@ -2532,6 +2522,7 @@ impl TabManager {
         let label = source.label.clone();
         let auth_pid = source.credentials_profile_id();
         let source_password = source.session_password.clone();
+        let source_jump_password = source.session_jump_password.clone();
         let live_cwd = source
             .terminal
             .as_ref()
@@ -2581,7 +2572,7 @@ impl TabManager {
                 };
                 match (
                     resolve_ssh_auth(&pseudo, password.or(source_password)),
-                    resolve_jump_params(&pseudo, jump_password),
+                    resolve_jump_params(&pseudo, jump_password.or(source_jump_password)),
                 ) {
                     (Ok(Some(auth)), Ok(jump))
                         if !(pseudo.kind.ssh_jump().is_some() && jump.is_none()) =>
@@ -2592,6 +2583,7 @@ impl TabManager {
                             profile_id: None,
                             auth_profile_id: auth_pid,
                             session_password: session_password_from_auth(&auth),
+                            session_jump_password: session_jump_password_from(&jump),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,

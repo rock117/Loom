@@ -47,5 +47,5 @@ Profile summary (Context / picker): `ssh · user@host:port via jumpuser@jumphost
 ## Limits (MVP)
 
 - One hop only (no jump chains).
-- No jump `session_password` on panes — reconnect without a stored jump password re-prompts.
+- Jump password is kept in pane memory for the session (like the target password); reconnect without keyring still uses it. Never persisted to disk.
 - Agent / passphrase UI still open (see BACKLOG P1).

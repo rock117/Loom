@@ -22,7 +22,7 @@ Right panel sections:
 
 Transfer progress lives in a **footer under Files** (not a separate tab). SSH uploads/downloads only.
 
-Both side panels hide completely when toggled off; width/visibility persist in `ui_state.json`. Default context panel: **off**.
+Both side panels hide completely when toggled off; width/visibility persist in `ui_state.json`. Default context panel: **off**. The **first** successful SSH connect auto-opens Files once with a short toast (`files_intro_shown` in UI state).
 
 ## Files browser (primary)
 
@@ -31,7 +31,7 @@ Windows-style navigation:
 | Action | Behavior |
 |--------|----------|
 | Double-click folder | Enter directory |
-| Double-click file | **Local:** open with OS default app (non-blocking). **SSH/Docker:** confirm → download to last/Downloads folder (Transfers footer; UI stays responsive) |
+| Double-click file | **Local:** open with OS default app (non-blocking). **SSH/Docker:** confirm → download to last/Downloads folder (Transfers footer; UI stays responsive). Same-name dests get `name (1).ext` — never overwrite. |
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
@@ -40,9 +40,7 @@ Windows-style navigation:
 | Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → settings dialog |
 | ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → settings → transfer |
 
-Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter).
-
-Compress: upload zips locally then sends `.zip`; download tries remote `zip` → `tar.gz` → `tar` → `7z` → `gzip`, then saves the archive file into the chosen local folder (does not auto-extract).
+Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter). Transfers always copy originals (no compress option — pack remotely yourself if needed).
 
 File rows use **type-specific SVG icons** tinted with Seti colors (VS Code built-in Explorer palette): folders, git, Rust hexagon, Python, Markdown `M↓`, JSON braces, shell green, etc.
 
@@ -54,7 +52,7 @@ Right-click an entry (or use prompts from the menu):
 
 | Action | Notes |
 |--------|--------|
-| Open / Download… | Same as double-click (Local opens; remote confirms download to last/Downloads) |
+| Open (Local) / Download (remote) | Local opens; remote confirms download to last/Downloads |
 | New folder | Name prompt |
 | Rename | Name prompt |
 | Permissions… | Octal mode (e.g. `755`). Local on Windows approximates via readonly bit |
