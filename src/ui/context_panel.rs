@@ -4674,6 +4674,17 @@ impl ContextPanel {
                     TransferDir::Upload => "↑",
                 };
                 let status = transfer_status_label(row);
+                let fail_detail = match &row.status {
+                    TransferStatus::Failed(msg)
+                        if !msg.is_empty()
+                            && !msg.eq_ignore_ascii_case("cancelled")
+                            && !msg.eq_ignore_ascii_case("canceled") =>
+                    {
+                        Some(msg.clone())
+                    }
+                    _ => None,
+                };
+                let tip = fail_detail.clone();
                 let color = match &row.status {
                     TransferStatus::Failed(_) => theme::DANGER,
                     TransferStatus::Done { .. } => theme::ICON_LOCAL,
@@ -4683,9 +4694,10 @@ impl ContextPanel {
                 div()
                     .id(SharedString::from(format!("xfer-{id}")))
                     .flex()
-                    .items_center()
-                    .gap(px(theme::SPACE_1))
+                    .flex_col()
+                    .gap(px(1.0))
                     .px(px(2.0))
+                    .py(px(1.0))
                     .rounded(px(theme::RADIUS_SM))
                     .text_xs()
                     .hover(|s| s.bg(theme::HOVER))
@@ -4700,38 +4712,62 @@ impl ContextPanel {
                             cx.stop_propagation();
                         }),
                     )
-                    .child(div().text_color(theme::TEXT_MUTED).flex_shrink_0().child(arrow))
+                    .when_some(tip, |d, tip| {
+                        d.tooltip(move |_, cx| Tooltip::text(tip.clone(), cx))
+                    })
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_color(theme::TEXT)
-                            .overflow_hidden()
-                            .child(row.label.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .text_color(theme::TEXT_MUTED)
+                                    .flex_shrink_0()
+                                    .child(arrow),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(theme::TEXT)
+                                    .overflow_hidden()
+                                    .child(row.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .whitespace_nowrap()
+                                    .text_color(color)
+                                    .child(status),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("xfer-rm-{id}")))
+                                    .flex_shrink_0()
+                                    .px(px(4.0))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .text_color(theme::TEXT_MUTED)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                    .child("×")
+                                    .tooltip(|_, cx| Tooltip::text("Remove", cx))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_transfer(id);
+                                        cx.notify();
+                                    })),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .whitespace_nowrap()
-                            .text_color(color)
-                            .child(status),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("xfer-rm-{id}")))
-                            .flex_shrink_0()
-                            .px(px(4.0))
-                            .rounded(px(theme::RADIUS_SM))
-                            .text_color(theme::TEXT_MUTED)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
-                            .child("×")
-                            .tooltip(|_, cx| Tooltip::text("Remove", cx))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.remove_transfer(id);
-                                cx.notify();
-                            })),
-                    )
+                    .when_some(fail_detail, |d, detail| {
+                        d.child(
+                            div()
+                                .pl(px(14.0))
+                                .pr(px(4.0))
+                                .text_xs()
+                                .text_color(theme::DANGER)
+                                .child(detail),
+                        )
+                    })
             }))
     }
 
@@ -4744,6 +4780,17 @@ impl ContextPanel {
             .local_path
             .as_ref()
             .is_some_and(|p| p.exists());
+        let fail_msg = match &row.status {
+            TransferStatus::Failed(msg)
+                if !msg.is_empty()
+                    && !msg.eq_ignore_ascii_case("cancelled")
+                    && !msg.eq_ignore_ascii_case("canceled") =>
+            {
+                Some(msg.clone())
+            }
+            _ => None,
+        };
+        let can_copy_error = fail_msg.is_some();
 
         Some(
             deferred(
@@ -4774,6 +4821,25 @@ impl ContextPanel {
                                 cx,
                                 move |this, _, _cx| {
                                     this.reveal_transfer(id);
+                                },
+                            ))
+                            .child(self.transfer_menu_item(
+                                "xfer-ctx-copy-error",
+                                "Copy error",
+                                can_copy_error,
+                                cx,
+                                move |this, _, cx| {
+                                    if let Some(msg) = this
+                                        .find_transfer(id)
+                                        .and_then(|r| match &r.status {
+                                            TransferStatus::Failed(m) => Some(m.clone()),
+                                            _ => None,
+                                        })
+                                    {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(msg));
+                                    }
+                                    this.transfer_menu = None;
+                                    cx.notify();
                                 },
                             ))
                             .child(self.transfer_menu_item(
@@ -6797,12 +6863,8 @@ fn transfer_status_label(row: &TransferRow) -> String {
             if lower.contains("cancelled") || lower.contains("canceled") {
                 parts.push("Cancelled".into());
             } else {
-                let short = if msg.len() > 28 {
-                    format!("{}…", &msg[..28])
-                } else {
-                    msg.clone()
-                };
-                parts.push(format!("Failed · {short}"));
+                // Badge stays short; the row body shows the raw error as-is.
+                parts.push("Failed".into());
             }
         }
     }

@@ -68,7 +68,9 @@ Transfers are scoped per SSH pane (switching tabs shows that session’s list on
 Phases: **Queued** (waiting for a per-host transfer slot, max 10 concurrent) → **Scanning · N** → `m/n · size · rate · time` → **Done**.  
 Each transfer opens its own SSH connection and closes it when done (see [SFTP_POOL.md](./SFTP_POOL.md)).  
 **×** / **Clear** cancel the job (not UI-only) so the host slot is freed for the next task.  
-Right-click → Reveal in File Explorer / Remove.  
+Right-click → Reveal in File Explorer / **Copy error** (failed jobs) / Remove.  
+Failed rows show a `Failed` badge plus the **raw** error under the filename
+(hover / Copy error use the same text) — no truncation or cause rewriting.  
 MVP: in-memory list for the panel lifetime; no separate Transfers tab.
 
 Drag the sash between the file list and Transfers to change their height ratio

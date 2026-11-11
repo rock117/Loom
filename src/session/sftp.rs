@@ -1358,10 +1358,10 @@ async fn download_file(
     let mut remote_file = sftp
         .open(remote.to_string())
         .await
-        .with_context(|| format!("open {remote}"))?;
+        .with_context(|| format!("open remote file {remote}"))?;
     let mut local_file = tokio::fs::File::create(local)
         .await
-        .with_context(|| format!("create {}", local.display()))?;
+        .with_context(|| format!("create local file {}", local.display()))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
     let base = overall_base.unwrap_or(0);
@@ -1650,7 +1650,7 @@ async fn upload_file(
     let mut remote_file = sftp
         .create(remote.to_string())
         .await
-        .with_context(|| format!("create {remote}"))?;
+        .with_context(|| format!("create remote file {remote}"))?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut done = 0u64;
     let base = overall_base.unwrap_or(0);
@@ -1672,7 +1672,7 @@ async fn upload_file(
         remote_file
             .write_all(&buf[..n])
             .await
-            .with_context(|| format!("write {remote}"))?;
+            .with_context(|| format!("write remote file {remote}"))?;
         done += n as u64;
         let _ = progress.try_send(progress_msg(
             id,
