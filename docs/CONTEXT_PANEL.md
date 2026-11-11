@@ -31,7 +31,7 @@ Windows-style navigation:
 | Action | Behavior |
 |--------|----------|
 | Double-click folder | Enter directory |
-| Double-click file | **Local:** open with OS default app (non-blocking). **SSH:** confirm → download to temp → open when finished (Transfers footer + toast; UI stays responsive) |
+| Double-click file | **Local:** open with OS default app (non-blocking). **SSH/Docker:** confirm → download to last/Downloads folder (Transfers footer; UI stays responsive) |
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
@@ -40,7 +40,7 @@ Windows-style navigation:
 | Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → settings dialog |
 | ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → settings → transfer |
 
-Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH double-click open** still skips settings (confirm → temp download → open).
+Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter).
 
 Compress: upload zips locally then sends `.zip`; download tries remote `zip` → `tar.gz` → `tar` → `7z` → `gzip`, then saves the archive file into the chosen local folder (does not auto-extract).
 
@@ -54,7 +54,7 @@ Right-click an entry (or use prompts from the menu):
 
 | Action | Notes |
 |--------|--------|
-| Open | Same as double-click (remote confirms download-then-open) |
+| Open / Download… | Same as double-click (Local opens; remote confirms download to last/Downloads) |
 | New folder | Name prompt |
 | Rename | Name prompt |
 | Permissions… | Octal mode (e.g. `755`). Local on Windows approximates via readonly bit |

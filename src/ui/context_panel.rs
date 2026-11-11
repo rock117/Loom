@@ -144,11 +144,7 @@ enum FilesPrompt {
         is_dir: bool,
         name: String,
     },
-    /// Remote file: confirm download-to-temp then open with default app.
-    ConfirmOpenRemote {
-        entry: RemoteEntry,
-    },
-    /// Path bar / typed remote file: confirm download to Downloads (or last dest).
+    /// Remote file (double-click / path bar / Open): confirm download to Downloads (or last dest).
     ConfirmDownloadRemote {
         entry: RemoteEntry,
     },
@@ -853,20 +849,14 @@ impl ContextPanel {
             return;
         }
         match self.files_kind {
-            Some(FilesKind::Sftp | FilesKind::Docker) => self.begin_open_remote(entry, cx),
+            Some(FilesKind::Sftp | FilesKind::Docker) => {
+                self.begin_confirm_download_remote(entry, cx);
+            }
             Some(FilesKind::Local) => {
                 platform::open_path_detached(PathBuf::from(entry.path));
             }
             None => {}
         }
-    }
-
-    fn begin_open_remote(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
-        if entry.is_dir {
-            return;
-        }
-        self.prompt = Some(FilesPrompt::ConfirmOpenRemote { entry });
-        cx.notify();
     }
 
     fn open_selected(&mut self, cx: &mut Context<Self>) {
@@ -881,7 +871,9 @@ impl ContextPanel {
             return;
         }
         match self.files_kind {
-            Some(FilesKind::Sftp | FilesKind::Docker) => self.begin_open_remote(entry, cx),
+            Some(FilesKind::Sftp | FilesKind::Docker) => {
+                self.begin_confirm_download_remote(entry, cx);
+            }
             Some(FilesKind::Local) => {
                 platform::open_path_detached(PathBuf::from(entry.path));
             }
@@ -2811,9 +2803,6 @@ impl ContextPanel {
             } => {
                 self.run_remove(path, is_dir, cx);
             }
-            FilesPrompt::ConfirmOpenRemote { entry } => {
-                self.download_entry(entry, true, TransferOptions::default(), None, cx);
-            }
             FilesPrompt::ConfirmDownloadRemote { entry } => {
                 let dest = self
                     .last_download_dir
@@ -3394,7 +3383,6 @@ impl ContextPanel {
             FilesPrompt::Rename { .. } => "Rename",
             FilesPrompt::Chmod { .. } => "Permissions (octal)",
             FilesPrompt::ConfirmDelete { .. } => "Delete?",
-            FilesPrompt::ConfirmOpenRemote { .. } => "Open remote file?",
             FilesPrompt::ConfirmDownloadRemote { .. } => "Download file?",
             FilesPrompt::TransferSettings(form) => form.title(),
         }
@@ -3407,7 +3395,6 @@ impl ContextPanel {
             | FilesPrompt::Chmod { edit, .. } => Some(edit),
             FilesPrompt::TransferSettings(form) => Some(form.focused_edit_mut()),
             FilesPrompt::ConfirmDelete { .. }
-            | FilesPrompt::ConfirmOpenRemote { .. }
             | FilesPrompt::ConfirmDownloadRemote { .. } => None,
         }
     }
@@ -3499,7 +3486,6 @@ impl ContextPanel {
             self.prompt,
             Some(
                 FilesPrompt::ConfirmDelete { .. }
-                    | FilesPrompt::ConfirmOpenRemote { .. }
                     | FilesPrompt::ConfirmDownloadRemote { .. }
             )
         ) {
@@ -3987,12 +3973,6 @@ impl ContextPanel {
                     format!("Delete “{name}”?")
                 }
             }
-            FilesPrompt::ConfirmOpenRemote { entry } => {
-                format!(
-                    "“{}” will download to a temporary folder, then open with the default app when finished.",
-                    entry.name
-                )
-            }
             FilesPrompt::ConfirmDownloadRemote { entry } => {
                 let dest = self
                     .last_download_dir
@@ -4010,7 +3990,6 @@ impl ContextPanel {
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
             FilesPrompt::ConfirmDelete { .. }
-            | FilesPrompt::ConfirmOpenRemote { .. }
             | FilesPrompt::ConfirmDownloadRemote { .. }
             | FilesPrompt::TransferSettings(_) => None,
         };
@@ -4066,7 +4045,6 @@ impl ContextPanel {
                                 .cursor_pointer()
                                 .child(match &self.prompt {
                                     Some(FilesPrompt::ConfirmDelete { .. }) => "Delete",
-                                    Some(FilesPrompt::ConfirmOpenRemote { .. }) => "Download & open",
                                     Some(FilesPrompt::ConfirmDownloadRemote { .. }) => "Download",
                                     Some(FilesPrompt::TransferSettings(_)) => "Start",
                                     _ => "OK",
@@ -5004,7 +4982,7 @@ impl ContextPanel {
                             .when(!is_dir, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-open",
-                                    "Open",
+                                    if is_local { "Open" } else { "Download…" },
                                     true,
                                     cx,
                                     |this, _, cx| {
