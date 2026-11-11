@@ -47,6 +47,13 @@ pub struct RemoteEntry {
     pub mtime: Option<u64>,
 }
 
+/// Result of resolving a typed/pasted Files path bar entry.
+#[derive(Debug, Clone)]
+pub enum ResolvedPath {
+    Dir(String),
+    File(RemoteEntry),
+}
+
 #[derive(Debug, Clone)]
 pub struct TransferProgress {
     pub id: uuid::Uuid,
@@ -187,10 +194,15 @@ pub enum SftpRequest {
         container: String,
         reply: Sender<Result<crate::session::host_info::HostSnapshot>>,
     },
-    DockerResolveDir {
+    DockerResolvePath {
         container: String,
         path: String,
-        reply: Sender<Result<String, String>>,
+        reply: Sender<Result<ResolvedPath, String>>,
+    },
+    /// Stat a remote path for the Files address bar (dir → navigate, file → download).
+    ResolvePath {
+        path: String,
+        reply: Sender<Result<ResolvedPath, String>>,
     },
 }
 
@@ -320,7 +332,7 @@ fn is_docker_exec_request(req: &SftpRequest) -> bool {
             | SftpRequest::DockerRename { .. }
             | SftpRequest::DockerChmod { .. }
             | SftpRequest::DockerProbe { .. }
-            | SftpRequest::DockerResolveDir { .. }
+            | SftpRequest::DockerResolvePath { .. }
     )
 }
 
@@ -716,8 +728,11 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
                 "docker probe must not run on SFTP lane"
             )));
         }
-        SftpRequest::DockerResolveDir { reply, .. } => {
+        SftpRequest::DockerResolvePath { reply, .. } => {
             let _ = reply.send(Err("docker resolve must not run on SFTP lane".into()));
+        }
+        SftpRequest::ResolvePath { path, reply } => {
+            let _ = reply.send(resolve_path(sftp, &path).await);
         }
     }
 }
@@ -781,13 +796,13 @@ async fn dispatch_docker_exec(session: &client::Handle<ClientHandler>, req: Sftp
                 crate::session::docker_ssh::container_snapshot(session, &container).await,
             );
         }
-        SftpRequest::DockerResolveDir {
+        SftpRequest::DockerResolvePath {
             container,
             path,
             reply,
         } => {
             let _ = reply.send(
-                crate::session::docker_ssh::resolve_existing_dir(session, &container, &path)
+                crate::session::docker_ssh::resolve_existing_path(session, &container, &path)
                     .await,
             );
         }
@@ -918,10 +933,32 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
         SftpRequest::HostProbe { reply } | SftpRequest::DockerProbe { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
-        SftpRequest::DockerResolveDir { reply, .. } => {
+        SftpRequest::DockerResolvePath { reply, .. }
+        | SftpRequest::ResolvePath { reply, .. } => {
             let _ = reply.send(Err(msg));
         }
     }
+}
+
+async fn resolve_path(sftp: &SftpSession, path: &str) -> Result<ResolvedPath, String> {
+    let path = path.trim().trim_matches('"').trim();
+    if path.is_empty() {
+        return Err("Path is empty".into());
+    }
+    let meta = sftp
+        .metadata(path.to_string())
+        .await
+        .map_err(|_| "Path does not exist".to_string())?;
+    if meta.is_dir() {
+        return Ok(ResolvedPath::Dir(path.to_string()));
+    }
+    Ok(ResolvedPath::File(RemoteEntry {
+        name: path_basename(path),
+        path: path.to_string(),
+        is_dir: false,
+        size: meta.size.unwrap_or(0),
+        mtime: meta.mtime.map(|t| t as u64),
+    }))
 }
 
 async fn remove_path(sftp: &SftpSession, path: &str, is_dir: bool) -> Result<()> {

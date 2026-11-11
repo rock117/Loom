@@ -13,8 +13,9 @@ use crate::session::docker_fs;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
 use crate::session::sftp::{
-    RemoteEntry, SftpHandle, SftpRequest, TransferCancel, TransferJob, TransferOptions,
-    TransferProgress, TransferTarget, join_remote, parent_remote, transfer_cancel_flag,
+    RemoteEntry, ResolvedPath, SftpHandle, SftpRequest, TransferCancel, TransferJob,
+    TransferOptions, TransferProgress, TransferTarget, join_remote, parent_remote,
+    transfer_cancel_flag,
 };
 use crate::shared::theme;
 use crate::ui::file_icon;
@@ -145,6 +146,10 @@ enum FilesPrompt {
     },
     /// Remote file: confirm download-to-temp then open with default app.
     ConfirmOpenRemote {
+        entry: RemoteEntry,
+    },
+    /// Path bar / typed remote file: confirm download to Downloads (or last dest).
+    ConfirmDownloadRemote {
         entry: RemoteEntry,
     },
     /// Upload/download settings before starting the transfer.
@@ -2007,7 +2012,15 @@ impl ContextPanel {
     }
 
     fn submit_path_edit(&mut self, cx: &mut Context<Self>) {
-        let raw = self.path_edit.text.clone();
+        // Trim paste/type noise so `" /path "` and Explorer-quoted paths resolve.
+        let raw = self
+            .path_edit
+            .text
+            .trim()
+            .trim_matches('"')
+            .trim()
+            .to_string();
+        self.path_edit.text = raw.clone();
         // `~` is a Unix path. Windows Explorer uses `%USERPROFILE%` instead.
         if self.files_kind == Some(FilesKind::Local) && cfg!(windows) {
             if local_fs::is_windows_env_path(&raw) {
@@ -2029,6 +2042,35 @@ impl ContextPanel {
             return;
         }
         self.navigate_typed_path(raw, cx);
+    }
+
+    fn begin_confirm_download_remote(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
+        self.editing_path = false;
+        self.error = None;
+        self.prompt = Some(FilesPrompt::ConfirmDownloadRemote { entry });
+        self.start_prompt_caret_blink(cx);
+        cx.notify();
+    }
+
+    fn apply_resolved_path(&mut self, resolved: ResolvedPath, cx: &mut Context<Self>) {
+        match resolved {
+            ResolvedPath::Dir(dir) => {
+                self.editing_path = false;
+                self.error = None;
+                self.load_dir(dir, cx);
+            }
+            ResolvedPath::File(entry) => {
+                if self.files_supports_transfer() {
+                    self.begin_confirm_download_remote(entry, cx);
+                } else {
+                    // Local: open with the OS default app (same as double-click).
+                    platform::open_path_detached(PathBuf::from(entry.path));
+                    self.editing_path = false;
+                    self.error = None;
+                    cx.notify();
+                }
+            }
+        }
     }
 
     /// Expand `~` / `~/…` then navigate. Home is cached after the first lookup.
@@ -2171,12 +2213,8 @@ impl ContextPanel {
 
     fn navigate_typed_path(&mut self, raw: String, cx: &mut Context<Self>) {
         match self.files_kind {
-            Some(FilesKind::Local) => match local_fs::resolve_existing_dir(&raw) {
-                Ok(dir) => {
-                    self.editing_path = false;
-                    self.error = None;
-                    self.load_dir(dir, cx);
-                }
+            Some(FilesKind::Local) => match local_fs::resolve_existing_path(&raw) {
+                Ok(resolved) => self.apply_resolved_path(resolved, cx),
                 Err(msg) => {
                     self.error = Some(msg);
                     self.editing_path = true;
@@ -2198,7 +2236,7 @@ impl ContextPanel {
                 if let Some(sftp) = sftp {
                     let (tx, rx) = flume::bounded(1);
                     if sftp
-                        .request(SftpRequest::DockerResolveDir {
+                        .request(SftpRequest::DockerResolvePath {
                             container,
                             path: trimmed,
                             reply: tx,
@@ -2216,11 +2254,7 @@ impl ContextPanel {
                         this.update(cx, |this, cx| {
                             this.listing = false;
                             match result {
-                                Ok(Ok(dir)) => {
-                                    this.editing_path = false;
-                                    this.error = None;
-                                    this.load_dir(dir, cx);
-                                }
+                                Ok(Ok(resolved)) => this.apply_resolved_path(resolved, cx),
                                 Ok(Err(msg)) => {
                                     this.error = Some(msg);
                                     this.editing_path = true;
@@ -2243,17 +2277,13 @@ impl ContextPanel {
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_spawn(async move {
-                            docker_fs::resolve_existing_dir(&container, &trimmed)
+                            docker_fs::resolve_existing_path(&container, &trimmed)
                         })
                         .await;
                     this.update(cx, |this, cx| {
                         this.listing = false;
                         match result {
-                            Ok(dir) => {
-                                this.editing_path = false;
-                                this.error = None;
-                                this.load_dir(dir, cx);
-                            }
+                            Ok(resolved) => this.apply_resolved_path(resolved, cx),
                             Err(msg) => {
                                 this.error = Some(msg);
                                 this.editing_path = true;
@@ -2272,9 +2302,46 @@ impl ContextPanel {
                     cx.notify();
                     return;
                 }
-                self.editing_path = false;
-                // List fails for missing paths and non-directories; cwd stays put on error.
-                self.load_dir(trimmed, cx);
+                let Some((_, sftp)) = self.focused_sftp(cx) else {
+                    self.error = Some("No SSH session".into());
+                    cx.notify();
+                    return;
+                };
+                let (tx, rx) = flume::bounded(1);
+                if sftp
+                    .request(SftpRequest::ResolvePath {
+                        path: trimmed,
+                        reply: tx,
+                    })
+                    .is_err()
+                {
+                    self.error = Some("SFTP unavailable".into());
+                    cx.notify();
+                    return;
+                }
+                self.listing = true;
+                cx.notify();
+                cx.spawn(async move |this, cx| {
+                    let result = rx.recv_async().await;
+                    this.update(cx, |this, cx| {
+                        this.listing = false;
+                        match result {
+                            Ok(Ok(resolved)) => this.apply_resolved_path(resolved, cx),
+                            Ok(Err(msg)) => {
+                                this.error = Some(msg);
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                            Err(_) => {
+                                this.error = Some("Path check cancelled".into());
+                                this.editing_path = true;
+                                cx.notify();
+                            }
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
             }
             None => {
                 self.error = Some("No session open".into());
@@ -2746,6 +2813,19 @@ impl ContextPanel {
             }
             FilesPrompt::ConfirmOpenRemote { entry } => {
                 self.download_entry(entry, true, TransferOptions::default(), None, cx);
+            }
+            FilesPrompt::ConfirmDownloadRemote { entry } => {
+                let dest = self
+                    .last_download_dir
+                    .clone()
+                    .unwrap_or_else(default_download_dir);
+                self.download_entry(
+                    entry,
+                    false,
+                    TransferOptions::default(),
+                    Some(PathBuf::from(dest)),
+                    cx,
+                );
             }
             FilesPrompt::TransferSettings(form) => {
                 self.submit_transfer_settings(form, cx);
@@ -3315,6 +3395,7 @@ impl ContextPanel {
             FilesPrompt::Chmod { .. } => "Permissions (octal)",
             FilesPrompt::ConfirmDelete { .. } => "Delete?",
             FilesPrompt::ConfirmOpenRemote { .. } => "Open remote file?",
+            FilesPrompt::ConfirmDownloadRemote { .. } => "Download file?",
             FilesPrompt::TransferSettings(form) => form.title(),
         }
     }
@@ -3325,7 +3406,9 @@ impl ContextPanel {
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit),
             FilesPrompt::TransferSettings(form) => Some(form.focused_edit_mut()),
-            FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. } => None,
+            FilesPrompt::ConfirmDelete { .. }
+            | FilesPrompt::ConfirmOpenRemote { .. }
+            | FilesPrompt::ConfirmDownloadRemote { .. } => None,
         }
     }
 
@@ -3414,7 +3497,11 @@ impl ContextPanel {
         }
         if matches!(
             self.prompt,
-            Some(FilesPrompt::ConfirmDelete { .. } | FilesPrompt::ConfirmOpenRemote { .. })
+            Some(
+                FilesPrompt::ConfirmDelete { .. }
+                    | FilesPrompt::ConfirmOpenRemote { .. }
+                    | FilesPrompt::ConfirmDownloadRemote { .. }
+            )
         ) {
             let key = event.keystroke.key.as_str();
             if key == "escape" {
@@ -3906,6 +3993,16 @@ impl ContextPanel {
                     entry.name
                 )
             }
+            FilesPrompt::ConfirmDownloadRemote { entry } => {
+                let dest = self
+                    .last_download_dir
+                    .clone()
+                    .unwrap_or_else(default_download_dir);
+                format!(
+                    "Download “{}” to {}?",
+                    entry.name, dest
+                )
+            }
             _ => String::new(),
         };
         let edit_el = match prompt {
@@ -3914,6 +4011,7 @@ impl ContextPanel {
             | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
             FilesPrompt::ConfirmDelete { .. }
             | FilesPrompt::ConfirmOpenRemote { .. }
+            | FilesPrompt::ConfirmDownloadRemote { .. }
             | FilesPrompt::TransferSettings(_) => None,
         };
 
@@ -3969,6 +4067,7 @@ impl ContextPanel {
                                 .child(match &self.prompt {
                                     Some(FilesPrompt::ConfirmDelete { .. }) => "Delete",
                                     Some(FilesPrompt::ConfirmOpenRemote { .. }) => "Download & open",
+                                    Some(FilesPrompt::ConfirmDownloadRemote { .. }) => "Download",
                                     Some(FilesPrompt::TransferSettings(_)) => "Start",
                                     _ => "OK",
                                 })

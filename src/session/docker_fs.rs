@@ -173,23 +173,79 @@ done
 
 /// Check that `path` exists and is a directory inside the container.
 pub fn resolve_existing_dir(container: &str, path: &str) -> Result<String, String> {
+    match resolve_existing_path(container, path)? {
+        crate::session::sftp::ResolvedPath::Dir(dir) => Ok(dir),
+        crate::session::sftp::ResolvedPath::File(_) => {
+            Err("Path does not exist or is not a directory".into())
+        }
+    }
+}
+
+/// Resolve a typed path inside the container to a directory or file.
+pub fn resolve_existing_path(
+    container: &str,
+    path: &str,
+) -> Result<crate::session::sftp::ResolvedPath, String> {
     let path = normalize_path(path);
+    if path.is_empty() {
+        return Err("Path is empty".into());
+    }
     let output = docker_cmd()
         .args([
             "exec",
             container,
             "sh",
             "-c",
-            r#"path=$1; [ -d "$path" ] || exit 1; printf '%s\n' "$path""#,
+            r#"path=$1
+if [ -d "$path" ]; then printf 'd\n%s\n' "$path"; exit 0; fi
+if [ -e "$path" ]; then
+  size=$(wc -c < "$path" 2>/dev/null || printf '0')
+  printf 'f\n%s\n%s\n' "$path" "$size"
+  exit 0
+fi
+exit 1"#,
             "--",
             &path,
         ])
         .output()
         .map_err(|e| format!("docker exec: {e}"))?;
     if !output.status.success() {
-        return Err("Path does not exist or is not a directory".into());
+        return Err("Path does not exist".into());
     }
-    Ok(path)
+    parse_resolve_stdout(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_resolve_stdout(stdout: &str) -> Result<crate::session::sftp::ResolvedPath, String> {
+    use crate::session::sftp::{RemoteEntry, ResolvedPath};
+
+    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let kind = lines.next().ok_or_else(|| "Path does not exist".to_string())?;
+    let path = lines
+        .next()
+        .ok_or_else(|| "Path does not exist".to_string())?
+        .to_string();
+    match kind {
+        "d" => Ok(ResolvedPath::Dir(path)),
+        "f" => {
+            let size = lines
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let name = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(path.as_str())
+                .to_string();
+            Ok(ResolvedPath::File(RemoteEntry {
+                name,
+                path,
+                is_dir: false,
+                size,
+                mtime: None,
+            }))
+        }
+        _ => Err("Path does not exist".into()),
+    }
 }
 
 pub fn create_dir(container: &str, path: &str) -> Result<()> {

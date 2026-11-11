@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use super::sftp::RemoteEntry;
+use super::sftp::{RemoteEntry, ResolvedPath};
 
 /// List a local directory as [`RemoteEntry`] rows (unsorted; UI applies sort).
 pub fn list_dir(path: &Path) -> Result<Vec<RemoteEntry>> {
@@ -161,6 +161,14 @@ fn join_under_home(home: &str, tail: &str) -> String {
 /// Validate a typed/pasted path for the Files browser: must exist and be a directory.
 /// Strips whitespace and surrounding quotes (Explorer-style paste).
 pub fn resolve_existing_dir(path: &str) -> Result<String, String> {
+    match resolve_existing_path(path)? {
+        ResolvedPath::Dir(dir) => Ok(dir),
+        ResolvedPath::File(_) => Err("Path is a file, not a directory".into()),
+    }
+}
+
+/// Resolve a typed/pasted Files path to an existing directory or file.
+pub fn resolve_existing_path(path: &str) -> Result<ResolvedPath, String> {
     let trimmed = path.trim().trim_matches('"').trim();
     if trimmed.is_empty() {
         return Err("Path is empty".into());
@@ -177,9 +185,25 @@ pub fn resolve_existing_dir(path: &str) -> Result<String, String> {
                 }
                 Err(_) => trimmed.to_string(),
             };
-            Ok(display)
+            Ok(ResolvedPath::Dir(display))
         }
-        Ok(_) => Err("Path is a file, not a directory".into()),
+        Ok(meta) => {
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| trimmed.to_string());
+            Ok(ResolvedPath::File(RemoteEntry {
+                name,
+                path: trimmed.to_string(),
+                is_dir: false,
+                size: meta.len(),
+                mtime: meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs()),
+            }))
+        }
         Err(_) => Err("Path does not exist".into()),
     }
 }

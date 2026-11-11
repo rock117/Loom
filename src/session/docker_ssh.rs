@@ -115,9 +115,32 @@ pub async fn resolve_existing_dir(
     container: &str,
     path: &str,
 ) -> Result<String, String> {
+    match resolve_existing_path(session, container, path).await? {
+        super::sftp::ResolvedPath::Dir(dir) => Ok(dir),
+        super::sftp::ResolvedPath::File(_) => {
+            Err("Path does not exist or is not a directory".into())
+        }
+    }
+}
+
+pub async fn resolve_existing_path(
+    session: &client::Handle<ClientHandler>,
+    container: &str,
+    path: &str,
+) -> Result<super::sftp::ResolvedPath, String> {
     let path = normalize_path(path);
+    if path.is_empty() {
+        return Err("Path is empty".into());
+    }
     let inner = format!(
-        "path={}; [ -d \"$path\" ] || exit 1; printf '%s\\n' \"$path\"",
+        "path={}\n\
+if [ -d \"$path\" ]; then printf 'd\\n%s\\n' \"$path\"; exit 0; fi\n\
+if [ -e \"$path\" ]; then\n\
+  size=$(wc -c < \"$path\" 2>/dev/null || printf '0')\n\
+  printf 'f\\n%s\\n%s\\n' \"$path\" \"$size\"\n\
+  exit 0\n\
+fi\n\
+exit 1",
         shell_single_quote(&path)
     );
     let cmd = format!(
@@ -125,9 +148,42 @@ pub async fn resolve_existing_dir(
         shell_single_quote(container.trim()),
         shell_single_quote(&inner)
     );
-    match remote_exec(session, &cmd).await {
-        Ok(_) => Ok(path),
-        Err(_) => Err("Path does not exist or is not a directory".into()),
+    let stdout = remote_exec(session, &cmd)
+        .await
+        .map_err(|_| "Path does not exist".to_string())?;
+    parse_resolve_stdout(&stdout)
+}
+
+fn parse_resolve_stdout(stdout: &str) -> Result<super::sftp::ResolvedPath, String> {
+    use super::sftp::{RemoteEntry, ResolvedPath};
+
+    let mut lines = stdout.lines().map(str::trim).filter(|l| !l.is_empty());
+    let kind = lines.next().ok_or_else(|| "Path does not exist".to_string())?;
+    let path = lines
+        .next()
+        .ok_or_else(|| "Path does not exist".to_string())?
+        .to_string();
+    match kind {
+        "d" => Ok(ResolvedPath::Dir(path)),
+        "f" => {
+            let size = lines
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let name = path
+                .rsplit('/')
+                .next()
+                .unwrap_or(path.as_str())
+                .to_string();
+            Ok(ResolvedPath::File(RemoteEntry {
+                name,
+                path,
+                is_dir: false,
+                size,
+                mtime: None,
+            }))
+        }
+        _ => Err("Path does not exist".into()),
     }
 }
 
