@@ -100,6 +100,12 @@ struct TransferRow {
     status: TransferStatus,
     /// Local path for Reveal (download destination or upload source).
     local_path: Option<PathBuf>,
+    /// Download: remote source path. Upload: remote destination directory.
+    /// Present for SSH transfers so Permission denied can Retry with sudo.
+    remote_path: Option<String>,
+    options: TransferOptions,
+    /// Last attempt used sudo staging (still show Retry if sudo auth failed).
+    used_sudo: bool,
     is_dir: bool,
     /// After a successful download, open with the OS default app (non-blocking).
     open_after: bool,
@@ -150,6 +156,23 @@ enum FilesPrompt {
     },
     /// Upload/download settings before starting the transfer.
     TransferSettings(TransferSettingsForm),
+    /// Sudo password for elevated retry after Permission denied.
+    SudoPassword {
+        target: SudoPromptTarget,
+        edit: RenameEdit,
+        use_session_password: bool,
+        has_session_password: bool,
+        user: String,
+        error: Option<String>,
+    },
+}
+
+/// What the sudo password prompt will retry.
+#[derive(Clone)]
+enum SudoPromptTarget {
+    Transfer(Uuid),
+    /// Files path bar / list — open this remote path with sudo.
+    Browse(String),
 }
 
 /// Temporary Local forward editor on Info.
@@ -186,6 +209,8 @@ pub struct ContextPanel {
     selected: Option<String>,
     listing: bool,
     error: Option<String>,
+    /// Remote path that failed with Permission denied — enables Files “Retry with sudo”.
+    browse_sudo_path: Option<String>,
     /// Pane id we last bound file state to.
     bound_pane: Option<Uuid>,
     files_kind: Option<FilesKind>,
@@ -271,6 +296,7 @@ impl ContextPanel {
             selected: None,
             listing: false,
             error: None,
+            browse_sudo_path: None,
             bound_pane: None,
             files_kind: None,
             bound_sftp_alive: false,
@@ -393,6 +419,7 @@ impl ContextPanel {
         self.entries.clear();
         self.selected = None;
         self.error = None;
+        self.browse_sudo_path = None;
         self.listing = false;
         self.transfer_menu = None;
         self.entry_menu = None;
@@ -693,6 +720,7 @@ impl ContextPanel {
         let req_gen = self.list_gen;
         self.listing = true;
         self.error = None;
+        self.browse_sudo_path = None;
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = rx.recv_async().await;
@@ -709,15 +737,15 @@ impl ContextPanel {
                         this.entries = entries;
                         this.selected = None;
                         this.error = None;
+                        this.browse_sudo_path = None;
                     }
                     Ok(Err(err)) => {
-                        this.error = Some(format!(
-                            "{err:#} (path missing or not a directory)"
-                        ));
-                        this.editing_path = true;
+                        let msg = format!("{err:#}");
+                        this.note_browse_permission_denied(&path, &msg);
                     }
                     Err(_) => {
                         this.error = Some("List cancelled".into());
+                        this.browse_sudo_path = None;
                     }
                 }
                 cx.notify();
@@ -806,9 +834,7 @@ impl ContextPanel {
                             this.error = None;
                         }
                         Ok(Err(err)) => {
-                            this.error = Some(format!(
-                                "{err:#} (path missing or not a directory)"
-                            ));
+                            this.error = Some(format!("{err:#}"));
                             this.editing_path = true;
                         }
                         Err(_) => {
@@ -849,9 +875,7 @@ impl ContextPanel {
                         this.error = None;
                     }
                     Err(err) => {
-                        this.error = Some(format!(
-                            "{err:#} (path missing or not a directory)"
-                        ));
+                        this.error = Some(format!("{err:#}"));
                         this.editing_path = true;
                     }
                 }
@@ -1059,6 +1083,9 @@ impl ContextPanel {
                 direction: TransferDir::Download,
                 status: TransferStatus::Queued,
                 local_path: None,
+                remote_path: Some(remote.clone()),
+                options: options.clone(),
+                used_sudo: false,
                 is_dir,
                 open_after,
                 started_at: None,
@@ -1131,6 +1158,7 @@ impl ContextPanel {
                 remote,
                 local,
                 options,
+                sudo: None,
             };
             spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
 
@@ -1232,6 +1260,9 @@ impl ContextPanel {
                 direction: TransferDir::Download,
                 status: TransferStatus::Queued,
                 local_path: None,
+                remote_path: None,
+                options: TransferOptions::default(),
+                used_sudo: false,
                 is_dir,
                 open_after,
                 started_at: None,
@@ -1524,6 +1555,9 @@ impl ContextPanel {
                 direction: TransferDir::Upload,
                 status: TransferStatus::Queued,
                 local_path: Some(local.clone()),
+                remote_path: Some(remote_dir.clone()),
+                options: options.clone(),
+                used_sudo: false,
                 is_dir,
                 open_after: false,
                 started_at: None,
@@ -1544,6 +1578,7 @@ impl ContextPanel {
                 local,
                 remote_dir,
                 options,
+                sudo: None,
             };
             spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
 
@@ -1650,6 +1685,9 @@ impl ContextPanel {
                 direction: TransferDir::Upload,
                 status: TransferStatus::Queued,
                 local_path: Some(local.clone()),
+                remote_path: None,
+                options: TransferOptions::default(),
+                used_sudo: false,
                 is_dir,
                 open_after: false,
                 started_at: None,
@@ -1863,6 +1901,444 @@ impl ContextPanel {
             row.phase = None;
             row.status = TransferStatus::Failed(msg);
         }
+    }
+
+    fn transfer_can_retry_sudo(row: &TransferRow) -> bool {
+        if row.remote_path.is_none() || row.local_path.is_none() {
+            return false;
+        }
+        match &row.status {
+            TransferStatus::Failed(msg) => {
+                crate::session::sudo_transfer::looks_like_permission_denied(msg)
+                    || (row.used_sudo
+                        && crate::session::sudo_transfer::looks_like_sudo_auth_failure(msg))
+            }
+            _ => false,
+        }
+    }
+
+    fn browse_can_retry_sudo(&self) -> bool {
+        self.files_kind == Some(FilesKind::Sftp)
+            && self.browse_sudo_path.is_some()
+            && self.error.as_ref().is_some_and(|msg| {
+                crate::session::sudo_transfer::looks_like_permission_denied(msg)
+                    || crate::session::sudo_transfer::looks_like_sudo_auth_failure(msg)
+            })
+    }
+
+    fn note_browse_permission_denied(&mut self, path: &str, msg: &str) {
+        self.error = Some(msg.to_string());
+        self.editing_path = true;
+        if self.files_kind == Some(FilesKind::Sftp)
+            && (crate::session::sudo_transfer::looks_like_permission_denied(msg)
+                || crate::session::sudo_transfer::looks_like_sudo_auth_failure(msg))
+        {
+            self.browse_sudo_path = Some(path.to_string());
+        } else {
+            self.browse_sudo_path = None;
+        }
+    }
+
+    fn focused_ssh_user(&self, cx: &App) -> Option<String> {
+        let pane = self.tabs.read(cx).active_tab()?.focused_pane()?;
+        Some(pane.ssh_transfer_target.as_ref()?.user.clone())
+    }
+
+    fn focused_session_passwords(&self, cx: &App) -> (Option<String>, Option<String>) {
+        let Some(pane) = self.tabs.read(cx).active_tab().and_then(|t| t.focused_pane()) else {
+            return (None, None);
+        };
+        (pane.session_password.clone(), pane.session_sudo_password.clone())
+    }
+
+    fn set_session_sudo_password(&self, password: Option<String>, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.bound_pane.or_else(|| {
+            self.tabs
+                .read(cx)
+                .active_tab()
+                .map(|t| t.focused)
+        }) else {
+            return;
+        };
+        self.tabs.update(cx, |tabs, _| {
+            for tab in &mut tabs.tabs {
+                if let Some(pane) = tab.panes.get_mut(&pane_id) {
+                    pane.session_sudo_password = password;
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Permission denied → Retry with sudo (prompt or reuse session sudo password).
+    fn begin_retry_with_sudo(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.transfer_menu = None;
+        let Some(row) = self.find_transfer(id) else {
+            return;
+        };
+        if !Self::transfer_can_retry_sudo(row) {
+            return;
+        }
+        self.begin_sudo_prompt(SudoPromptTarget::Transfer(id), window, cx);
+    }
+
+    fn begin_browse_retry_with_sudo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.browse_sudo_path.clone() else {
+            return;
+        };
+        if !self.browse_can_retry_sudo() {
+            return;
+        }
+        self.begin_sudo_prompt(SudoPromptTarget::Browse(path), window, cx);
+    }
+
+    fn begin_sudo_prompt(
+        &mut self,
+        target: SudoPromptTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (_, session_sudo) = self.focused_session_passwords(cx);
+        if let Some(pw) = session_sudo.filter(|p| !p.is_empty()) {
+            let mode = crate::session::sudo_transfer::SudoMode::Password(pw);
+            match target {
+                SudoPromptTarget::Transfer(id) => self.spawn_elevated_retry(id, mode, cx),
+                SudoPromptTarget::Browse(path) => self.spawn_browse_with_sudo(path, mode, cx),
+            }
+            return;
+        }
+        let (session_pw, _) = self.focused_session_passwords(cx);
+        let has_session_password = session_pw.as_ref().is_some_and(|p| !p.is_empty());
+        let user = self
+            .focused_ssh_user(cx)
+            .unwrap_or_else(|| "user".into());
+        self.prompt = Some(FilesPrompt::SudoPassword {
+            target,
+            edit: RenameEdit::new(""),
+            use_session_password: has_session_password,
+            has_session_password,
+            user,
+            error: None,
+        });
+        self.start_prompt_caret_blink(cx);
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn spawn_browse_with_sudo(
+        &mut self,
+        path: String,
+        mode: crate::session::sudo_transfer::SudoMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, sftp)) = self.focused_sftp(cx) else {
+            self.error = Some("No SSH session".into());
+            cx.notify();
+            return;
+        };
+        let password_for_memory = match &mode {
+            crate::session::sudo_transfer::SudoMode::Password(p) if !p.is_empty() => {
+                Some(p.clone())
+            }
+            _ => None,
+        };
+        let (tx, rx) = flume::bounded(1);
+        if sftp
+            .request(SftpRequest::SudoResolvePath {
+                path: path.clone(),
+                mode: mode.clone(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            self.error = Some("SFTP unavailable".into());
+            cx.notify();
+            return;
+        }
+        self.list_gen = self.list_gen.wrapping_add(1);
+        let req_gen = self.list_gen;
+        self.listing = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let resolved = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                if req_gen != this.list_gen {
+                    return;
+                }
+                match resolved {
+                    Ok(Ok(ResolvedPath::Dir(dir))) => {
+                        this.load_dir_sftp_sudo(dir, mode, password_for_memory, cx);
+                    }
+                    Ok(Ok(ResolvedPath::File(entry))) => {
+                        this.listing = false;
+                        if let Some(pw) = password_for_memory {
+                            this.set_session_sudo_password(Some(pw), cx);
+                        }
+                        this.browse_sudo_path = None;
+                        this.error = None;
+                        // Elevated download: confirm, then transfer will offer sudo on fail
+                        // if needed — seed session sudo so Retry is one click.
+                        this.begin_confirm_download_remote(entry, cx);
+                    }
+                    Ok(Err(msg)) => {
+                        this.listing = false;
+                        if crate::session::sudo_transfer::looks_like_sudo_auth_failure(&msg) {
+                            this.set_session_sudo_password(None, cx);
+                            this.note_browse_permission_denied(&path, &msg);
+                            let (session_pw, _) = this.focused_session_passwords(cx);
+                            let has_session_password =
+                                session_pw.as_ref().is_some_and(|p| !p.is_empty());
+                            let user = this
+                                .focused_ssh_user(cx)
+                                .unwrap_or_else(|| "user".into());
+                            this.prompt = Some(FilesPrompt::SudoPassword {
+                                target: SudoPromptTarget::Browse(path),
+                                edit: RenameEdit::new(""),
+                                use_session_password: false,
+                                has_session_password,
+                                user,
+                                error: Some(msg),
+                            });
+                            this.start_prompt_caret_blink(cx);
+                        } else {
+                            this.note_browse_permission_denied(&path, &msg);
+                        }
+                        cx.notify();
+                    }
+                    Err(_) => {
+                        this.listing = false;
+                        this.error = Some("Path check cancelled".into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn load_dir_sftp_sudo(
+        &mut self,
+        path: String,
+        mode: crate::session::sudo_transfer::SudoMode,
+        password_for_memory: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, sftp)) = self.focused_sftp(cx) else {
+            self.listing = false;
+            self.error = Some("No SSH session".into());
+            cx.notify();
+            return;
+        };
+        let (tx, rx) = flume::bounded(1);
+        if sftp
+            .request(SftpRequest::SudoList {
+                path: path.clone(),
+                mode,
+                reply: tx,
+            })
+            .is_err()
+        {
+            self.listing = false;
+            self.error = Some("SFTP unavailable".into());
+            cx.notify();
+            return;
+        }
+        self.list_gen = self.list_gen.wrapping_add(1);
+        let req_gen = self.list_gen;
+        self.listing = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, cx| {
+                if req_gen != this.list_gen {
+                    return;
+                }
+                this.listing = false;
+                match result {
+                    Ok(Ok(entries)) => {
+                        if let Some(pw) = password_for_memory {
+                            this.set_session_sudo_password(Some(pw), cx);
+                        }
+                        this.cwd = Some(path.clone());
+                        this.path_edit = RenameEdit::new(path);
+                        this.editing_path = false;
+                        this.entries = entries;
+                        this.selected = None;
+                        this.error = None;
+                        this.browse_sudo_path = None;
+                    }
+                    Ok(Err(err)) => {
+                        let msg = format!("{err:#}");
+                        if crate::session::sudo_transfer::looks_like_sudo_auth_failure(&msg) {
+                            this.set_session_sudo_password(None, cx);
+                        }
+                        this.note_browse_permission_denied(&path, &msg);
+                    }
+                    Err(_) => {
+                        this.error = Some("List cancelled".into());
+                        this.browse_sudo_path = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn spawn_elevated_retry(
+        &mut self,
+        id: Uuid,
+        mode: crate::session::sudo_transfer::SudoMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((pane_id, target)) = self.focused_transfer(cx) else {
+            self.error = Some("No SSH session".into());
+            cx.notify();
+            return;
+        };
+        let Some(row) = self.find_transfer(id) else {
+            return;
+        };
+        let Some(remote) = row.remote_path.clone() else {
+            return;
+        };
+        let Some(local) = row.local_path.clone() else {
+            return;
+        };
+        let direction = row.direction;
+        let options = row.options.clone();
+        let is_dir = row.is_dir;
+        let password_for_memory = match &mode {
+            crate::session::sudo_transfer::SudoMode::Password(p) if !p.is_empty() => {
+                Some(p.clone())
+            }
+            _ => None,
+        };
+
+        let cancel = transfer_cancel_flag();
+        if let Some(row) = self.find_transfer_mut(id) {
+            row.cancel
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            row.cancel = cancel.clone();
+            row.used_sudo = true;
+            row.status = TransferStatus::Queued;
+            row.started_at = None;
+            row.elapsed = None;
+            row.bytes_done = 0;
+            row.phase = None;
+        }
+        let _ = pane_id;
+        cx.notify();
+
+        let job = match direction {
+            TransferDir::Download => TransferJob::Download {
+                id,
+                remote,
+                local,
+                options,
+                sudo: Some(mode),
+            },
+            TransferDir::Upload => TransferJob::Upload {
+                id,
+                local,
+                remote_dir: remote,
+                options,
+                sudo: Some(mode),
+            },
+        };
+
+        cx.spawn(async move |this, cx| {
+            let (progress_tx, progress_rx) = flume::bounded::<TransferProgress>(64);
+            let (reply_tx, reply_rx) = flume::bounded(1);
+            spawn_transfer_job(target, job, progress_tx, cancel, reply_tx);
+
+            let mut progress_open = true;
+            loop {
+                tokio::select! {
+                    p = progress_rx.recv_async(), if progress_open => {
+                        match p {
+                            Ok(p) => {
+                                this.update(cx, |this, cx| {
+                                    this.update_transfer_progress(p);
+                                    Self::request_transfer_repaint(cx);
+                                }).ok();
+                            }
+                            Err(_) => progress_open = false,
+                        }
+                    }
+                    result = reply_rx.recv_async() => {
+                        this.update(cx, |this, cx| {
+                            if this.find_transfer(id).is_some() {
+                                match result {
+                                    Ok(Ok(outcome)) => {
+                                        if let Some(pw) = password_for_memory {
+                                            this.set_session_sudo_password(Some(pw), cx);
+                                        }
+                                        let files = if is_dir {
+                                            Some(outcome.files)
+                                        } else {
+                                            None
+                                        };
+                                        this.finish_transfer(
+                                            id,
+                                            files,
+                                            Some(outcome.bytes),
+                                            outcome.saved_as,
+                                            cx,
+                                        );
+                                        if matches!(direction, TransferDir::Upload) {
+                                            if let Some(cwd) = this.cwd.clone() {
+                                                this.load_dir(cwd, cx);
+                                            }
+                                        }
+                                    }
+                                    Ok(Err(err)) => {
+                                        let msg = format!("{err:#}");
+                                        if msg.contains("cancelled") {
+                                            this.remove_transfer_silent(id);
+                                        } else if crate::session::sudo_transfer::looks_like_sudo_auth_failure(&msg)
+                                        {
+                                            this.set_session_sudo_password(None, cx);
+                                            this.fail_transfer(id, msg.clone());
+                                            let (session_pw, _) = this.focused_session_passwords(cx);
+                                            let has_session_password =
+                                                session_pw.as_ref().is_some_and(|p| !p.is_empty());
+                                            let user = this
+                                                .focused_ssh_user(cx)
+                                                .unwrap_or_else(|| "user".into());
+                                            this.prompt = Some(FilesPrompt::SudoPassword {
+                                                target: SudoPromptTarget::Transfer(id),
+                                                edit: RenameEdit::new(""),
+                                                use_session_password: false,
+                                                has_session_password,
+                                                user,
+                                                error: Some(msg),
+                                            });
+                                            this.start_prompt_caret_blink(cx);
+                                        } else {
+                                            this.fail_transfer(id, msg);
+                                        }
+                                    }
+                                    Err(_) => this.fail_transfer(id, "Transfer cancelled".into()),
+                                }
+                            }
+                            cx.notify();
+                        }).ok();
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     fn remove_transfer(&mut self, id: Uuid) {
@@ -2327,7 +2803,7 @@ impl ContextPanel {
                 let (tx, rx) = flume::bounded(1);
                 if sftp
                     .request(SftpRequest::ResolvePath {
-                        path: trimmed,
+                        path: trimmed.clone(),
                         reply: tx,
                     })
                     .is_err()
@@ -2337,6 +2813,7 @@ impl ContextPanel {
                     return;
                 }
                 self.listing = true;
+                self.browse_sudo_path = None;
                 cx.notify();
                 cx.spawn(async move |this, cx| {
                     let result = rx.recv_async().await;
@@ -2345,13 +2822,13 @@ impl ContextPanel {
                         match result {
                             Ok(Ok(resolved)) => this.apply_resolved_path(resolved, cx),
                             Ok(Err(msg)) => {
-                                this.error = Some(msg);
-                                this.editing_path = true;
+                                this.note_browse_permission_denied(&trimmed, &msg);
                                 cx.notify();
                             }
                             Err(_) => {
                                 this.error = Some("Path check cancelled".into());
                                 this.editing_path = true;
+                                this.browse_sudo_path = None;
                                 cx.notify();
                             }
                         }
@@ -2843,6 +3320,46 @@ impl ContextPanel {
             }
             FilesPrompt::TransferSettings(form) => {
                 self.submit_transfer_settings(form, cx);
+            }
+            FilesPrompt::SudoPassword {
+                target,
+                edit,
+                use_session_password,
+                has_session_password,
+                user,
+                error: _,
+            } => {
+                let typed = edit.text.clone(); // keep spaces; only trim ends
+                let typed = typed.trim_end_matches(['\r', '\n']).to_string();
+                let (session_pw, _) = self.focused_session_passwords(cx);
+                let mode = if !typed.is_empty() {
+                    crate::session::sudo_transfer::SudoMode::Password(typed)
+                } else if use_session_password {
+                    match session_pw.filter(|p| !p.is_empty()) {
+                        Some(pw) => crate::session::sudo_transfer::SudoMode::Password(pw),
+                        None => {
+                            self.prompt = Some(FilesPrompt::SudoPassword {
+                                target,
+                                edit,
+                                use_session_password,
+                                has_session_password,
+                                user,
+                                error: Some("No SSH session password to try".into()),
+                            });
+                            self.start_prompt_caret_blink(cx);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                } else {
+                    crate::session::sudo_transfer::SudoMode::Passwordless
+                };
+                match target {
+                    SudoPromptTarget::Transfer(id) => self.spawn_elevated_retry(id, mode, cx),
+                    SudoPromptTarget::Browse(path) => {
+                        self.spawn_browse_with_sudo(path, mode, cx)
+                    }
+                }
             }
         }
     }
@@ -3395,6 +3912,7 @@ impl ContextPanel {
             FilesPrompt::ConfirmDelete { .. } => "Delete?",
             FilesPrompt::ConfirmDownloadRemote { .. } => "Download file?",
             FilesPrompt::TransferSettings(form) => form.title(),
+            FilesPrompt::SudoPassword { .. } => "Sudo password",
         }
     }
 
@@ -3402,7 +3920,8 @@ impl ContextPanel {
         match self.prompt.as_mut()? {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
-            | FilesPrompt::Chmod { edit, .. } => Some(edit),
+            | FilesPrompt::Chmod { edit, .. }
+            | FilesPrompt::SudoPassword { edit, .. } => Some(edit),
             FilesPrompt::TransferSettings(form) => Some(form.focused_edit_mut()),
             FilesPrompt::ConfirmDelete { .. }
             | FilesPrompt::ConfirmDownloadRemote { .. } => None,
@@ -3731,6 +4250,7 @@ impl ContextPanel {
         let connecting_msg = error
             .as_ref()
             .is_some_and(|e| e.starts_with("Connecting"));
+        let can_sudo_browse = self.browse_can_retry_sudo();
         let search_query = self.search_edit.text.clone();
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
@@ -3970,6 +4490,23 @@ impl ContextPanel {
                                 })
                                 .child(err),
                         )
+                        .when(can_sudo_browse, |row| {
+                            row.child(
+                                div()
+                                    .id("ctx-files-sudo")
+                                    .px(px(theme::SPACE_2))
+                                    .py(px(theme::SPACE_1))
+                                    .rounded(px(theme::RADIUS_SM))
+                                    .text_xs()
+                                    .bg(theme::ACCENT)
+                                    .text_color(theme::TEXT)
+                                    .cursor_pointer()
+                                    .child("Retry with sudo")
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.begin_browse_retry_with_sudo(window, cx);
+                                    })),
+                            )
+                        })
                         .when(can_reconnect, |row| {
                             row.child(
                                 div()
@@ -4012,7 +4549,12 @@ impl ContextPanel {
         }
 
         let prompt = self.prompt.as_ref()?;
-        let title = Self::prompt_title(prompt);
+        let title = match prompt {
+            FilesPrompt::SudoPassword { user, .. } => {
+                format!("Sudo password for {user}")
+            }
+            _ => Self::prompt_title(prompt).to_string(),
+        };
         let confirm_label = match prompt {
             FilesPrompt::ConfirmDelete { name, is_dir, .. } => {
                 if *is_dir {
@@ -4031,12 +4573,46 @@ impl ContextPanel {
                     entry.name, dest
                 )
             }
+            FilesPrompt::SudoPassword {
+                error: Some(err), ..
+            } => err.clone(),
+            FilesPrompt::SudoPassword { .. } => {
+                "Required to copy via sudo into a temp folder, then transfer.".into()
+            }
             _ => String::new(),
+        };
+        let confirm_is_error = matches!(
+            prompt,
+            FilesPrompt::SudoPassword {
+                error: Some(_),
+                ..
+            }
+        );
+        let sudo_session_toggle = match prompt {
+            FilesPrompt::SudoPassword {
+                use_session_password,
+                has_session_password: true,
+                ..
+            } => Some(*use_session_password),
+            _ => None,
         };
         let edit_el = match prompt {
             FilesPrompt::NewFolder { edit }
             | FilesPrompt::Rename { edit, .. }
             | FilesPrompt::Chmod { edit, .. } => Some(edit.into_element()),
+            FilesPrompt::SudoPassword { edit, .. } => Some(
+                div()
+                    .id("ctx-prompt-input")
+                    .w_full()
+                    .px(px(theme::SPACE_1))
+                    .py(px(2.0))
+                    .rounded(px(theme::RADIUS_SM))
+                    .border_1()
+                    .border_color(theme::BORDER)
+                    .bg(theme::SIDEBAR_BG)
+                    .child(edit.into_element_bare_masked())
+                    .into_any_element(),
+            ),
             FilesPrompt::ConfirmDelete { .. }
             | FilesPrompt::ConfirmDownloadRemote { .. }
             | FilesPrompt::TransferSettings(_) => None,
@@ -4065,16 +4641,44 @@ impl ContextPanel {
                     d.child(
                         div()
                             .text_xs()
-                            .text_color(theme::TEXT_MUTED)
+                            .text_color(if confirm_is_error {
+                                theme::DANGER
+                            } else {
+                                theme::TEXT_MUTED
+                            })
                             .child(confirm_label),
                     )
                 })
                 .when_some(edit_el, |d, el| {
                     d.child(
                         div()
-                            .id("ctx-prompt-input")
+                            .id("ctx-prompt-input-wrap")
                             .w_full()
                             .child(el),
+                    )
+                })
+                .when_some(sudo_session_toggle, |d, checked| {
+                    d.child(
+                        div()
+                            .id("ctx-sudo-use-session")
+                            .flex()
+                            .items_center()
+                            .gap(px(theme::SPACE_1))
+                            .text_xs()
+                            .text_color(theme::TEXT_MUTED)
+                            .cursor_pointer()
+                            .child(if checked { "☑" } else { "☐" })
+                            .child("Try SSH session password")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(FilesPrompt::SudoPassword {
+                                    use_session_password,
+                                    ..
+                                }) = this.prompt.as_mut()
+                                {
+                                    *use_session_password = !*use_session_password;
+                                }
+                                cx.notify();
+                            })),
                     )
                 })
                 .child(
@@ -4095,6 +4699,7 @@ impl ContextPanel {
                                     Some(FilesPrompt::ConfirmDelete { .. }) => "Delete",
                                     Some(FilesPrompt::ConfirmDownloadRemote { .. }) => "Download",
                                     Some(FilesPrompt::TransferSettings(_)) => "Start",
+                                    Some(FilesPrompt::SudoPassword { .. }) => "Retry with sudo",
                                     _ => "OK",
                                 })
                                 .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
@@ -4766,6 +5371,7 @@ impl ContextPanel {
                     }
                     _ => None,
                 };
+                let can_sudo = Self::transfer_can_retry_sudo(row);
                 let tip = fail_detail.clone();
                 let color = match &row.status {
                     TransferStatus::Failed(_) => theme::DANGER,
@@ -4850,6 +5456,22 @@ impl ContextPanel {
                                 .child(detail),
                         )
                     })
+                    .when(can_sudo, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("xfer-sudo-{id}")))
+                                .pl(px(14.0))
+                                .pr(px(4.0))
+                                .text_xs()
+                                .text_color(theme::ACCENT)
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme::TEXT))
+                                .child("Retry with sudo")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.begin_retry_with_sudo(id, window, cx);
+                                })),
+                        )
+                    })
             }))
     }
 
@@ -4873,6 +5495,7 @@ impl ContextPanel {
             _ => None,
         };
         let can_copy_error = fail_msg.is_some();
+        let can_sudo = Self::transfer_can_retry_sudo(row);
 
         Some(
             deferred(
@@ -4903,6 +5526,15 @@ impl ContextPanel {
                                 cx,
                                 move |this, _, _cx| {
                                     this.reveal_transfer(id);
+                                },
+                            ))
+                            .child(self.transfer_menu_item(
+                                "xfer-ctx-sudo",
+                                "Retry with sudo",
+                                can_sudo,
+                                cx,
+                                move |this, window, cx| {
+                                    this.begin_retry_with_sudo(id, window, cx);
                                 },
                             ))
                             .child(self.transfer_menu_item(

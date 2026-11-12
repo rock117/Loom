@@ -203,6 +203,18 @@ pub enum SftpRequest {
         path: String,
         reply: Sender<Result<ResolvedPath, String>>,
     },
+    /// List a directory via `sudo` (Permission denied browse retry).
+    SudoList {
+        path: String,
+        mode: crate::session::sudo_transfer::SudoMode,
+        reply: Sender<Result<Vec<RemoteEntry>>>,
+    },
+    /// Stat a path via `sudo` (Permission denied path-bar retry).
+    SudoResolvePath {
+        path: String,
+        mode: crate::session::sudo_transfer::SudoMode,
+        reply: Sender<Result<ResolvedPath, String>>,
+    },
 }
 
 /// One file/folder upload or download.
@@ -215,12 +227,16 @@ pub enum TransferJob {
         remote: String,
         local: PathBuf,
         options: TransferOptions,
+        /// When set, `sudo cp` into `/tmp` first (SFTP cannot elevate).
+        sudo: Option<crate::session::sudo_transfer::SudoMode>,
     },
     Upload {
         id: uuid::Uuid,
         local: PathBuf,
         remote_dir: String,
         options: TransferOptions,
+        /// When set, SFTP into `/tmp` then `sudo cp` into `remote_dir`.
+        sudo: Option<crate::session::sudo_transfer::SudoMode>,
     },
     /// Stage with remote `docker cp`, then SFTP pull.
     DockerDownload {
@@ -332,6 +348,13 @@ fn is_docker_exec_request(req: &SftpRequest) -> bool {
             | SftpRequest::DockerChmod { .. }
             | SftpRequest::DockerProbe { .. }
             | SftpRequest::DockerResolvePath { .. }
+    )
+}
+
+fn is_sudo_exec_request(req: &SftpRequest) -> bool {
+    matches!(
+        req,
+        SftpRequest::SudoList { .. } | SftpRequest::SudoResolvePath { .. }
     )
 }
 
@@ -484,26 +507,61 @@ async fn run_transfer(
                 remote,
                 local,
                 options,
+                sudo,
                 ..
             } => {
-                download_path(
-                    &session,
-                    &sftp,
-                    id,
-                    &remote,
-                    &local,
-                    &options,
-                    &progress,
-                    &cancel,
-                )
-                .await
+                if let Some(mode) = sudo {
+                    sudo_download_staged(
+                        &session,
+                        &sftp,
+                        id,
+                        &remote,
+                        &local,
+                        &options,
+                        &mode,
+                        &progress,
+                        &cancel,
+                    )
+                    .await
+                } else {
+                    download_path(
+                        &session,
+                        &sftp,
+                        id,
+                        &remote,
+                        &local,
+                        &options,
+                        &progress,
+                        &cancel,
+                    )
+                    .await
+                }
             }
             TransferJob::Upload {
                 local,
                 remote_dir,
                 options,
+                sudo,
                 ..
-            } => upload_path(&sftp, id, &local, &remote_dir, &options, &progress, &cancel).await,
+            } => {
+                if let Some(mode) = sudo {
+                    sudo_upload_staged(
+                        &session,
+                        &sftp,
+                        id,
+                        &local,
+                        &remote_dir,
+                        &options,
+                        &mode,
+                        &progress,
+                        &cancel,
+                    )
+                    .await
+                } else {
+                    upload_path(&sftp, id, &local, &remote_dir, &options, &progress, &cancel)
+                        .await
+                }
+            }
             TransferJob::DockerDownload {
                 container,
                 remote,
@@ -629,6 +687,13 @@ pub async fn run_sftp_worker(
             });
             continue;
         }
+        if is_sudo_exec_request(&req) {
+            let session = Arc::clone(&session);
+            tokio::spawn(async move {
+                dispatch_sudo_exec(&session, req).await;
+            });
+            continue;
+        }
         if let Err(err) = ensure_session(&session, &mut sftp).await {
             reply_open_err(&req, err);
             continue;
@@ -733,6 +798,30 @@ async fn dispatch_request(sftp: &SftpSession, req: SftpRequest) {
         SftpRequest::ResolvePath { path, reply } => {
             let _ = reply.send(resolve_path(sftp, &path).await);
         }
+        SftpRequest::SudoList { reply, .. } => {
+            let _ = reply.send(Err(anyhow::anyhow!(
+                "sudo list must not run on SFTP lane"
+            )));
+        }
+        SftpRequest::SudoResolvePath { reply, .. } => {
+            let _ = reply.send(Err("sudo resolve must not run on SFTP lane".into()));
+        }
+    }
+}
+
+async fn dispatch_sudo_exec(session: &client::Handle<ClientHandler>, req: SftpRequest) {
+    match req {
+        SftpRequest::SudoList { path, mode, reply } => {
+            let _ = reply.send(
+                crate::session::sudo_transfer::list_dir(session, &path, &mode).await,
+            );
+        }
+        SftpRequest::SudoResolvePath { path, mode, reply } => {
+            let _ = reply.send(
+                crate::session::sudo_transfer::resolve_path(session, &path, &mode).await,
+            );
+        }
+        _ => {}
     }
 }
 
@@ -806,6 +895,105 @@ async fn dispatch_docker_exec(session: &client::Handle<ClientHandler>, req: Sftp
             );
         }
         _ => {}
+    }
+}
+
+async fn sudo_download_staged(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    id: uuid::Uuid,
+    remote: &str,
+    local: &Path,
+    options: &TransferOptions,
+    mode: &crate::session::sudo_transfer::SudoMode,
+    progress: &Sender<TransferProgress>,
+    cancel: &TransferCancel,
+) -> Result<TransferOutcome> {
+    ensure_not_cancelled(cancel)?;
+    let name = path_basename(remote);
+    let tmp = crate::session::sudo_transfer::mktemp_dir(session).await?;
+    let staged = format!("{tmp}/{name}");
+    let _ = progress.try_send(progress_phase(id, "Copying with sudo…"));
+    if let Err(err) =
+        crate::session::sudo_transfer::sudo_cp_a(session, remote, &staged, mode).await
+    {
+        let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+        return Err(err);
+    }
+    let _ = progress.try_send(progress_phase(id, "Downloading…"));
+    let result = download_path(
+        session,
+        sftp,
+        id,
+        &staged,
+        local,
+        options,
+        progress,
+        cancel,
+    )
+    .await;
+    let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+    result
+}
+
+async fn sudo_upload_staged(
+    session: &client::Handle<ClientHandler>,
+    sftp: &SftpSession,
+    id: uuid::Uuid,
+    local: &Path,
+    remote_dir: &str,
+    options: &TransferOptions,
+    mode: &crate::session::sudo_transfer::SudoMode,
+    progress: &Sender<TransferProgress>,
+    cancel: &TransferCancel,
+) -> Result<TransferOutcome> {
+    ensure_not_cancelled(cancel)?;
+    let name = local
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("invalid local path"))?;
+    let tmp = crate::session::sudo_transfer::mktemp_dir(session).await?;
+    let _ = progress.try_send(progress_phase(id, "Uploading…"));
+    let outcome = upload_path(
+        sftp,
+        id,
+        local,
+        &tmp,
+        options,
+        progress,
+        cancel,
+    )
+    .await;
+    match outcome {
+        Ok(o) => {
+            // Fresh mktemp dir → upload_path keeps the original basename.
+            let staged = format!("{tmp}/{name}");
+            let _ = progress.try_send(progress_phase(id, "Installing with sudo…"));
+            let remote_name = match crate::session::sudo_transfer::unique_remote_basename_sudo(
+                session, remote_dir, name, mode,
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(err) => {
+                    let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+                    return Err(err);
+                }
+            };
+            let dest = join_remote(remote_dir, &remote_name);
+            if let Err(err) =
+                crate::session::sudo_transfer::sudo_cp_a(session, &staged, &dest, mode).await
+            {
+                let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+                return Err(err);
+            }
+            let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+            Ok(o)
+        }
+        Err(err) => {
+            let _ = crate::session::sudo_transfer::rm_rf_sudo(session, &tmp, mode).await;
+            Err(err)
+        }
     }
 }
 
@@ -916,7 +1104,9 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
         | SftpRequest::DockerHome { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
-        SftpRequest::List { reply, .. } | SftpRequest::DockerList { reply, .. } => {
+        SftpRequest::List { reply, .. }
+        | SftpRequest::DockerList { reply, .. }
+        | SftpRequest::SudoList { reply, .. } => {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::Mkdir { reply, .. }
@@ -933,7 +1123,8 @@ fn reply_open_err(req: &SftpRequest, err: anyhow::Error) {
             let _ = reply.send(Err(anyhow::anyhow!(msg)));
         }
         SftpRequest::DockerResolvePath { reply, .. }
-        | SftpRequest::ResolvePath { reply, .. } => {
+        | SftpRequest::ResolvePath { reply, .. }
+        | SftpRequest::SudoResolvePath { reply, .. } => {
             let _ = reply.send(Err(msg));
         }
     }
@@ -947,7 +1138,7 @@ async fn resolve_path(sftp: &SftpSession, path: &str) -> Result<ResolvedPath, St
     let meta = sftp
         .metadata(path.to_string())
         .await
-        .map_err(|_| "Path does not exist".to_string())?;
+        .map_err(|err| format!("{err:#}"))?;
     if meta.is_dir() {
         return Ok(ResolvedPath::Dir(path.to_string()));
     }

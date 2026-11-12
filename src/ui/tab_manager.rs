@@ -38,6 +38,9 @@ pub struct PaneSession {
     /// In-memory jump-host password for this pane only (never persisted).
     /// Same lifetime rules as [`Self::session_password`].
     pub session_jump_password: Option<String>,
+    /// In-memory sudo password for elevated transfers (never persisted / keyring).
+    /// Set after a successful “Retry with sudo”; cleared on disconnect of the pane.
+    pub session_sudo_password: Option<String>,
     /// Connection snapshot for spawn / reconnect / Save to….
     pub kind: ProfileKind,
     /// Display name (profile name or ephemeral label).
@@ -319,6 +322,7 @@ impl TabManager {
                         auth_profile_id: None,
                         session_password: None,
                         session_jump_password: None,
+                        session_sudo_password: None,
                         kind: profile.kind.clone(),
                         label: profile.name.clone(),
                         state: ConnectionState::Connecting,
@@ -439,6 +443,7 @@ impl TabManager {
                 auth_profile_id: None,
                 session_password: session_password.clone(),
                 session_jump_password: session_jump_password_from(&jump),
+                session_sudo_password: None,
                 kind: profile.kind.clone(),
                 label: profile.name.clone(),
                 state: ConnectionState::Connecting,
@@ -612,6 +617,7 @@ impl TabManager {
             auth_profile_id: None,
             session_password: None,
             session_jump_password: None,
+            session_sudo_password: None,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Failed,
@@ -655,6 +661,7 @@ impl TabManager {
             auth_profile_id: None,
             session_password,
             session_jump_password,
+            session_sudo_password: None,
             kind: profile.kind.clone(),
             label: profile.name.clone(),
             state: ConnectionState::Connecting,
@@ -968,6 +975,7 @@ impl TabManager {
             auth_profile_id: None,
             session_password: None,
             session_jump_password: None,
+            session_sudo_password: None,
             kind: kind.clone(),
             label: label.to_string(),
             state: ConnectionState::Connecting,
@@ -1228,6 +1236,7 @@ impl TabManager {
             auth_profile_id: None,
             session_password: None,
             session_jump_password: None,
+            session_sudo_password: None,
             kind,
             label: label.to_string(),
             state: ConnectionState::Connected,
@@ -1333,6 +1342,7 @@ impl TabManager {
                 p.credentials_profile_id(),
                 p.session_password.clone(),
                 p.session_jump_password.clone(),
+                p.session_sudo_password.clone(),
                 p.ssh_forwards.clone(),
                 p.terminal
                     .as_ref()
@@ -1341,8 +1351,16 @@ impl TabManager {
         }) else {
             return SessionOpResult::Done;
         };
-        let (kind, label, auth_profile_id, source_password, source_jump_password, source_forwards, live_cwd) =
-            source;
+        let (
+            kind,
+            label,
+            auth_profile_id,
+            source_password,
+            source_jump_password,
+            source_sudo_password,
+            source_forwards,
+            live_cwd,
+        ) = source;
 
         let (default_shell, font_family) = {
             let s = store.read(cx);
@@ -1413,6 +1431,7 @@ impl TabManager {
                             auth_profile_id,
                             session_password: session_password_from_auth(&auth),
                             session_jump_password: session_jump_password_from(&jump),
+                            session_sudo_password: source_sudo_password.clone(),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,
@@ -2523,6 +2542,7 @@ impl TabManager {
         let auth_pid = source.credentials_profile_id();
         let source_password = source.session_password.clone();
         let source_jump_password = source.session_jump_password.clone();
+        let source_sudo_password = source.session_sudo_password.clone();
         let live_cwd = source
             .terminal
             .as_ref()
@@ -2584,6 +2604,7 @@ impl TabManager {
                             auth_profile_id: auth_pid,
                             session_password: session_password_from_auth(&auth),
                             session_jump_password: session_jump_password_from(&jump),
+                            session_sudo_password: source_sudo_password.clone(),
                             kind: kind.clone(),
                             label: label.clone(),
                             state: ConnectionState::Connecting,

@@ -204,7 +204,7 @@ pub fn resolve_existing_path(path: &str) -> Result<ResolvedPath, String> {
                     .map(|d| d.as_secs()),
             }))
         }
-        Err(_) => Err("Path does not exist".into()),
+        Err(err) => Err(format!("{err}")),
     }
 }
 

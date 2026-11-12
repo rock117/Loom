@@ -69,6 +69,13 @@ Each transfer opens its own SSH connection and closes it when done (see [SFTP_PO
 Right-click → Reveal in File Explorer / **Copy error** (failed jobs) / Remove.  
 Failed rows show a `Failed` badge plus the **raw** error under the filename
 (hover / Copy error use the same text) — no truncation or cause rewriting.  
+**Permission denied** (SSH only):
+- **Transfers:** **Retry with sudo** under the error (and in the row menu). Stages
+  via `sudo -n` / `sudo -S` under `/tmp`, then SFTP.
+- **Files browse / path bar:** same **Retry with sudo** on the error banner —
+  lists/stats via sudo `find`/`test` on the shell connection.
+Sudo password stays in pane memory only (never keyring). Optional “Try SSH session
+password”. Shared across browse + transfer retries on that pane.  
 MVP: in-memory list for the panel lifetime; no separate Transfers tab.
 
 Drag the sash between the file list and Transfers to change their height ratio
@@ -117,6 +124,7 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 | Host info | `src/session/host_info.rs`（Local sysinfo + SSH probe） |
 | UI | `src/ui/context_panel.rs`、`src/ui/file_icon.rs`、`src/ui/transfer_settings.rs` |
 | Transfer filter / archive | `src/session/transfer_filter.rs`、`src/session/transfer_archive.rs` |
+| Elevated (sudo) transfer | `src/session/sudo_transfer.rs`（`sudo cp` 暂存 + SFTP） |
 | Open path | `src/platform.rs` (`open_path` / `open_path_detached`) |
 | Pane handle | `PaneSession.ssh_sftp`（浏览）、`PaneSession.ssh_transfer_target`（传输连接信息） |
 

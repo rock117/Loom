@@ -150,7 +150,7 @@ exit 1",
     );
     let stdout = remote_exec(session, &cmd)
         .await
-        .map_err(|_| "Path does not exist".to_string())?;
+        .map_err(|err| format!("{err:#}"))?;
     parse_resolve_stdout(&stdout)
 }
 

@@ -210,7 +210,13 @@ exit 1"#,
         .output()
         .map_err(|e| format!("docker exec: {e}"))?;
     if !output.status.success() {
-        return Err("Path does not exist".into());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or("Path does not exist");
+        return Err(detail.to_string());
     }
     parse_resolve_stdout(&String::from_utf8_lossy(&output.stdout))
 }

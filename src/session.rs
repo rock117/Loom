@@ -12,6 +12,7 @@ pub mod local_fs;
 pub mod local_proxy;
 pub mod sftp;
 pub mod ssh;
+pub mod sudo_transfer;
 pub mod transfer_archive;
 pub mod transfer_filter;
 pub mod wsl;
