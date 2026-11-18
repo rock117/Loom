@@ -22,6 +22,10 @@ pub fn snippets_path() -> PathBuf {
     loom_dir().join("snippets.json")
 }
 
+pub fn transfer_history_path() -> PathBuf {
+    loom_dir().join("transfer_history.json")
+}
+
 pub fn known_hosts_path() -> PathBuf {
     loom_dir().join("known_hosts.json")
 }

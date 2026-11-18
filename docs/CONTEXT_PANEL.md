@@ -70,7 +70,10 @@ Right-click an entry (or use prompts from the menu):
 
 ### Transfers footer
 
-Transfers are scoped per SSH pane (switching tabs shows that session’s list only).  
+Transfers are scoped by **host identity** (`profile:{uuid}` or `ssh:user@host:port`),
+not pane UUID — same profile / endpoint shares one list across tabs and splits.
+Finished **Done** / **Failed** rows persist in `transfer_history.json` (cap 80 per
+scope) and restore after quit; Queued/Running do not.  
 Phases: **Queued** (waiting for a per-host transfer slot, max 10 concurrent) → **Scanning · N** → `m/n · size · rate · time` → **Done**.  
 Each transfer opens its own SSH connection and closes it when done (see [SFTP_POOL.md](./SFTP_POOL.md)).  
 **×** / **Clear** cancel the job (not UI-only) so the host slot is freed for the next task.  
@@ -83,8 +86,7 @@ Failed rows show a `Failed` badge plus the **raw** error under the filename
 - **Files browse / path bar:** same **Retry with sudo** on the error banner —
   lists/stats via sudo `find`/`test` on the shell connection.
 Sudo password stays in pane memory only (never keyring). Optional “Try SSH session
-password”. Shared across browse + transfer retries on that pane.  
-MVP: in-memory list for the panel lifetime; no separate Transfers tab.
+password”. Shared across browse + transfer retries on that pane.
 
 Drag the sash between the file list and Transfers to change their height ratio
 (`context_files_list_ratio` in UI state, default ~72% list).

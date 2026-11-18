@@ -7,7 +7,11 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::{ConnectionState, ProfileKind, SshAuth, format_open_ssh_command, suggest_free_bind_port};
+use crate::model::{
+    ConnectionState, PersistedTransfer, PersistedTransferDir, PersistedTransferStatus,
+    ProfileKind, SshAuth, TransferHistoryFile, format_open_ssh_command, load_transfer_history,
+    save_transfer_history, scope_key_from_parts, suggest_free_bind_port,
+};
 use crate::platform;
 use crate::session::docker_fs;
 use crate::session::host_info::{self, HostSnapshot};
@@ -218,8 +222,11 @@ pub struct ContextPanel {
     bound_sftp_alive: bool,
     /// Bumps on each List so stale replies are ignored.
     list_gen: u64,
-    /// Transfers keyed by SSH pane id (not shared across servers/tabs).
-    transfers_by_pane: HashMap<Uuid, Vec<TransferRow>>,
+    /// Transfers keyed by stable scope (`profile:{uuid}` / `ssh:user@host:port`),
+    /// not pane id — shared across tabs of the same host and restored after quit.
+    transfers_by_scope: HashMap<String, Vec<TransferRow>>,
+    /// Scope for the currently bound Files pane (drives the Transfers footer).
+    bound_transfer_scope: Option<String>,
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
     prompt: Option<FilesPrompt>,
@@ -301,7 +308,8 @@ impl ContextPanel {
             files_kind: None,
             bound_sftp_alive: false,
             list_gen: 0,
-            transfers_by_pane: HashMap::new(),
+            transfers_by_scope: Self::load_transfers_from_disk(),
+            bound_transfer_scope: None,
             transfer_menu: None,
             entry_menu: None,
             prompt: None,
@@ -439,51 +447,203 @@ impl ContextPanel {
         self.host_info_gen = self.host_info_gen.wrapping_add(1);
     }
 
-    /// Drop transfer lists for panes that no longer exist; cancel their jobs.
+    fn load_transfers_from_disk() -> HashMap<String, Vec<TransferRow>> {
+        let file = load_transfer_history();
+        let mut map = HashMap::new();
+        for (scope, rows) in file.by_scope {
+            if !Self::is_stable_transfer_scope(&scope) {
+                continue;
+            }
+            let restored: Vec<TransferRow> = rows
+                .into_iter()
+                .filter_map(Self::row_from_persisted)
+                .collect();
+            if !restored.is_empty() {
+                map.insert(scope, restored);
+            }
+        }
+        map
+    }
+
+    fn is_stable_transfer_scope(scope: &str) -> bool {
+        scope.starts_with("profile:") || scope.starts_with("ssh:")
+    }
+
+    fn transfer_scope_for_pane(&self, pane_id: Uuid, cx: &App) -> String {
+        let Some(pane) = self
+            .tabs
+            .read(cx)
+            .tabs
+            .iter()
+            .find_map(|t| t.panes.get(&pane_id))
+        else {
+            return format!("pane:{pane_id}");
+        };
+        match &pane.kind {
+            ProfileKind::Ssh {
+                host, port, user, ..
+            } => scope_key_from_parts(
+                pane.credentials_profile_id(),
+                Some(user.as_str()),
+                Some(host.as_str()),
+                Some(*port),
+            )
+            .unwrap_or_else(|| format!("pane:{pane_id}")),
+            _ => format!("pane:{pane_id}"),
+        }
+    }
+
+    fn row_from_persisted(p: PersistedTransfer) -> Option<TransferRow> {
+        let status = match p.status {
+            PersistedTransferStatus::Done { files } => TransferStatus::Done { files },
+            PersistedTransferStatus::Failed { message } => TransferStatus::Failed(message),
+        };
+        let direction = match p.direction {
+            PersistedTransferDir::Download => TransferDir::Download,
+            PersistedTransferDir::Upload => TransferDir::Upload,
+        };
+        Some(TransferRow {
+            id: p.id,
+            label: p.label,
+            direction,
+            status,
+            local_path: p.local_path.map(PathBuf::from),
+            remote_path: p.remote_path,
+            options: TransferOptions::default(),
+            used_sudo: false,
+            is_dir: p.is_dir,
+            open_after: false,
+            started_at: None,
+            elapsed: p.elapsed_ms.map(std::time::Duration::from_millis),
+            bytes_done: p.bytes_done,
+            bytes_total: p.bytes_total,
+            phase: None,
+            cancel: transfer_cancel_flag(),
+        })
+    }
+
+    fn persisted_from_row(row: &TransferRow) -> Option<PersistedTransfer> {
+        let status = match &row.status {
+            TransferStatus::Done { files } => PersistedTransferStatus::Done { files: *files },
+            TransferStatus::Failed(message) => PersistedTransferStatus::Failed {
+                message: message.clone(),
+            },
+            TransferStatus::Queued | TransferStatus::Running { .. } => return None,
+        };
+        Some(PersistedTransfer {
+            id: row.id,
+            label: row.label.clone(),
+            direction: match row.direction {
+                TransferDir::Download => PersistedTransferDir::Download,
+                TransferDir::Upload => PersistedTransferDir::Upload,
+            },
+            status,
+            local_path: row
+                .local_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            remote_path: row.remote_path.clone(),
+            is_dir: row.is_dir,
+            bytes_done: row.bytes_done,
+            bytes_total: row.bytes_total,
+            elapsed_ms: row.elapsed.map(|d| d.as_millis() as u64),
+            finished_at: Some(crate::model::transfer_history::now_unix_secs()),
+        })
+    }
+
+    /// Write finished transfer rows for stable scopes to disk.
+    pub fn flush_transfer_history(&self) {
+        let mut file = TransferHistoryFile::default();
+        for (scope, rows) in &self.transfers_by_scope {
+            if !Self::is_stable_transfer_scope(scope) {
+                continue;
+            }
+            let persisted: Vec<PersistedTransfer> = rows
+                .iter()
+                .filter_map(Self::persisted_from_row)
+                .take(crate::model::transfer_history::MAX_PER_SCOPE)
+                .collect();
+            if !persisted.is_empty() {
+                file.by_scope.insert(scope.clone(), persisted);
+            }
+        }
+        file.trim();
+        if let Err(error) = save_transfer_history(&file) {
+            eprintln!("loom: failed to save transfer history: {error:#}");
+        }
+    }
+
+    /// Cancel in-flight jobs for scopes with no live panes; keep finished history.
     fn prune_closed_pane_transfers(&mut self, cx: &App) {
-        let live: std::collections::HashSet<Uuid> = self
+        let pane_ids: Vec<Uuid> = self
             .tabs
             .read(cx)
             .tabs
             .iter()
             .flat_map(|t| t.panes.keys().copied())
             .collect();
-        let stale: Vec<Uuid> = self
-            .transfers_by_pane
-            .keys()
-            .copied()
-            .filter(|id| !live.contains(id))
+        let live_scopes: std::collections::HashSet<String> = pane_ids
+            .iter()
+            .map(|id| self.transfer_scope_for_pane(*id, cx))
             .collect();
-        for pane_id in stale {
-            if let Some(rows) = self.transfers_by_pane.remove(&pane_id) {
-                for row in rows {
-                    row.cancel
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
+        let scopes: Vec<String> = self.transfers_by_scope.keys().cloned().collect();
+        let mut dirty = false;
+        for scope in scopes {
+            if live_scopes.contains(&scope) {
+                continue;
             }
+            let drop_scope = {
+                let Some(rows) = self.transfers_by_scope.get_mut(&scope) else {
+                    continue;
+                };
+                for row in rows.iter() {
+                    if matches!(
+                        row.status,
+                        TransferStatus::Queued | TransferStatus::Running { .. }
+                    ) {
+                        row.cancel
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let before = rows.len();
+                rows.retain(|r| {
+                    !matches!(
+                        r.status,
+                        TransferStatus::Queued | TransferStatus::Running { .. }
+                    )
+                });
+                if rows.len() != before {
+                    dirty = true;
+                }
+                rows.is_empty() || !Self::is_stable_transfer_scope(&scope)
+            };
+            if drop_scope && self.transfers_by_scope.remove(&scope).is_some() {
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.flush_transfer_history();
         }
     }
 
-    fn pane_transfers(&self, pane_id: Uuid) -> &[TransferRow] {
-        self.transfers_by_pane
-            .get(&pane_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     fn current_transfers(&self) -> &[TransferRow] {
-        match self.bound_pane {
-            Some(id) => self.pane_transfers(id),
+        match &self.bound_transfer_scope {
+            Some(scope) => self
+                .transfers_by_scope
+                .get(scope)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
             None => &[],
         }
     }
 
-    fn pane_transfers_mut(&mut self, pane_id: Uuid) -> &mut Vec<TransferRow> {
-        self.transfers_by_pane.entry(pane_id).or_default()
+    fn pane_transfers_mut(&mut self, pane_id: Uuid, cx: &App) -> &mut Vec<TransferRow> {
+        let scope = self.transfer_scope_for_pane(pane_id, cx);
+        self.transfers_by_scope.entry(scope).or_default()
     }
 
     fn find_transfer_mut(&mut self, id: Uuid) -> Option<&mut TransferRow> {
-        for rows in self.transfers_by_pane.values_mut() {
+        for rows in self.transfers_by_scope.values_mut() {
             if let Some(row) = rows.iter_mut().find(|t| t.id == id) {
                 return Some(row);
             }
@@ -492,7 +652,7 @@ impl ContextPanel {
     }
 
     fn find_transfer(&self, id: Uuid) -> Option<&TransferRow> {
-        self.transfers_by_pane
+        self.transfers_by_scope
             .values()
             .flat_map(|rows| rows.iter())
             .find(|t| t.id == id)
@@ -502,15 +662,18 @@ impl ContextPanel {
         self.prune_closed_pane_transfers(cx);
         let Some((pane_id, kind, sftp)) = self.focused_files(cx) else {
             if self.bound_pane.take().is_some() || self.files_kind.take().is_some() {
+                self.bound_transfer_scope = None;
                 self.bound_sftp_alive = false;
                 self.reset_files_state();
             }
             return;
         };
+        let scope = self.transfer_scope_for_pane(pane_id, cx);
         let sftp_alive = sftp.is_some();
         if self.bound_pane == Some(pane_id)
             && self.files_kind == Some(kind)
             && self.bound_sftp_alive == sftp_alive
+            && self.bound_transfer_scope.as_ref() == Some(&scope)
         {
             // SFTP handle still missing: refresh Connecting / Disconnected banner.
             if !sftp_alive && kind == FilesKind::Sftp {
@@ -523,6 +686,7 @@ impl ContextPanel {
             return;
         }
         self.bound_pane = Some(pane_id);
+        self.bound_transfer_scope = Some(scope);
         self.files_kind = Some(kind);
         self.bound_sftp_alive = sftp_alive;
         self.reset_files_state();
@@ -1221,7 +1385,7 @@ impl ContextPanel {
         let cancel = transfer_cancel_flag();
         let label = name.clone();
 
-        self.pane_transfers_mut(pane_id).insert(
+        self.pane_transfers_mut(pane_id, cx).insert(
             0,
             TransferRow {
                 id,
@@ -1398,7 +1562,7 @@ impl ContextPanel {
         let id = Uuid::new_v4();
         let cancel = transfer_cancel_flag();
 
-        self.pane_transfers_mut(pane_id).insert(
+        self.pane_transfers_mut(pane_id, cx).insert(
             0,
             TransferRow {
                 id,
@@ -1693,7 +1857,7 @@ impl ContextPanel {
         let is_dir = local.is_dir();
         let cancel = transfer_cancel_flag();
 
-        self.pane_transfers_mut(pane_id).insert(
+        self.pane_transfers_mut(pane_id, cx).insert(
             0,
             TransferRow {
                 id,
@@ -1823,7 +1987,7 @@ impl ContextPanel {
         let is_dir = local.is_dir();
         let cancel = transfer_cancel_flag();
 
-        self.pane_transfers_mut(pane_id).insert(
+        self.pane_transfers_mut(pane_id, cx).insert(
             0,
             TransferRow {
                 id,
@@ -2033,6 +2197,8 @@ impl ContextPanel {
             }
             row.status = TransferStatus::Done { files };
         }
+        self.trim_scope_history_for_id(id);
+        self.flush_transfer_history();
         if let Some(path) = open_path {
             platform::open_path_detached(path);
         }
@@ -2046,6 +2212,35 @@ impl ContextPanel {
             row.elapsed = row.started_at.map(|t| t.elapsed());
             row.phase = None;
             row.status = TransferStatus::Failed(msg);
+        }
+        self.trim_scope_history_for_id(id);
+        self.flush_transfer_history();
+    }
+
+    /// Drop oldest finished rows past [`MAX_PER_SCOPE`] in the scope that owns `id`.
+    fn trim_scope_history_for_id(&mut self, id: Uuid) {
+        let Some(scope) = self
+            .transfers_by_scope
+            .iter()
+            .find(|(_, rows)| rows.iter().any(|r| r.id == id))
+            .map(|(s, _)| s.clone())
+        else {
+            return;
+        };
+        let Some(rows) = self.transfers_by_scope.get_mut(&scope) else {
+            return;
+        };
+        let max = crate::model::transfer_history::MAX_PER_SCOPE;
+        while rows.len() > max {
+            let Some(idx) = rows.iter().rposition(|r| {
+                matches!(
+                    r.status,
+                    TransferStatus::Done { .. } | TransferStatus::Failed(_)
+                )
+            }) else {
+                break;
+            };
+            rows.remove(idx);
         }
     }
 
@@ -2495,19 +2690,20 @@ impl ContextPanel {
     }
 
     fn remove_transfer_silent(&mut self, id: Uuid) {
-        for rows in self.transfers_by_pane.values_mut() {
+        for rows in self.transfers_by_scope.values_mut() {
             rows.retain(|t| t.id != id);
         }
         if self.transfer_menu.as_ref().is_some_and(|m| m.id == id) {
             self.transfer_menu = None;
         }
+        self.flush_transfer_history();
     }
 
     fn clear_transfers(&mut self) {
-        let Some(pane_id) = self.bound_pane else {
+        let Some(scope) = self.bound_transfer_scope.clone() else {
             return;
         };
-        if let Some(rows) = self.transfers_by_pane.get_mut(&pane_id) {
+        if let Some(rows) = self.transfers_by_scope.get_mut(&scope) {
             for row in rows.iter() {
                 row.cancel
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -2515,6 +2711,7 @@ impl ContextPanel {
             rows.clear();
         }
         self.transfer_menu = None;
+        self.flush_transfer_history();
     }
 
     fn reveal_transfer(&self, id: Uuid) {

@@ -1305,6 +1305,8 @@ impl WorkspaceView {
             let (tabs, active) = m.snapshot_for_persist();
             (tabs, active, m.font_size)
         });
+        self.context_panel
+            .update(cx, |panel, _cx| panel.flush_transfer_history());
         self.store.update(cx, |s, _cx| {
             s.ui_state.sidebar_width = sidebar_width;
             s.ui_state.sidebar_visible = sidebar_visible;

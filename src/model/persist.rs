@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use super::snippets::SnippetsFile;
+use super::transfer_history::TransferHistoryFile;
 use super::workspace::{SettingsFile, UiStateFile, WorkspaceFile};
 use crate::shared::paths;
 
@@ -81,6 +82,17 @@ pub fn load_snippets() -> SnippetsFile {
 
 pub fn save_snippets(file: &SnippetsFile) -> Result<()> {
     write_json(&paths::snippets_path(), file)
+}
+
+pub fn load_transfer_history() -> TransferHistoryFile {
+    read_json(&paths::transfer_history_path())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+pub fn save_transfer_history(file: &TransferHistoryFile) -> Result<()> {
+    write_json(&paths::transfer_history_path(), file)
 }
 
 pub fn export_workspace_to(path: &PathBuf, ws: &WorkspaceFile) -> Result<()> {
