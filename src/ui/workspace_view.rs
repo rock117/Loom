@@ -184,6 +184,7 @@ impl WorkspaceView {
 
         view._subscriptions.push(cx.observe(&tabs, |this, _tabs, cx| {
             this.maybe_auto_show_files_for_ssh(cx);
+            this.sync_sidebar_to_active_pane(cx);
         }));
 
         view._subscriptions.push(cx.subscribe_in(
@@ -209,6 +210,13 @@ impl WorkspaceView {
                 }
                 AppBusEvent::Toast(msg) => {
                     this.set_toast(msg.clone(), cx);
+                }
+                AppBusEvent::WorkingDirectoryChanged { pane_id, path } => {
+                    let pane_id = *pane_id;
+                    let path = path.clone();
+                    this.context_panel.update(cx, |panel, cx| {
+                        panel.on_pane_cwd_changed(pane_id, path, cx);
+                    });
                 }
                 _ => {}
             },
@@ -1370,6 +1378,28 @@ impl WorkspaceView {
         );
         self.persist_tabs(cx);
         cx.notify();
+    }
+
+    /// Sidebar highlight follows the focused pane’s Bound profile (or auth source).
+    fn sync_sidebar_to_active_pane(&mut self, cx: &mut Context<Self>) {
+        let profile_id = {
+            let tabs = self.tabs.read(cx);
+            let Some(pane) = tabs.active_tab().and_then(|t| t.focused_pane()) else {
+                self.store
+                    .update(cx, |s, cx| s.reveal_active_profile(None, cx));
+                return;
+            };
+            let candidate = pane.profile_id.or(pane.auth_profile_id);
+            let store = self.store.read(cx);
+            candidate.filter(|id| {
+                store
+                    .workspace
+                    .find_profile(*id)
+                    .is_some_and(|p| p.kind.visible_in_sidebar())
+            })
+        };
+        self.store
+            .update(cx, |s, cx| s.reveal_active_profile(profile_id, cx));
     }
 
     fn toggle_context_panel(&mut self, cx: &mut Context<Self>) {

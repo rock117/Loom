@@ -26,6 +26,14 @@ Both side panels hide completely when toggled off; width/visibility persist in `
 
 ## Files browser (primary)
 
+Switching the focused pane rebinds Files and opens at that pane’s **cached** working
+directory when known (OSC / spawn `cd`); otherwise SSH → session home, Local → user
+profile, Docker → container `$HOME`. While bound, **OSC cwd changes follow into Files**
+(`cd` in the terminal updates the browser path) unless the path bar or a prompt is
+active. The ⌂ Home button still jumps to those homes.
+Cached cwd is fine for browse paint; user Save / Reveal still must `refresh_working_directory`
+first ([SESSION_PROFILE_IA.md](./SESSION_PROFILE_IA.md) § cwd).
+
 Windows-style navigation:
 
 | Action | Behavior |

@@ -123,6 +123,19 @@ impl WorkspaceFile {
         None
     }
 
+    /// Ancestor groups from root → immediate parent (empty if profile is at root / missing).
+    pub fn group_path_for_profile(&self, profile_id: Uuid) -> Vec<Uuid> {
+        if self.profiles.iter().any(|p| p.id == profile_id) {
+            return Vec::new();
+        }
+        for g in &self.groups {
+            if let Some(path) = g.group_path_for_profile(profile_id) {
+                return path;
+            }
+        }
+        Vec::new()
+    }
+
     pub fn first_local_profile_id(&self) -> Option<Uuid> {
         if let Some(p) = self.profiles.iter().find(|p| p.kind.is_local()) {
             return Some(p.id);
@@ -539,6 +552,20 @@ impl Group {
         for c in &self.children {
             if let Some(id) = c.group_id_for_profile(profile_id) {
                 return Some(id);
+            }
+        }
+        None
+    }
+
+    /// Path `self.id … parent` when this subtree contains the profile.
+    fn group_path_for_profile(&self, profile_id: Uuid) -> Option<Vec<Uuid>> {
+        if self.profiles.iter().any(|p| p.id == profile_id) {
+            return Some(vec![self.id]);
+        }
+        for c in &self.children {
+            if let Some(mut path) = c.group_path_for_profile(profile_id) {
+                path.insert(0, self.id);
+                return Some(path);
             }
         }
         None

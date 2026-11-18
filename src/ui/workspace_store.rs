@@ -98,6 +98,56 @@ impl WorkspaceStore {
         cx.notify();
     }
 
+    /// Mirror the focused pane’s profile in the sidebar (expand ancestors if needed).
+    ///
+    /// `None` clears the highlight (ephemeral pane with no Bound / auth profile).
+    pub fn reveal_active_profile(&mut self, profile_id: Option<Uuid>, cx: &mut Context<Self>) {
+        let mut changed = false;
+        match profile_id {
+            Some(id) if self.workspace.find_profile(id).is_some() => {
+                if self.expand_ancestors_of_profile(id) {
+                    changed = true;
+                }
+                if self.selection != Selection::Profile(id) {
+                    self.rename = None;
+                    self.selection = Selection::Profile(id);
+                    changed = true;
+                }
+            }
+            Some(_) | None => {
+                if self.selection != Selection::None {
+                    self.rename = None;
+                    self.selection = Selection::None;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Uncollapse groups on the path to `profile_id`. Returns true if any flag changed.
+    fn expand_ancestors_of_profile(&mut self, profile_id: Uuid) -> bool {
+        let path = self.workspace.group_path_for_profile(profile_id);
+        if path.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for gid in path {
+            if let Some(g) = self.workspace.find_group_mut(gid) {
+                if g.collapsed {
+                    g.collapsed = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
     pub fn toggle_group(&mut self, id: Uuid, cx: &mut Context<Self>) {
         if let Some(g) = self.workspace.find_group_mut(id) {
             g.collapsed = !g.collapsed;

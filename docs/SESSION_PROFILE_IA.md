@@ -82,6 +82,7 @@ PaneSession {
 4. **新建 / 侧栏 Duplicate Profile → 只改收藏，不自动打开** Session。
 5. **工作区再开为临时**：Ctrl+T、Tab/终端 Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。
 6. **点侧栏 Profile → Bound Session**（可持久恢复）。
+   - **反向同步：** 当前 focused pane 变化时，侧栏高亮对应 Profile（Bound 用 `profile_id`；Ephemeral Split/Duplicate 用 `auth_profile_id`）。无对应 Profile 时清空高亮；嵌套 Group 会自动展开。
 7. **Tab 右键 Save / Save As…**（文件隐喻）：
    - **Bound**（已有 Profile）→ **Save**（单 Pane：写公共 cwd；多 Pane：写 `layout`+`panes`，见 [PROFILE_TAB_LAYOUT.md](./PROFILE_TAB_LAYOUT.md)）+ **Save As…**（弹框建新 Profile 并绑定；多 Pane 时快照一并写入）。
    - **Ephemeral** → 仅 **Save As…**（同上弹框）。

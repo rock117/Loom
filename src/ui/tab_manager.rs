@@ -2788,21 +2788,27 @@ fn wire_terminal_session(
                 this.on_pane_session_ended(pane_id, cx);
             }
             TerminalViewEvent::WorkingDirectoryChanged(path) => {
-                let Some(pane) = this
+                if let Some(pane) = this
                     .tabs
                     .iter_mut()
                     .find_map(|t| t.panes.get_mut(&pane_id))
-                else {
-                    return;
-                };
-                // Session-only: do not write Bound profile start directory on cd.
-                // Docker: pane kind cwd is not a host start dir.
-                if !pane.kind.is_local() || pane.kind.is_docker_local() {
-                    return;
+                {
+                    // Session-only memory for Local (not Docker): do not write Profile on cd.
+                    if pane.kind.is_local() && !pane.kind.is_docker_local() {
+                        if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
+                            *cwd = Some(path.clone());
+                        }
+                    }
                 }
-                if let ProfileKind::Local { cwd, .. } = &mut pane.kind {
-                    *cwd = Some(path.clone());
-                }
+                AppBus::emit(
+                    &this.app_bus,
+                    AppBusEvent::WorkingDirectoryChanged {
+                        pane_id,
+                        path: path.clone(),
+                    },
+                    cx,
+                );
+                cx.notify();
             }
         }
     });

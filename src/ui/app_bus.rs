@@ -29,6 +29,11 @@ pub enum AppBusEvent {
     },
     /// Brief status-bar toast (e.g. invalid shell fallback).
     Toast(SharedString),
+    /// Terminal OSC / process cwd changed for a pane — Files may follow.
+    WorkingDirectoryChanged {
+        pane_id: Uuid,
+        path: std::path::PathBuf,
+    },
 }
 
 /// Empty emitter entity for [`AppBusEvent`].

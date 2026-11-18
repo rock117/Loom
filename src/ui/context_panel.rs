@@ -526,18 +526,164 @@ impl ContextPanel {
         self.files_kind = Some(kind);
         self.bound_sftp_alive = sftp_alive;
         self.reset_files_state();
+        // Follow the focused pane’s known cwd (OSC / spawn cache). Home button still
+        // uses go_home_* (SSH session home / container $HOME / local fallback).
+        self.open_files_for_focused_pane(kind, sftp, cx);
+    }
+
+    /// Start Files at the focused pane’s working directory when known.
+    fn open_files_for_focused_pane(
+        &mut self,
+        kind: FilesKind,
+        sftp: Option<SftpHandle>,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_cwd = self.focused_pane_working_directory(cx);
         match kind {
+            FilesKind::Local => {
+                let home = pane_cwd.unwrap_or_else(default_local_home);
+                self.home = Some(home.clone());
+                self.load_dir(home, cx);
+            }
             FilesKind::Sftp => {
-                if let Some(sftp) = sftp {
-                    self.go_home_sftp(sftp, cx);
-                } else {
+                let Some(sftp) = sftp else {
                     self.error = Some(self.sftp_unavailable_message(cx));
                     cx.notify();
+                    return;
+                };
+                if let Some(cwd) = pane_cwd {
+                    // Cache session home in the background for `~` expansion; list cwd now.
+                    self.prefetch_sftp_home(sftp.clone(), cx);
+                    self.home = self.home.clone().or_else(|| Some(cwd.clone()));
+                    self.load_dir(cwd, cx);
+                } else {
+                    self.go_home_sftp(sftp, cx);
                 }
             }
-            FilesKind::Docker => self.go_home_docker(cx),
-            FilesKind::Local => self.go_home_local(cx),
+            FilesKind::Docker => {
+                if let Some(cwd) = pane_cwd.filter(|p| p.starts_with('/')) {
+                    self.prefetch_docker_home(cx);
+                    self.home = self.home.clone().or_else(|| Some(cwd.clone()));
+                    self.load_dir(cwd, cx);
+                } else {
+                    self.go_home_docker(cx);
+                }
+            }
         }
+    }
+
+    /// Cached terminal cwd for the focused pane (OSC / initial cd — OK for Files paint).
+    fn focused_pane_working_directory(&self, cx: &App) -> Option<String> {
+        self.tabs
+            .read(cx)
+            .active_tab()?
+            .focused_pane()?
+            .terminal
+            .as_ref()?
+            .read(cx)
+            .working_directory()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    /// Terminal cwd changed (OSC) — keep Files in sync with the bound pane.
+    pub fn on_pane_cwd_changed(
+        &mut self,
+        pane_id: Uuid,
+        path: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.bound_pane != Some(pane_id) {
+            return;
+        }
+        // Don't yank the path bar / modal out from under the user.
+        if self.editing_path || self.prompt.is_some() {
+            return;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        if path_str.trim().is_empty() {
+            return;
+        }
+        if self.cwd.as_ref() == Some(&path_str) {
+            return;
+        }
+        match self.files_kind {
+            Some(FilesKind::Docker) if !path_str.starts_with('/') => return,
+            Some(FilesKind::Sftp | FilesKind::Docker | FilesKind::Local) => {
+                self.load_dir(path_str, cx);
+            }
+            None => {}
+        }
+    }
+
+    fn prefetch_sftp_home(&mut self, sftp: SftpHandle, cx: &mut Context<Self>) {
+        if self.home.as_ref().is_some_and(|h| !h.is_empty()) {
+            return;
+        }
+        let (tx, rx) = flume::bounded(1);
+        if sftp.request(SftpRequest::Home { reply: tx }).is_err() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = rx.recv_async().await;
+            this.update(cx, |this, _cx| {
+                if let Ok(Ok(home)) = result {
+                    if this.home.as_ref().map_or(true, |h| h.is_empty()) {
+                        this.home = Some(home);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn prefetch_docker_home(&mut self, cx: &mut Context<Self>) {
+        if self.home.as_ref().is_some_and(|h| !h.is_empty()) {
+            return;
+        }
+        let Some((_, container, sftp)) = self.focused_docker(cx) else {
+            return;
+        };
+        if let Some(sftp) = sftp {
+            let (tx, rx) = flume::bounded(1);
+            if sftp
+                .request(SftpRequest::DockerHome {
+                    container,
+                    reply: tx,
+                })
+                .is_err()
+            {
+                return;
+            }
+            cx.spawn(async move |this, cx| {
+                let result = rx.recv_async().await;
+                this.update(cx, |this, _cx| {
+                    if let Ok(Ok(home)) = result {
+                        if this.home.as_ref().map_or(true, |h| h.is_empty()) {
+                            this.home = Some(home);
+                        }
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move { docker_fs::home_dir(&container) })
+                .await;
+            this.update(cx, |this, _cx| {
+                if let Ok(home) = result {
+                    if this.home.as_ref().map_or(true, |h| h.is_empty()) {
+                        this.home = Some(home);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn sftp_unavailable_message(&self, cx: &App) -> String {

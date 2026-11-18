@@ -36,6 +36,7 @@ impl Persistence {
                 AppBusEvent::DuplicateActiveTab => {}
                 AppBusEvent::HostKeyChanged { .. } => {}
                 AppBusEvent::Toast(_) => {}
+                AppBusEvent::WorkingDirectoryChanged { .. } => {}
             }
         });
 
