@@ -44,11 +44,11 @@ Windows-style navigation:
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
 | Toolbar Upload (SSH) | Pick local **file** → upload to current remote cwd (**no settings**). |
-| Toolbar Upload folder (SSH) | Pick local **folder** → **settings** (remote dir / include·exclude / compress) → recursive upload |
-| Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → settings dialog |
-| ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → settings → transfer |
+| Toolbar Upload folder (SSH) | Pick local **folder** → **modal** (remote dir / skip folders / advanced filters) → recursive upload |
+| Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → transfer settings modal |
+| ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → transfer settings modal |
 
-Settings dialog (folders / mixed only): local dest = Downloads; remote dest = current cwd; exclude presets (`node_modules`, `target`, `dist`, …) checked; include empty (= all). Paths support select / copy / paste; Tab cycles fields. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter). Transfers always copy originals (no compress option — pack remotely yourself if needed).
+Transfer settings modal (folders / mixed only): centered overlay like SSH password. Shows item summary; Save to / Remote folder + Browse; **Skip folders** two-column checklist (`node_modules`, `target`, …); **Advanced filters** (include / extra exclude) collapsed by default. Tab cycles fields; Cancel · Download/Upload bottom-right. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter). Transfers always copy originals (no compress option — pack remotely yourself if needed).
 
 File rows use **type-specific SVG icons** tinted with Seti colors (VS Code built-in Explorer palette): folders, git, Rust hexagon, Python, Markdown `M↓`, JSON braces, shell green, etc.
 

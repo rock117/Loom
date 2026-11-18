@@ -4887,8 +4887,9 @@ impl ContextPanel {
     }
 
     fn render_prompt_bar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Transfer settings uses a centered modal overlay (see render_transfer_settings).
         if matches!(self.prompt, Some(FilesPrompt::TransferSettings(_))) {
-            return self.render_transfer_settings(cx);
+            return None;
         }
 
         let prompt = self.prompt.as_ref()?;
@@ -5065,211 +5066,432 @@ impl ContextPanel {
         )
     }
 
+    /// Centered modal (password / Settings style) — not the cramped Files prompt bar.
     fn render_transfer_settings(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let FilesPrompt::TransferSettings(form) = self.prompt.as_ref()? else {
             return None;
         };
         let dest_label = form.dest_label();
         let is_download = form.is_download();
+        let show_skip = form.show_skip_presets();
+        let advanced_open = form.advanced_open;
         let focus = form.focus;
         let presets: Vec<(String, bool)> = form.exclude_presets.clone();
+        let dest_empty = form.dest.text.is_empty();
+        let include_empty = form.include.text.is_empty();
+        let exclude_empty = form.exclude_extra.text.is_empty();
         let dest_el = form.dest.into_element();
         let include_el = form.include.into_element();
         let exclude_el = form.exclude_extra.into_element();
         let title = form.title();
+        let summary = form.summary();
+        let action = form.action_label();
 
-        let field_style = |active: bool| {
+        let field_box = |active: bool| {
             div()
                 .w_full()
+                .min_h(px(28.0))
                 .border_1()
                 .border_color(if active {
                     theme::ACCENT
                 } else {
-                    theme::BORDER_SUBTLE
+                    theme::BORDER
                 })
                 .rounded(px(theme::RADIUS_SM))
-                .px(px(theme::SPACE_1))
-                .py(px(2.0))
+                .bg(theme::BG)
+                .px(px(theme::SPACE_2))
+                .py(px(theme::SPACE_1))
+                .text_sm()
+                .text_color(theme::TEXT)
         };
 
-        let mut preset_row = div().flex().flex_wrap().gap(px(theme::SPACE_1));
+        let section_label = |text: &'static str| {
+            div()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::TEXT_MUTED)
+                .child(text)
+        };
+
+        // Two-column skip list (WinSCP / FinalShell style), not wrapping chips.
+        let mut skip_left = div().flex().flex_col().gap(px(2.0)).flex_1().min_w_0();
+        let mut skip_right = div().flex().flex_col().gap(px(2.0)).flex_1().min_w_0();
         for (i, (name, on)) in presets.iter().enumerate() {
             let checked = *on;
             let label = name.clone();
-            preset_row = preset_row.child(
-                div()
-                    .id(ElementId::Name(format!("xfer-ex-{i}").into()))
-                    .px(px(theme::SPACE_1))
-                    .py(px(1.0))
-                    .rounded(px(theme::RADIUS_SM))
-                    .text_xs()
-                    .cursor_pointer()
-                    .bg(if checked {
-                        theme::ACCENT.opacity(0.25)
-                    } else {
-                        theme::HOVER
-                    })
-                    .text_color(if checked {
-                        theme::TEXT
-                    } else {
-                        theme::TEXT_MUTED
-                    })
-                    .child(format!("{} {label}", if checked { "☑" } else { "☐" }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(FilesPrompt::TransferSettings(form)) = this.prompt.as_mut() {
-                            if let Some((_, on)) = form.exclude_presets.get_mut(i) {
-                                *on = !*on;
-                            }
-                        }
-                        cx.notify();
-                    })),
-            );
-        }
-
-        Some(
-            div()
+            let row = div()
+                .id(ElementId::Name(format!("xfer-ex-{i}").into()))
                 .flex()
-                .flex_col()
+                .items_center()
                 .gap(px(theme::SPACE_1))
                 .px(px(theme::SPACE_1))
-                .py(px(theme::SPACE_1))
+                .py(px(3.0))
                 .rounded(px(theme::RADIUS_SM))
-                .border_1()
-                .border_color(theme::BORDER)
-                .bg(theme::ELEVATED)
-                .track_focus(&self.focus_handle)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::HOVER))
                 .child(
                     div()
-                        .text_xs()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::TEXT)
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child(dest_label),
-                )
-                .child(
-                    div()
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .rounded(px(3.0))
+                        .border_1()
+                        .border_color(if checked {
+                            theme::ACCENT
+                        } else {
+                            theme::BORDER
+                        })
+                        .bg(if checked {
+                            theme::ACCENT
+                        } else {
+                            theme::BG
+                        })
                         .flex()
-                        .gap(px(theme::SPACE_1))
                         .items_center()
-                        .child(
-                            field_style(focus == TransferField::Dest)
-                                .id("xfer-dest")
-                                .flex_1()
-                                .child(dest_el)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        if let Some(FilesPrompt::TransferSettings(form)) =
-                                            this.prompt.as_mut()
-                                        {
-                                            form.focus = TransferField::Dest;
-                                        }
-                                        cx.notify();
-                                    }),
-                                ),
-                        )
-                        .when(is_download, |d| {
-                            d.child(
-                                div()
-                                    .id("xfer-browse")
-                                    .px(px(theme::SPACE_2))
-                                    .py(px(theme::SPACE_1))
-                                    .rounded(px(theme::RADIUS_SM))
-                                    .text_xs()
-                                    .cursor_pointer()
-                                    .bg(theme::HOVER)
-                                    .child("Browse…")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.browse_transfer_dest(cx);
-                                    })),
-                            )
+                        .justify_center()
+                        .child(if checked {
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xffffff))
+                                .child("✓")
+                        } else {
+                            div()
                         }),
                 )
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child("Include (globs, empty = all)"),
+                        .text_color(theme::TEXT)
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(label),
                 )
-                .child(
-                    field_style(focus == TransferField::Include)
-                        .id("xfer-include")
-                        .child(include_el)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(FilesPrompt::TransferSettings(form)) =
-                                    this.prompt.as_mut()
-                                {
-                                    form.focus = TransferField::Include;
-                                }
-                                cx.notify();
-                            }),
-                        ),
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(FilesPrompt::TransferSettings(form)) = this.prompt.as_mut() {
+                        if let Some((_, on)) = form.exclude_presets.get_mut(i) {
+                            *on = !*on;
+                        }
+                    }
+                    cx.notify();
+                }));
+            if i % 2 == 0 {
+                skip_left = skip_left.child(row);
+            } else {
+                skip_right = skip_right.child(row);
+            }
+        }
+
+        Some(
+            div()
+                .id("xfer-settings-overlay")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(theme::SPACE_2))
+                .bg(hsla(0.0, 0.0, 0.0, 0.55))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        this.cancel_prompt(cx);
+                        cx.stop_propagation();
+                    }),
                 )
                 .child(
                     div()
-                        .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child("Exclude presets (checked = skip)"),
-                )
-                .child(preset_row)
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::TEXT_MUTED)
-                        .child("Extra exclude globs"),
-                )
-                .child(
-                    field_style(focus == TransferField::ExcludeExtra)
-                        .id("xfer-exclude")
-                        .child(exclude_el)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(FilesPrompt::TransferSettings(form)) =
-                                    this.prompt.as_mut()
-                                {
-                                    form.focus = TransferField::ExcludeExtra;
-                                }
-                                cx.notify();
-                            }),
-                        ),
-                )
-                .child(
-                    div()
+                        .id("xfer-settings-card")
+                        .w_full()
+                        .max_w(px(360.0))
+                        .max_h(relative(0.92))
+                        .overflow_y_scroll()
+                        .p(px(theme::SPACE_4))
+                        .rounded(px(theme::RADIUS))
+                        .bg(theme::PANEL_BG)
+                        .border_1()
+                        .border_color(theme::BORDER)
                         .flex()
-                        .gap(px(theme::SPACE_1))
-                        .child(
-                            div()
-                                .id("ctx-prompt-ok")
-                                .px(px(theme::SPACE_2))
-                                .py(px(theme::SPACE_1))
-                                .rounded(px(theme::RADIUS_SM))
-                                .text_xs()
-                                .bg(theme::ACCENT)
-                                .text_color(theme::TEXT)
-                                .cursor_pointer()
-                                .child("Start")
-                                .on_click(cx.listener(|this, _, _, cx| this.submit_prompt(cx))),
+                        .flex_col()
+                        .gap(px(theme::SPACE_3))
+                        .shadow_md()
+                        .track_focus(&self.focus_handle)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
                         )
                         .child(
                             div()
-                                .id("ctx-prompt-cancel")
-                                .px(px(theme::SPACE_2))
-                                .py(px(theme::SPACE_1))
-                                .rounded(px(theme::RADIUS_SM))
-                                .text_xs()
-                                .text_color(theme::TEXT_MUTED)
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACE_1))
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::TEXT)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child(summary),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(theme::SPACE_1))
+                                .child(section_label(dest_label))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(theme::SPACE_1))
+                                        .items_center()
+                                        .child(
+                                            field_box(focus == TransferField::Dest)
+                                                .id("xfer-dest")
+                                                .relative()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(dest_el)
+                                                .when(dest_empty, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .absolute()
+                                                            .inset_0()
+                                                            .px(px(theme::SPACE_2))
+                                                            .py(px(theme::SPACE_1))
+                                                            .text_sm()
+                                                            .text_color(theme::TEXT_DISABLED)
+                                                            .child(if is_download {
+                                                                "Choose a local folder…"
+                                                            } else {
+                                                                "Remote path…"
+                                                            }),
+                                                    )
+                                                })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        if let Some(
+                                                            FilesPrompt::TransferSettings(form),
+                                                        ) = this.prompt.as_mut()
+                                                        {
+                                                            form.focus = TransferField::Dest;
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .when(is_download, |d| {
+                                            d.child(
+                                                div()
+                                                    .id("xfer-browse")
+                                                    .h(px(28.0))
+                                                    .px(px(theme::SPACE_2))
+                                                    .rounded(px(theme::RADIUS_SM))
+                                                    .border_1()
+                                                    .border_color(theme::BORDER)
+                                                    .bg(theme::BG)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT)
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(theme::HOVER))
+                                                    .child("Browse…")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.browse_transfer_dest(cx);
+                                                    })),
+                                            )
+                                        }),
+                                ),
+                        )
+                        .when(show_skip, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_1))
+                                    .child(section_label("Skip folders"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .gap(px(theme::SPACE_2))
+                                            .child(skip_left)
+                                            .child(skip_right),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("xfer-advanced-toggle")
+                                .flex()
+                                .items_center()
+                                .gap(px(theme::SPACE_1))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme::HOVER))
-                                .child("Cancel")
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_prompt(cx))),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child(if advanced_open { "▾" } else { "▸" }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::TEXT_MUTED)
+                                        .child("Advanced filters"),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(FilesPrompt::TransferSettings(form)) =
+                                        this.prompt.as_mut()
+                                    {
+                                        form.advanced_open = !form.advanced_open;
+                                        if !form.advanced_open
+                                            && form.focus != TransferField::Dest
+                                        {
+                                            form.focus = TransferField::Dest;
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .when(advanced_open, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(theme::SPACE_2))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(theme::SPACE_1))
+                                            .child(section_label("Include"))
+                                            .child(
+                                                field_box(focus == TransferField::Include)
+                                                    .id("xfer-include")
+                                                    .relative()
+                                                    .child(include_el)
+                                                    .when(include_empty, |box_| {
+                                                        box_.child(
+                                                            div()
+                                                                .absolute()
+                                                                .inset_0()
+                                                                .px(px(theme::SPACE_2))
+                                                                .py(px(theme::SPACE_1))
+                                                                .text_sm()
+                                                                .text_color(theme::TEXT_DISABLED)
+                                                                .child("*.rs, src/**  (empty = all)"),
+                                                        )
+                                                    })
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            if let Some(
+                                                                FilesPrompt::TransferSettings(
+                                                                    form,
+                                                                ),
+                                                            ) = this.prompt.as_mut()
+                                                            {
+                                                                form.focus =
+                                                                    TransferField::Include;
+                                                            }
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(theme::SPACE_1))
+                                            .child(section_label("Extra exclude"))
+                                            .child(
+                                                field_box(focus == TransferField::ExcludeExtra)
+                                                    .id("xfer-exclude")
+                                                    .relative()
+                                                    .child(exclude_el)
+                                                    .when(exclude_empty, |box_| {
+                                                        box_.child(
+                                                            div()
+                                                                .absolute()
+                                                                .inset_0()
+                                                                .px(px(theme::SPACE_2))
+                                                                .py(px(theme::SPACE_1))
+                                                                .text_sm()
+                                                                .text_color(theme::TEXT_DISABLED)
+                                                                .child("*.tmp, logs/**"),
+                                                        )
+                                                    })
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(|this, _, _, cx| {
+                                                            if let Some(
+                                                                FilesPrompt::TransferSettings(
+                                                                    form,
+                                                                ),
+                                                            ) = this.prompt.as_mut()
+                                                            {
+                                                                form.focus =
+                                                                    TransferField::ExcludeExtra;
+                                                            }
+                                                            cx.notify();
+                                                        }),
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .gap(px(theme::SPACE_2))
+                                .pt(px(theme::SPACE_1))
+                                .child(
+                                    div()
+                                        .id("ctx-prompt-cancel")
+                                        .h(px(30.0))
+                                        .px(px(theme::SPACE_3))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .flex()
+                                        .items_center()
+                                        .text_sm()
+                                        .text_color(theme::TEXT_MUTED)
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::HOVER).text_color(theme::TEXT))
+                                        .child("Cancel")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cancel_prompt(cx)
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("ctx-prompt-ok")
+                                        .h(px(30.0))
+                                        .px(px(theme::SPACE_3))
+                                        .rounded(px(theme::RADIUS_SM))
+                                        .flex()
+                                        .items_center()
+                                        .bg(theme::ACCENT)
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(0xffffff))
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(theme::ACCENT.opacity(0.85)))
+                                        .child(action)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.submit_prompt(cx)
+                                        })),
+                                ),
                         ),
                 )
                 .into_any_element(),
@@ -8005,6 +8227,7 @@ impl Render for ContextPanel {
         let entry_menu = self.render_entry_menu(cx);
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -8137,6 +8360,7 @@ impl Render for ContextPanel {
             )
             .when_some(transfer_menu, |d, menu| d.child(menu))
             .when_some(entry_menu, |d, menu| d.child(menu))
+            .when_some(self.render_transfer_settings(cx), |d, overlay| d.child(overlay))
     }
 }
 
