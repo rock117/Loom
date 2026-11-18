@@ -2463,7 +2463,7 @@ impl TabManager {
         (tabs, active)
     }
 
-    /// Ctrl+T / +: ephemeral Local session (not in sidebar).
+    /// Ctrl+N / Ctrl+T / +: ephemeral Local session (not in sidebar).
     pub fn open_ephemeral_local(
         &mut self,
         store: &Entity<WorkspaceStore>,

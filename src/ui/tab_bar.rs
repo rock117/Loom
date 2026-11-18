@@ -803,7 +803,7 @@ impl Render for TabBar {
                     .text_color(theme::TEXT_MUTED)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme::HOVER))
-                    .tooltip(|_, cx| Tooltip::with_key("New Tab", "Ctrl+T", cx))
+                    .tooltip(|_, cx| Tooltip::with_key("New Tab", "Ctrl+N", cx))
                     .child(Self::svg_icon("icons/ui/plus.svg", ICON, theme::TEXT_MUTED))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.rename.is_some() {

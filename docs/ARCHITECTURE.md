@@ -121,7 +121,8 @@ Keep OS-specific `#cfg` inside `platform/*`. UI and terminal grid code should no
 - In-house terminal (`terminal/gpui_emu`) paints via GPUI `text_system`; always handle `Event::PtyWrite`.
 - Cell paint must honor **`Flags::INVERSE`** and native cursor **`SHOW_CURSOR` / Hidden** (TUI self-drawn carets); see [TERMINAL_INVERSE_CURSOR.md](./TERMINAL_INVERSE_CURSOR.md).
 - Multi-tab: each tab owns a session; closing a tab must not block the UI thread (careful kill / drop order for ConPTY on Windows).
-- App shortcuts (`Ctrl+T` / `Ctrl+W` / `Ctrl+Q`, …) must not steal shell chords such as `Ctrl+C`.
+- App shortcuts (`Ctrl+N` / `Ctrl+W` / `Ctrl+Q`, …) must not steal shell chords such as `Ctrl+C`.
+  Default map + Action model: [KEYMAP.md](./KEYMAP.md).
 
 ## Implementation phases
 

@@ -9,6 +9,8 @@ pub fn run() {
 
     app.run(|cx| {
         cx.bind_keys([
+            // New ephemeral Local tab (default shell). Ctrl+N is primary; Ctrl+T kept.
+            KeyBinding::new("ctrl-n", NewLocalTab, Some("Loom")),
             KeyBinding::new("ctrl-t", NewLocalTab, Some("Loom")),
             KeyBinding::new("ctrl-w", CloseTab, Some("Loom")),
             KeyBinding::new("ctrl-tab", NextTab, Some("Loom")),

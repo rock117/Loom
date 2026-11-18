@@ -80,7 +80,7 @@ PaneSession {
 2. **Group 可嵌套**（`children`）。
 3. **选中 Group 时 New\*** → 创建物挂到**该 Group**；选中根 / 根级 Profile → New\* 进**根**；选中 Group 内 Profile → New\* 进**父 Group**。
 4. **新建 / 侧栏 Duplicate Profile → 只改收藏，不自动打开** Session。
-5. **工作区再开为临时**：Ctrl+T、Tab/终端 Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。
+5. **工作区再开为临时**：Ctrl+N（或 Ctrl+T）、Tab/终端 Duplicate、Split → **Ephemeral**（不进侧栏）。文案均叫 **Duplicate**，靠 context 区分。快捷键总表见 [KEYMAP.md](./KEYMAP.md)。
 6. **点侧栏 Profile → Bound Session**（可持久恢复）。
    - **反向同步：** 当前 focused pane 变化时，侧栏高亮对应 Profile（Bound 用 `profile_id`；Ephemeral Split/Duplicate 用 `auth_profile_id`）。无对应 Profile 时清空高亮；嵌套 Group 会自动展开。
 7. **Tab 右键 Save / Save As…**（文件隐喻）：
@@ -104,7 +104,7 @@ PaneSession {
 | 侧栏 Duplicate | **是**（复制配置） | 否 | 否 | — |
 | Tab / 终端 / Ctrl+Shift+D Duplicate | 否 | **是** | 是（1） | Ephemeral（SSH 带 `auth_profile_id`） |
 | Split | 否 | 否 | **是** | Ephemeral（SSH 带 `auth_profile_id`） |
-| Ctrl+T | 否 | **是** | 是（1） | Ephemeral Local |
+| Ctrl+N / Ctrl+T | 否 | **是** | 是（1） | Ephemeral Local |
 | Save（Bound） | 否（单 Pane 写公共 cwd；多 Pane 写 layout） | 否 | 否 | — |
 | Save As… | **是**（弹框确认） | 否 | 否 | 绑定当前会话到新 Profile |
 
@@ -113,7 +113,7 @@ PaneSession {
 | 来源 | `profile_id` | `auth_profile_id` | `session_password` | 重启 |
 |------|--------------|-------------------|-------------------|------|
 | 侧栏打开 | `Some` | `None` | 认证成功后写入 | 可恢复（密码不恢复） |
-| Ctrl+T | `None` | `None` | — | 否 |
+| Ctrl+N / Ctrl+T | `None` | `None` | — | 否 |
 | Duplicate Tab / Split | `None` | 继承 credentials | 从源 clone | 否 |
 | Save As… | 变为 `Some` | 清掉 | 保留（仍仅内存） | 之后可恢复 |
 

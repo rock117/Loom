@@ -157,7 +157,7 @@ fn empty_state() -> Div {
             div()
                 .text_sm()
                 .text_color(theme::TEXT_MUTED)
-                .child("Open a profile from the left, or press Ctrl+T"),
+                .child("Open a profile from the left, or press Ctrl+N"),
         )
 }
 
