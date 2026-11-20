@@ -98,7 +98,8 @@ Transfers footer stays empty unless an SSH pane is focused. Use Reveal / Copy Pa
 
 ### Docker sessions（本机 + SSH 宿主）
 
-入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。本机：`docker_fs`；经 SSH：`docker_ssh`（列举 + 远端 `docker cp` 再 SFTP）。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。
+入口：Docker 图标 → **本地 | SSH Profile** → 容器列表（不做侧栏 Docker 树）。本机：`docker_fs`；经 SSH：`docker_ssh`（列举 + 远端 `docker cp` 再 SFTP）。规格：[DOCKER_SESSION.md](./DOCKER_SESSION.md)。  
+Profile 优先存**容器名**；打开 / Reconnect 前后台 `docker ps` 解析（名 → ID → 短 ID），同名重建可再连。
 
 ## Info
 

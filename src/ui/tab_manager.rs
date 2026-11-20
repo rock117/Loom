@@ -753,21 +753,6 @@ impl TabManager {
             return;
         };
 
-        let remote_command = docker_container
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-            .map(crate::session::docker::exec_remote_command);
-
-        let params = SshConnectParams {
-            host: host.clone(),
-            port: *port,
-            user: user.clone(),
-            auth,
-            cols: 80,
-            rows: 24,
-            remote_command,
-            jump,
-        };
         let family = if font_family.trim().is_empty() {
             platform::monospace_font_family().to_string()
         } else {
@@ -779,12 +764,46 @@ impl TabManager {
         let label = format!("{user}@{host}:{port}");
         let is_docker = kind.is_docker_ssh();
         let cd_after = initial_cwd.filter(|s| !s.trim().is_empty());
+        let docker_query = docker_container
+            .clone()
+            .filter(|id| !id.trim().is_empty());
+        let host_s = host.clone();
+        let port_n = *port;
+        let user_s = user.clone();
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
             .name("loom-ssh-connect".into())
             .spawn(move || {
-                let result = ssh::connect_blocking(params);
+                let result = (|| -> anyhow::Result<(ssh::SshSessionHandles, Option<String>)> {
+                    let mut docker_ref = None;
+                    let remote_command = if let Some(ref query) = docker_query {
+                        // Resolve name/id against live `docker ps` before exec.
+                        let resolved = crate::session::docker::resolve_ssh_running(
+                            query,
+                            &host_s,
+                            port_n,
+                            &user_s,
+                            auth.clone(),
+                        )?;
+                        docker_ref = Some(resolved.exec_ref.clone());
+                        Some(crate::session::docker::exec_remote_command(&resolved.exec_ref))
+                    } else {
+                        None
+                    };
+                    let params = SshConnectParams {
+                        host: host_s,
+                        port: port_n,
+                        user: user_s,
+                        auth,
+                        cols: 80,
+                        rows: 24,
+                        remote_command,
+                        jump,
+                    };
+                    let handles = ssh::connect_blocking(params)?;
+                    Ok((handles, docker_ref))
+                })();
                 let _ = tx.send(result);
             });
 
@@ -798,7 +817,15 @@ impl TabManager {
                     return;
                 };
                 match result {
-                    Ok(Ok(handles)) => {
+                    Ok(Ok((handles, docker_ref))) => {
+                        if let Some(ref_) = docker_ref {
+                            if let ProfileKind::Ssh {
+                                docker_container, ..
+                            } = &mut pane.kind
+                            {
+                                *docker_container = Some(ref_);
+                            }
+                        }
                         let config = terminal_config(font_size, &family, show_line_numbers, ansi_palette);
                         let resize = handles.resize.clone();
                         let terminal = cx.new(|cx| {
@@ -1053,23 +1080,34 @@ impl TabManager {
         let cwd_for_ui = spawn_cwd.clone();
         let is_docker = kind.is_docker_local();
         let cd_after = post_cd.filter(|s| !s.trim().is_empty());
+        let store_for_persist = store.clone();
 
         let (tx, rx) = flume::bounded(1);
         let _ = thread::Builder::new()
             .name("loom-local-spawn".into())
             .spawn(move || {
-                let result = (|| -> anyhow::Result<LocalPty> {
-                    let (shell_path, spawn_args, _) =
+                let result = (|| -> anyhow::Result<(LocalPty, Option<String>)> {
+                    let (shell_path, mut spawn_args, _) =
                         resolve_local_spawn(shell.as_deref(), &args, default_shell.as_deref())?;
-                    wsl::preflight_local_spawn(&shell_path, &spawn_args)?;
-                    LocalPty::spawn(
+                    let docker_ref = if crate::session::docker::is_docker_executable(&shell_path) {
+                        crate::session::docker::prepare_local_docker_exec(
+                            &shell_path,
+                            &mut spawn_args,
+                        )?
+                        .map(|r| r.exec_ref)
+                    } else {
+                        wsl::preflight_local_spawn(&shell_path, &spawn_args)?;
+                        None
+                    };
+                    let pty = LocalPty::spawn(
                         &shell_path,
                         &spawn_args,
                         spawn_cwd.as_deref(),
                         proxy_mode,
                         proxy_url.as_deref(),
                         proxy_no.as_deref(),
-                    )
+                    )?;
+                    Ok((pty, docker_ref))
                 })();
                 let _ = tx.send(result);
             });
@@ -1084,7 +1122,15 @@ impl TabManager {
                     return;
                 };
                 match result {
-                    Ok(Ok(pty)) => {
+                    Ok(Ok((pty, docker_ref))) => {
+                        if let Some(ref_) = docker_ref {
+                            if let ProfileKind::Local { args, .. } = &mut pane.kind {
+                                crate::session::docker::set_exec_container_ref(args, &ref_);
+                            }
+                            if let Some(pid) = pane.profile_id {
+                                persist_bound_docker_ref(&store_for_persist, pid, &ref_, cx);
+                            }
+                        }
                         let family = if font_family.trim().is_empty() {
                             platform::monospace_font_family().to_string()
                         } else {
@@ -1944,10 +1990,9 @@ impl TabManager {
             pane.status_message = "checking container…".into();
             // Keep last terminal output until we know whether to re-exec.
             cx.spawn(async move |this, cx| {
-                let running = cx
+                let resolved = cx
                     .background_spawn(async move {
-                        crate::session::docker::container_is_running(&container_id)
-                            .unwrap_or(false)
+                        crate::session::docker::resolve_local_running(&container_id).ok()
                     })
                     .await;
                 this.update(cx, |this, cx| {
@@ -1961,7 +2006,13 @@ impl TabManager {
                     if !matches!(pane.state, ConnectionState::Connecting) {
                         return;
                     }
-                    if running {
+                    if let Some(resolved) = resolved {
+                        if let ProfileKind::Local { args, .. } = &mut pane.kind {
+                            crate::session::docker::set_exec_container_ref(
+                                args,
+                                &resolved.exec_ref,
+                            );
+                        }
                         drop(pane.terminal.take());
                         pane.status_message = "reconnecting Docker…".into();
                         AppBus::emit(
@@ -3108,4 +3159,35 @@ fn collect_auto_forwards(
             enabled: true,
         })
         .collect()
+}
+
+/// Rewrite a Bound Docker profile to the stable exec ref (usually container name).
+fn persist_bound_docker_ref(
+    store: &Entity<WorkspaceStore>,
+    profile_id: Uuid,
+    exec_ref: &str,
+    cx: &mut Context<TabManager>,
+) {
+    store.update(cx, |s, _| {
+        let Some(p) = s.workspace.find_profile_mut(profile_id) else {
+            return;
+        };
+        match &mut p.kind {
+            ProfileKind::Local { shell, args, .. } => {
+                let prog = shell.as_deref().unwrap_or_else(|| {
+                    crate::session::docker::docker_program()
+                });
+                if crate::session::docker::is_docker_executable(prog) {
+                    crate::session::docker::set_exec_container_ref(args, exec_ref);
+                    s.mark_dirty();
+                }
+            }
+            ProfileKind::Ssh {
+                docker_container, ..
+            } => {
+                *docker_container = Some(exec_ref.to_string());
+                s.mark_dirty();
+            }
+        }
+    });
 }

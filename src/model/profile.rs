@@ -192,8 +192,13 @@ impl ProfileKind {
             } => {
                 let base = if let Some(id) = docker_container.as_deref() {
                     let id = id.trim();
-                    let short = if id.len() > 12 { &id[..12] } else { id };
-                    format!("docker · {short} @ {user}@{host}:{port}")
+                    // Name stays readable; hex ids still shorten.
+                    let label = if id.len() > 12 && id.chars().all(|c| c.is_ascii_hexdigit()) {
+                        &id[..12]
+                    } else {
+                        id
+                    };
+                    format!("docker · {label} @ {user}@{host}:{port}")
                 } else {
                     format!("{user}@{host}:{port}")
                 };

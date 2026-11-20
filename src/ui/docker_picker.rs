@@ -370,8 +370,10 @@ impl DockerPicker {
             return;
         }
 
+        // Prefer container **name** so recreate-with-same-name still reconnects.
+        let container_ref = row.exec_ref().to_string();
         let profile = match self.mode {
-            HostMode::Local => docker::new_profile(name, &row.id),
+            HostMode::Local => docker::new_profile(name, &container_ref),
             HostMode::Ssh => {
                 let Some(host_id) = self.selected_ssh else {
                     self.error = Some("Select an SSH profile".into());
@@ -401,7 +403,7 @@ impl DockerPicker {
                     cx.notify();
                     return;
                 };
-                docker::new_ssh_docker_profile(name, host, port, user, auth, &row.id)
+                docker::new_ssh_docker_profile(name, host, port, user, auth, &container_ref)
             }
         };
 

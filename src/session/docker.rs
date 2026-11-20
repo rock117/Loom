@@ -37,6 +37,26 @@ impl ContainerInfo {
             name.to_string()
         }
     }
+
+    /// Prefer **name** for `docker exec` / profile storage so recreate-with-same-name
+    /// still connects; fall back to full id when unnamed.
+    pub fn exec_ref(&self) -> &str {
+        let name = self.name.trim();
+        if name.is_empty() {
+            self.id.trim()
+        } else {
+            name
+        }
+    }
+}
+
+/// Result of matching a stored ref against a live `docker ps` list.
+#[derive(Debug, Clone)]
+pub struct ResolvedContainer {
+    /// Value to pass to `docker exec` / store in the profile (name if any).
+    pub exec_ref: String,
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,13 +224,90 @@ pub fn list_running_containers_ssh(
     parse_ps_json_lines(&stdout)
 }
 
-/// Before spawning a Local profile that is `docker exec …`.
-pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
-    if args.is_empty() || !is_docker_executable(shell) {
-        return Ok(());
+/// Match `query` (name, full id, or short id) against a `docker ps` list.
+pub fn resolve_running_ref(query: &str, list: &[ContainerInfo]) -> Option<ResolvedContainer> {
+    let q = query.trim();
+    if q.is_empty() {
+        return None;
     }
-    let Some(id) = container_id_from_args(args) else {
-        return Ok(());
+    let row = list
+        .iter()
+        .find(|c| !c.name.is_empty() && c.name == q)
+        .or_else(|| list.iter().find(|c| c.id == q))
+        .or_else(|| {
+            list.iter().find(|c| {
+                let short = c.short_id();
+                c.id.starts_with(q) || q == short || (q.len() >= 12 && short.starts_with(q))
+            })
+        })?;
+    Some(ResolvedContainer {
+        exec_ref: row.exec_ref().to_string(),
+        id: row.id.clone(),
+        name: row.name.clone(),
+    })
+}
+
+/// Local: `docker ps` then resolve name → id (background thread only).
+pub fn resolve_local_running(query: &str) -> Result<ResolvedContainer> {
+    let list = list_running_containers()?;
+    resolve_running_ref(query, &list).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Container `{query}` is not running (or was recreated with a new id). Re-pick it from Docker."
+        )
+    })
+}
+
+/// Remote: `docker ps` over SSH then resolve (background thread only).
+pub fn resolve_ssh_running(
+    query: &str,
+    host: &str,
+    port: u16,
+    user: &str,
+    auth: SshAuthMaterial,
+) -> Result<ResolvedContainer> {
+    let list = list_running_containers_ssh(host, port, user, auth)?;
+    resolve_running_ref(query, &list).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Container `{query}` is not running on the SSH host (or was recreated). Re-pick it from Docker."
+        )
+    })
+}
+
+/// Rewrite `docker exec -it <ref> …` argv slot to `new_ref`.
+pub fn set_exec_container_ref(args: &mut [String], new_ref: &str) -> bool {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "exec" {
+            i += 1;
+            while i < args.len() && args[i].starts_with('-') {
+                if matches!(
+                    args[i].as_str(),
+                    "-e" | "-u" | "-w" | "--env" | "--user" | "--workdir"
+                ) {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if let Some(slot) = args.get_mut(i) {
+                *slot = new_ref.to_string();
+                return true;
+            }
+            return false;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Ensure Docker engine is up; resolve container by name/id and rewrite `args`.
+/// Call only from a background thread.
+pub fn prepare_local_docker_exec(shell: &str, args: &mut Vec<String>) -> Result<Option<ResolvedContainer>> {
+    if args.is_empty() || !is_docker_executable(shell) {
+        return Ok(None);
+    }
+    let Some(query) = container_id_from_args(args).map(str::to_string) else {
+        return Ok(None);
     };
 
     // Engine reachable?
@@ -233,14 +330,23 @@ pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
         }
     }
 
-    // Container still present / running?
-    if !container_is_running(id)? {
-        bail!("Container `{id}` is not running.");
+    let resolved = resolve_local_running(&query)?;
+    set_exec_container_ref(args, &resolved.exec_ref);
+    Ok(Some(resolved))
+}
+
+/// Before spawning a Local profile that is `docker exec …`.
+pub fn preflight_local_spawn(shell: &str, args: &[String]) -> Result<()> {
+    if args.is_empty() || !is_docker_executable(shell) {
+        return Ok(());
     }
+    let mut owned = args.to_vec();
+    prepare_local_docker_exec(shell, &mut owned)?;
     Ok(())
 }
 
 /// Fast `docker inspect` running check (background thread only — not UI).
+#[allow(dead_code)]
 pub fn container_is_running(container_id: &str) -> Result<bool> {
     let id = container_id.trim();
     if id.is_empty() {
@@ -793,5 +899,38 @@ mod tests {
         assert!((cpu - 1.23).abs() < 0.01);
         assert!(used > 40 * 1024 * 1024);
         assert!(total > 7 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn resolve_prefers_name_over_stale_id() {
+        let list = vec![ContainerInfo {
+            id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            name: "web".into(),
+            image: "nginx".into(),
+            status: "Up".into(),
+        }];
+        let by_name = resolve_running_ref("web", &list).unwrap();
+        assert_eq!(by_name.exec_ref, "web");
+        let by_old_id = resolve_running_ref(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &list,
+        );
+        assert!(by_old_id.is_none());
+        let by_short = resolve_running_ref("aaaaaaaaaaaa", &list).unwrap();
+        assert_eq!(by_short.exec_ref, "web");
+    }
+
+    #[test]
+    fn set_exec_ref_rewrites_argv() {
+        let mut args = vec![
+            "exec".into(),
+            "-it".into(),
+            "oldid".into(),
+            "sh".into(),
+            "-c".into(),
+            "exec bash".into(),
+        ];
+        assert!(set_exec_container_ref(&mut args, "web"));
+        assert_eq!(args[2], "web");
     }
 }
