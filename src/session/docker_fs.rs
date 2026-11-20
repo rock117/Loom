@@ -310,7 +310,7 @@ pub fn chmod(container: &str, path: &str, mode: u32) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort Info tab snapshot (container summary + ports / volumes).
+/// Best-effort Info tab snapshot (container summary + ports / volumes + stats).
 pub fn container_snapshot(container: &str) -> Result<crate::session::host_info::HostSnapshot> {
     let output = docker_cmd()
         .args(["inspect", "--format", "{{json .}}", container])
@@ -321,7 +321,24 @@ pub fn container_snapshot(container: &str) -> Result<crate::session::host_info::
         bail!("{}", err.trim());
     }
     let json = String::from_utf8_lossy(&output.stdout);
-    super::docker::host_snapshot_from_inspect(&json, container, false)
+    let mut snap = super::docker::host_snapshot_from_inspect(&json, container, false)?;
+    // One-shot sample; ignore failures (older engines / permissions).
+    if let Ok(stats) = docker_cmd()
+        .args([
+            "stats",
+            "--no-stream",
+            "--format",
+            "{{.CPUPerc}}\t{{.MemUsage}}",
+            container,
+        ])
+        .output()
+    {
+        if stats.status.success() {
+            let line = String::from_utf8_lossy(&stats.stdout);
+            super::docker::apply_stats_sample(&mut snap, line.lines().next().unwrap_or(""));
+        }
+    }
+    Ok(snap)
 }
 
 fn docker_cp_spec(container: &str, container_path: &str) -> String {

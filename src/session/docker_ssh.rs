@@ -269,7 +269,19 @@ pub async fn container_snapshot(
         shell_single_quote(container.trim())
     );
     let json = remote_exec(session, &cmd).await?;
-    crate::session::docker::host_snapshot_from_inspect(&json, container, true)
+    let mut snap = crate::session::docker::host_snapshot_from_inspect(&json, container, true)?;
+    let stats_cmd = format!(
+        "docker stats --no-stream --format {} {}",
+        shell_single_quote("{{.CPUPerc}}\t{{.MemUsage}}"),
+        shell_single_quote(container.trim())
+    );
+    if let Ok(out) = remote_exec(session, &stats_cmd).await {
+        crate::session::docker::apply_stats_sample(
+            &mut snap,
+            out.lines().next().unwrap_or(""),
+        );
+    }
+    Ok(snap)
 }
 
 pub async fn mktemp_dir(session: &client::Handle<ClientHandler>) -> Result<String> {

@@ -135,6 +135,10 @@ struct EntryMenu {
     position: Point<Pixels>,
 }
 
+struct PathBarMenu {
+    position: Point<Pixels>,
+}
+
 enum FilesPrompt {
     NewFolder {
         edit: RenameEdit,
@@ -229,6 +233,9 @@ pub struct ContextPanel {
     bound_transfer_scope: Option<String>,
     transfer_menu: Option<TransferMenu>,
     entry_menu: Option<EntryMenu>,
+    path_bar_menu: Option<PathBarMenu>,
+    /// Docker Info: Env / Command / Workdir / User (collapsed by default).
+    info_docker_details_open: bool,
     prompt: Option<FilesPrompt>,
     /// Last local download destination directory.
     last_download_dir: Option<String>,
@@ -312,6 +319,8 @@ impl ContextPanel {
             bound_transfer_scope: None,
             transfer_menu: None,
             entry_menu: None,
+            path_bar_menu: None,
+            info_docker_details_open: false,
             prompt: None,
             last_download_dir: None,
             path_edit: RenameEdit::new(""),
@@ -2825,6 +2834,7 @@ impl ContextPanel {
         self.editing_path = true;
         self.entry_menu = None;
         self.transfer_menu = None;
+        self.path_bar_menu = None;
         if self.path_edit.text.is_empty() {
             if let Some(cwd) = self.cwd.clone() {
                 self.path_edit = RenameEdit::new(cwd);
@@ -2833,6 +2843,98 @@ impl ContextPanel {
         self.path_edit.select_all();
         self.start_prompt_caret_blink(cx);
         self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    /// Right-click: enter edit (no select-all) and show Cut/Copy/Paste menu.
+    fn open_path_bar_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.cwd.is_none() && self.path_edit.text.is_empty() {
+            return;
+        }
+        self.editing_search = false;
+        self.entry_menu = None;
+        self.transfer_menu = None;
+        if !self.editing_path {
+            self.editing_path = true;
+            if self.path_edit.text.is_empty() {
+                if let Some(cwd) = self.cwd.clone() {
+                    self.path_edit = RenameEdit::new(cwd);
+                }
+            }
+            self.path_edit.caret_visible = true;
+            self.start_prompt_caret_blink(cx);
+            self.focus_handle.focus(window);
+        }
+        self.path_bar_menu = Some(PathBarMenu { position });
+        cx.notify();
+    }
+
+    fn path_clipboard_text(&self) -> String {
+        if self.path_edit.has_selection() {
+            self.path_edit.selected_text()
+        } else {
+            self.path_edit.text.clone()
+        }
+    }
+
+    fn path_bar_cut(&mut self, cx: &mut Context<Self>) {
+        let text = self.path_clipboard_text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if self.path_edit.has_selection() {
+            self.path_edit.delete_selection();
+        } else {
+            self.path_edit.text.clear();
+            self.path_edit.cursor = 0;
+            self.path_edit.anchor = 0;
+        }
+        self.path_bar_menu = None;
+        cx.notify();
+    }
+
+    fn path_bar_copy(&mut self, cx: &mut Context<Self>) {
+        let text = self.path_clipboard_text();
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        self.path_bar_menu = None;
+        cx.notify();
+    }
+
+    fn path_bar_paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            let cleaned = text.replace('\r', "").replace('\n', "");
+            if !cleaned.is_empty() {
+                self.path_edit.insert(&cleaned);
+            }
+        }
+        self.path_bar_menu = None;
+        cx.notify();
+    }
+
+    fn path_bar_select_all(&mut self, cx: &mut Context<Self>) {
+        self.path_edit.select_all();
+        self.path_bar_menu = None;
+        cx.notify();
+    }
+
+    fn path_bar_copy_cwd(&mut self, cx: &mut Context<Self>) {
+        let text = self
+            .cwd
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.path_edit.text.clone());
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            cx.emit(ContextPanelEvent::Toast("Copied".into()));
+        }
+        self.path_bar_menu = None;
         cx.notify();
     }
 
@@ -4811,6 +4913,13 @@ impl ContextPanel {
                             this.begin_path_edit(window, cx);
                             cx.stop_propagation();
                         }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.open_path_bar_menu(event.position, window, cx);
+                            cx.stop_propagation();
+                        }),
                     ),
             )
             .when_some(self.render_prompt_bar(cx), |d, bar| d.child(bar))
@@ -6137,6 +6246,83 @@ impl ContextPanel {
         )
     }
 
+    fn render_path_bar_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.path_bar_menu.as_ref()?;
+        let position = menu.position;
+        let has_text = !self.path_edit.text.is_empty();
+        let can_paste = cx
+            .read_from_clipboard()
+            .and_then(|i| i.text())
+            .is_some_and(|t| !t.replace('\r', "").replace('\n', "").is_empty());
+        let can_copy_cwd = self
+            .cwd
+            .as_ref()
+            .is_some_and(|s| !s.is_empty())
+            || has_text;
+
+        Some(
+            deferred(
+                anchored()
+                    .position(position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(Edges {
+                        top: px(4.0),
+                        right: px(4.0),
+                        bottom: px(4.0),
+                        left: px(4.0),
+                    })
+                    .child(
+                        div()
+                            .min_w(px(140.0))
+                            .p(px(theme::SPACE_1))
+                            .rounded(px(theme::RADIUS))
+                            .bg(theme::ELEVATED)
+                            .border_1()
+                            .border_color(theme::BORDER)
+                            .shadow_md()
+                            .occlude()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .child(self.transfer_menu_item(
+                                "path-ctx-cut",
+                                "Cut",
+                                has_text,
+                                cx,
+                                |this, _, cx| this.path_bar_cut(cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "path-ctx-copy",
+                                "Copy",
+                                has_text,
+                                cx,
+                                |this, _, cx| this.path_bar_copy(cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "path-ctx-paste",
+                                "Paste",
+                                can_paste,
+                                cx,
+                                |this, _, cx| this.path_bar_paste(cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "path-ctx-select-all",
+                                "Select All",
+                                has_text,
+                                cx,
+                                |this, _, cx| this.path_bar_select_all(cx),
+                            ))
+                            .child(self.transfer_menu_item(
+                                "path-ctx-copy-path",
+                                "Copy path",
+                                can_copy_cwd,
+                                cx,
+                                |this, _, cx| this.path_bar_copy_cwd(cx),
+                            )),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
     fn render_entry_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.entry_menu.as_ref()?;
         let path = menu.path.clone();
@@ -6279,6 +6465,7 @@ impl ContextPanel {
                 on_click(this, window, cx);
                 this.transfer_menu = None;
                 this.entry_menu = None;
+                this.path_bar_menu = None;
                 cx.notify();
             }))
     }
@@ -6735,18 +6922,88 @@ impl ContextPanel {
                         _ => format!("Up {}", host_info::format_uptime(s.uptime_secs)),
                     }
                 };
-                let show_resources = !is_docker
+                let show_host_resources = !is_docker
                     && (s.mem_total > 0 || !s.disks.is_empty() || !s.gpus.is_empty());
+                let show_docker_resources =
+                    is_docker && (s.mem_total > 0 || s.cpu_usage_pct.is_some());
                 let docker_ports = s.docker_ports.clone();
                 let docker_volumes = s.docker_volumes.clone();
+                let docker_networks = s.docker_networks.clone();
+                let docker_env = s.docker_env.clone();
+                let docker_command = s.docker_command.clone();
+                let docker_workdir = s.docker_workdir.clone();
+                let docker_user = s.docker_user.clone();
+                let docker_status = s.docker_status.clone();
+                let docker_restart = s.docker_restart_count;
+                let docker_details_open = self.info_docker_details_open;
+                let docker_has_details = !docker_env.is_empty()
+                    || !docker_command.is_empty()
+                    || !docker_workdir.is_empty()
+                    || !docker_user.is_empty();
                 let mem_used = s.mem_used;
                 let mem_total = s.mem_total;
                 let mem_ratio = s.mem_ratio();
+                let cpu_usage_pct = s.cpu_usage_pct;
                 let hostname = s.hostname.clone();
                 let listening = s.listening;
                 let disks = s.disks;
                 let gpus = s.gpus;
                 let footer_for_resources = footer.clone();
+                let status_line = if is_docker {
+                    let mut parts = Vec::new();
+                    if !docker_status.is_empty() {
+                        parts.push(docker_status.clone());
+                    }
+                    if s.uptime_secs > 0 {
+                        parts.push(format!("up {}", host_info::format_uptime(s.uptime_secs)));
+                    }
+                    if docker_restart > 0 {
+                        parts.push(format!("restarts {docker_restart}"));
+                    }
+                    if parts.is_empty() {
+                        os_line.clone()
+                    } else {
+                        parts.join(" · ")
+                    }
+                } else {
+                    os_line.clone()
+                };
+
+                // Build network / env copy cells outside map+cx closures (GPUI IntoElement borrow).
+                let mut network_block = div().flex().flex_col().gap(px(2.0));
+                let has_networks = !docker_networks.is_empty();
+                for (i, n) in docker_networks.into_iter().enumerate() {
+                    let label = if n.ip.is_empty() {
+                        n.name.clone()
+                    } else if n.name.is_empty() {
+                        n.ip.clone()
+                    } else {
+                        format!("{} · {}", n.name, n.ip)
+                    };
+                    network_block = network_block.child(Self::info_copy_cell(
+                        cx,
+                        SharedString::from(format!("ctx-docker-net-{i}")),
+                        label,
+                        true,
+                        false,
+                    ));
+                }
+                let mut env_block = div().flex().flex_col().gap(px(2.0)).child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::TEXT_DISABLED)
+                        .child("Env"),
+                );
+                let has_env = !docker_env.is_empty();
+                for (i, line) in docker_env.into_iter().enumerate() {
+                    env_block = env_block.child(Self::info_copy_cell(
+                        cx,
+                        SharedString::from(format!("ctx-docker-env-{i}")),
+                        line,
+                        true,
+                        false,
+                    ));
+                }
 
                 d.child(
                     // Identity: hostname as title, OS/CPU as muted lines.
@@ -6767,7 +7024,7 @@ impl ContextPanel {
                                 .text_xs()
                                 .text_color(theme::TEXT_MUTED)
                                 .overflow_hidden()
-                                .child(os_line),
+                                .child(status_line),
                         )
                         .child(
                             div()
@@ -6775,9 +7032,58 @@ impl ContextPanel {
                                 .text_color(theme::TEXT_MUTED)
                                 .overflow_hidden()
                                 .child(cpu_line),
-                        ),
+                        )
+                        .when(is_docker && has_networks, |d| d.child(network_block)),
                 )
-                .when(show_resources, |d| {
+                .when(show_docker_resources, |d| {
+                    d.child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .pt(px(theme::SPACE_2))
+                            .border_t_1()
+                            .border_color(theme::BORDER_SUBTLE)
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_2))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::TEXT_MUTED)
+                                    .child("Resources"),
+                            )
+                            .when_some(cpu_usage_pct, |d, pct| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::TEXT_MUTED)
+                                                .child("CPU"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(theme::TEXT)
+                                                .child(format!("{pct:.1}%")),
+                                        ),
+                                )
+                            })
+                            .when(mem_total > 0, |d| {
+                                d.child(resource_meter(
+                                    "Memory".into(),
+                                    mem_used,
+                                    mem_total,
+                                    mem_ratio,
+                                ))
+                            }),
+                    )
+                })
+                .when(show_host_resources, |d| {
                     d.child(
                     div()
                         .mt(px(theme::SPACE_1))
@@ -7132,6 +7438,110 @@ impl ContextPanel {
                                         true,
                                     ))
                             })),
+                    )
+                })
+                .when(is_docker && docker_has_details, |d| {
+                    d.child(
+                        div()
+                            .mt(px(theme::SPACE_1))
+                            .pt(px(theme::SPACE_2))
+                            .border_t_1()
+                            .border_color(theme::BORDER_SUBTLE)
+                            .flex()
+                            .flex_col()
+                            .gap(px(theme::SPACE_1))
+                            .child(
+                                div()
+                                    .id("ctx-docker-details-toggle")
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(theme::SPACE_1))
+                                    .cursor_pointer()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(theme::TEXT_MUTED)
+                                            .child(if docker_details_open { "▾" } else { "▸" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme::TEXT_MUTED)
+                                            .child("Details"),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.info_docker_details_open =
+                                            !this.info_docker_details_open;
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(docker_details_open, |d| {
+                                d.when(!docker_user.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .gap(px(theme::SPACE_2))
+                                            .child(
+                                                div()
+                                                    .w(px(56.0))
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_DISABLED)
+                                                    .child("User"),
+                                            )
+                                            .child(Self::info_copy_cell(
+                                                cx,
+                                                "ctx-docker-user".into(),
+                                                docker_user,
+                                                false,
+                                                true,
+                                            )),
+                                    )
+                                })
+                                .when(!docker_workdir.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .gap(px(theme::SPACE_2))
+                                            .child(
+                                                div()
+                                                    .w(px(56.0))
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_DISABLED)
+                                                    .child("Workdir"),
+                                            )
+                                            .child(Self::info_copy_cell(
+                                                cx,
+                                                "ctx-docker-workdir".into(),
+                                                docker_workdir,
+                                                false,
+                                                true,
+                                            )),
+                                    )
+                                })
+                                .when(!docker_command.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(2.0))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme::TEXT_DISABLED)
+                                                    .child("Command"),
+                                            )
+                                            .child(Self::info_copy_cell(
+                                                cx,
+                                                "ctx-docker-cmd".into(),
+                                                docker_command,
+                                                false,
+                                                false,
+                                            )),
+                                    )
+                                })
+                                .when(has_env, |d| d.child(env_block))
+                            }),
                     )
                 })
                 .when(!listening.is_empty(), |d| {
@@ -8225,6 +8635,7 @@ impl Render for ContextPanel {
         self.sync_session(cx);
         let transfer_menu = self.render_transfer_menu(cx);
         let entry_menu = self.render_entry_menu(cx);
+        let path_bar_menu = self.render_path_bar_menu(cx);
 
         div()
             .relative()
@@ -8245,6 +8656,10 @@ impl Render for ContextPanel {
                     }
                     if this.entry_menu.is_some() {
                         this.entry_menu = None;
+                        changed = true;
+                    }
+                    if this.path_bar_menu.is_some() {
+                        this.path_bar_menu = None;
                         changed = true;
                     }
                     if changed {
@@ -8268,9 +8683,13 @@ impl Render for ContextPanel {
                 if event.keystroke.key.as_str() != "escape" {
                     return;
                 }
-                if this.transfer_menu.is_some() || this.entry_menu.is_some() {
+                if this.transfer_menu.is_some()
+                    || this.entry_menu.is_some()
+                    || this.path_bar_menu.is_some()
+                {
                     this.transfer_menu = None;
                     this.entry_menu = None;
+                    this.path_bar_menu = None;
                     cx.notify();
                     cx.stop_propagation();
                 }
@@ -8360,6 +8779,7 @@ impl Render for ContextPanel {
             )
             .when_some(transfer_menu, |d, menu| d.child(menu))
             .when_some(entry_menu, |d, menu| d.child(menu))
+            .when_some(path_bar_menu, |d, menu| d.child(menu))
             .when_some(self.render_transfer_settings(cx), |d, overlay| d.child(overlay))
     }
 }

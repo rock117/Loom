@@ -106,15 +106,18 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 
 | Block | Content |
 |-------|---------|
-| Identity | Hostname (or container hostname) as title; OS/kernel and CPU/image as muted lines |
-| Resources | Memory + up to 5 disks + up to 2 GPUs (hidden if undetected). Continuous bars; fill danger at ≥90%. **Hidden for Docker** |
-| Listening | Open ports + process names (up to 24). Common ports (22/80/443/DB/dev…) ranked first. **Hidden for Docker** |
+| Identity | Hostname (or container hostname) as title; Host: OS/kernel + CPU. **Docker:** status · uptime · restarts; image; network · IP |
+| Resources | Host: Memory + up to 5 disks + up to 2 GPUs. **Docker:** CPU % + Memory from one-shot `docker stats` (hidden if unavailable). Continuous bars; fill danger at ≥90% |
+| Listening | Open ports + process names (up to 24). Common ports ranked first. **Hidden for Docker** |
 | Ports / Volumes | **Docker only:** published `host → container` ports; mounts as a compact table (Type / Mode / Source / Destination) from `docker inspect` |
+| Details | **Docker only (collapsed):** User, Workdir, Command, Env from inspect |
 | Footer | Host: `Load … · Up …`. Docker: container name / short id |
 
 - **Local:** `sysinfo` disks/memory; GPU via `nvidia-smi` then Windows CIM / `lspci`; listening via PowerShell `Get-NetTCPConnection` (Windows) or `ss`/`netstat` (Unix) — all on a **background** thread
 - **SSH:** probe + `df`; GPU via `nvidia-smi` then `lspci`; listening via remote `ss`/`netstat` (best-effort) — never blocks the UI thread
-- **Docker** (local or over SSH): `docker inspect` → ports + mounts; see [DOCKER_SESSION.md](./DOCKER_SESSION.md)
+- **Docker** (local or over SSH): `docker inspect` + optional `docker stats --no-stream`; see [DOCKER_SESSION.md](./DOCKER_SESSION.md)
+
+Path bar: left-click edits; **right-click** → Cut / Copy / Paste / Select All / Copy path (keyboard Ctrl+A/C/X/V still work while editing).
 
 
 ## Non-goals (for now)

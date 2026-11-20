@@ -322,6 +322,8 @@ pub fn docker_engine_ok() -> Result<()> {
 
 const MAX_DOCKER_PORTS: usize = 32;
 const MAX_DOCKER_VOLUMES: usize = 24;
+const MAX_DOCKER_ENV: usize = 40;
+const MAX_DOCKER_NETWORKS: usize = 8;
 
 #[derive(Debug, Deserialize)]
 struct InspectJson {
@@ -345,12 +347,26 @@ struct InspectConfig {
     image: String,
     #[serde(rename = "Hostname", default)]
     hostname: String,
+    #[serde(rename = "Env", default)]
+    env: Vec<String>,
+    #[serde(rename = "Cmd", default)]
+    cmd: Option<serde_json::Value>,
+    #[serde(rename = "Entrypoint", default)]
+    entrypoint: Option<serde_json::Value>,
+    #[serde(rename = "WorkingDir", default)]
+    working_dir: String,
+    #[serde(rename = "User", default)]
+    user: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct InspectState {
     #[serde(rename = "Status", default)]
     status: String,
+    #[serde(rename = "StartedAt", default)]
+    started_at: String,
+    #[serde(rename = "RestartCount", default)]
+    restart_count: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -358,6 +374,14 @@ struct InspectNetwork {
     /// `null` binding = published but unbound / not mapped yet.
     #[serde(rename = "Ports", default)]
     ports: std::collections::BTreeMap<String, Option<Vec<InspectPortBinding>>>,
+    #[serde(rename = "Networks", default)]
+    networks: std::collections::BTreeMap<String, InspectEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InspectEndpoint {
+    #[serde(rename = "IPAddress", default)]
+    ip: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -386,13 +410,107 @@ fn default_true() -> bool {
     true
 }
 
+fn json_string_list(v: &Option<serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        Some(serde_json::Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn join_cmd_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            if p.is_empty() || p.contains(char::is_whitespace) {
+                format!("\"{p}\"")
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn uptime_from_started_at(started_at: &str) -> u64 {
+    let s = started_at.trim();
+    if s.is_empty() || s.starts_with("0001-01-01") {
+        return 0;
+    }
+    let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) else {
+        return 0;
+    };
+    let now = chrono::Utc::now();
+    let secs = (now - dt.with_timezone(&chrono::Utc)).num_seconds();
+    secs.max(0) as u64
+}
+
+/// Parse `docker stats --no-stream` one-liner into CPU % + mem used/limit bytes.
+pub fn parse_stats_line(line: &str) -> Option<(f32, u64, u64)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (cpu_s, mem_s) = line
+        .split_once('\t')
+        .or_else(|| line.split_once("  "))
+        .unwrap_or((line, ""));
+    let cpu = cpu_s.trim().trim_end_matches('%').parse::<f32>().ok()?;
+    let mem_s = mem_s.trim();
+    if mem_s.is_empty() {
+        return Some((cpu, 0, 0));
+    }
+    let (used_s, total_s) = mem_s.split_once('/')?;
+    let used = parse_docker_size(used_s.trim())?;
+    let total = parse_docker_size(total_s.trim())?;
+    Some((cpu, used, total))
+}
+
+fn parse_docker_size(s: &str) -> Option<u64> {
+    let s = s.trim().replace(' ', "");
+    if s.is_empty() {
+        return None;
+    }
+    let (num_s, unit) = s
+        .char_indices()
+        .find(|(_, c)| c.is_ascii_alphabetic())
+        .map(|(i, _)| (&s[..i], s[i..].to_ascii_lowercase()))
+        .unwrap_or((s.as_str(), String::new()));
+    let n: f64 = num_s.parse().ok()?;
+    let mult = match unit.as_str() {
+        "" | "b" => 1.0,
+        "kb" | "kib" => 1024.0,
+        "mb" | "mib" => 1024.0 * 1024.0,
+        "gb" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tb" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * mult) as u64)
+}
+
+/// Apply a `docker stats` sample onto an existing container snapshot (best-effort).
+pub fn apply_stats_sample(snap: &mut crate::session::host_info::HostSnapshot, line: &str) {
+    if let Some((cpu, used, total)) = parse_stats_line(line) {
+        snap.cpu_usage_pct = Some(cpu);
+        if total > 0 {
+            snap.mem_used = used;
+            snap.mem_total = total;
+        }
+    }
+}
+
 /// Build an Info-tab snapshot from `docker inspect --format '{{json .}}'` output.
 pub fn host_snapshot_from_inspect(
     json: &str,
     container_fallback: &str,
     via_ssh: bool,
 ) -> Result<crate::session::host_info::HostSnapshot> {
-    use crate::session::host_info::{DockerPortMap, DockerVolumeMap, HostSnapshot};
+    use crate::session::host_info::{
+        DockerNetworkMap, DockerPortMap, DockerVolumeMap, HostSnapshot,
+    };
 
     let raw = json.trim();
     // Some clients wrap as a one-element array.
@@ -416,25 +534,33 @@ pub fn host_snapshot_from_inspect(
     } else {
         name
     };
-    let image = inspect
-        .config
-        .as_ref()
-        .map(|c| c.image.clone())
-        .unwrap_or_default();
-    let status = inspect
-        .state
-        .as_ref()
-        .map(|s| s.status.clone())
-        .unwrap_or_default();
-    let hostname = inspect
-        .config
-        .as_ref()
-        .map(|c| c.hostname.clone())
-        .unwrap_or_default();
+    let config = inspect.config.as_ref();
+    let image = config.map(|c| c.image.clone()).unwrap_or_default();
+    let hostname = config.map(|c| c.hostname.clone()).unwrap_or_default();
+    let workdir = config.map(|c| c.working_dir.clone()).unwrap_or_default();
+    let user = config.map(|c| c.user.clone()).unwrap_or_default();
+    let mut env = config.map(|c| c.env.clone()).unwrap_or_default();
+    env.truncate(MAX_DOCKER_ENV);
+    let entrypoint_v = config.and_then(|c| c.entrypoint.clone());
+    let cmd_v = config.and_then(|c| c.cmd.clone());
+    let docker_command = {
+        let mut parts = json_string_list(&entrypoint_v);
+        parts.extend(json_string_list(&cmd_v));
+        join_cmd_parts(&parts)
+    };
+
+    let state = inspect.state.as_ref();
+    let status = state.map(|s| s.status.clone()).unwrap_or_default();
+    let restart_count = state.map(|s| s.restart_count).unwrap_or(0);
+    let uptime_secs = state
+        .map(|s| uptime_from_started_at(&s.started_at))
+        .unwrap_or(0);
+
     let id = inspect.id.trim();
     let short_id = if id.len() >= 12 { &id[..12] } else { id };
 
     let mut docker_ports = Vec::new();
+    let mut docker_networks = Vec::new();
     if let Some(net) = inspect.network.as_ref() {
         for (container_port, bindings) in &net.ports {
             match bindings {
@@ -479,6 +605,20 @@ pub fn host_snapshot_from_inspect(
                 .then_with(|| a.host.cmp(&b.host))
         });
         docker_ports.truncate(MAX_DOCKER_PORTS);
+
+        for (net_name, ep) in &net.networks {
+            let ip = ep.ip.trim().to_string();
+            if net_name.is_empty() && ip.is_empty() {
+                continue;
+            }
+            docker_networks.push(DockerNetworkMap {
+                name: net_name.clone(),
+                ip,
+            });
+            if docker_networks.len() >= MAX_DOCKER_NETWORKS {
+                break;
+            }
+        }
     }
 
     let mut docker_volumes = Vec::new();
@@ -537,10 +677,17 @@ pub fn host_snapshot_from_inspect(
         gpus: Vec::new(),
         listening: Vec::new(),
         load: Some(name),
-        uptime_secs: 0,
+        uptime_secs,
         is_docker: true,
         docker_ports,
         docker_volumes,
+        docker_status: status,
+        docker_networks,
+        docker_env: env,
+        docker_command,
+        docker_workdir: workdir,
+        docker_user: user,
+        docker_restart_count: restart_count,
     })
 }
 
@@ -580,12 +727,23 @@ mod tests {
         let json = r#"{
             "Id": "abcdef1234567890",
             "Name": "/web",
-            "Config": {"Image": "nginx:latest", "Hostname": "web"},
-            "State": {"Status": "running"},
+            "Config": {
+                "Image": "nginx:latest",
+                "Hostname": "web",
+                "Env": ["PATH=/usr/bin", "NGINX=1"],
+                "Cmd": ["nginx", "-g", "daemon off;"],
+                "Entrypoint": ["/docker-entrypoint.sh"],
+                "WorkingDir": "/usr/share/nginx/html",
+                "User": "nginx"
+            },
+            "State": {"Status": "running", "StartedAt": "2020-01-01T00:00:00Z", "RestartCount": 2},
             "NetworkSettings": {
                 "Ports": {
                     "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8080"}],
                     "443/tcp": null
+                },
+                "Networks": {
+                    "bridge": {"IPAddress": "172.17.0.2"}
                 }
             },
             "Mounts": [
@@ -597,6 +755,16 @@ mod tests {
         assert!(snap.is_docker);
         assert_eq!(snap.hostname, "web");
         assert_eq!(snap.cpu_model, "nginx:latest");
+        assert_eq!(snap.docker_status, "running");
+        assert!(snap.uptime_secs > 0);
+        assert_eq!(snap.docker_restart_count, 2);
+        assert_eq!(snap.docker_networks.len(), 1);
+        assert_eq!(snap.docker_networks[0].name, "bridge");
+        assert_eq!(snap.docker_networks[0].ip, "172.17.0.2");
+        assert_eq!(snap.docker_env.len(), 2);
+        assert!(snap.docker_command.contains("nginx"));
+        assert_eq!(snap.docker_workdir, "/usr/share/nginx/html");
+        assert_eq!(snap.docker_user, "nginx");
         assert_eq!(snap.docker_ports.len(), 2);
         let p80 = snap
             .docker_ports
@@ -616,5 +784,14 @@ mod tests {
         assert_eq!(snap.docker_volumes[1].kind, "volume");
         assert_eq!(snap.docker_volumes[1].source, "pgdata");
         assert!(snap.docker_volumes[1].read_only);
+    }
+
+    #[test]
+    fn parse_stats_mem_and_cpu() {
+        let (cpu, used, total) =
+            parse_stats_line("1.23%\t41.02MiB / 7.653GiB").expect("stats line");
+        assert!((cpu - 1.23).abs() < 0.01);
+        assert!(used > 40 * 1024 * 1024);
+        assert!(total > 7 * 1024 * 1024 * 1024);
     }
 }

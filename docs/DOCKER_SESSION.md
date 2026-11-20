@@ -162,7 +162,7 @@ Docker pane
 
 ## Info 面板
 
-只读摘要：类型 Docker、宿主（本机 / SSH）、容器名、短 ID、镜像、状态；以及 **Ports**（宿主→容器发布端口）与 **Volumes**（bind / volume / tmpfs 挂载）。不提供完整 Docker 管理 UI。
+只读摘要：类型 Docker、宿主（本机 / SSH）、容器名、短 ID、镜像、**状态 / 运行时长 / restarts**、**网络·IP**；可选一次 `docker stats` 的 CPU / Memory；**Ports**、**Volumes**；折叠 **Details**（User / Workdir / Command / Env）。不提供完整 Docker 管理 UI；不轮询。
 
 ## 非目标（当前规格）
 

@@ -46,7 +46,7 @@ Loom 自定义输入（非系统原生 `<input>`）的统一约定。
 | 表面 | 状态 |
 |------|------|
 | SSH 表单字段 / 转发编辑 | ✅ `RenameEdit` |
-| Context Files 路径栏、过滤器、提示框、Temporary 转发 | ✅ |
+| Context Files 路径栏、过滤器、提示框、Temporary 转发 | ✅（路径栏另有右键 Cut/Copy/Paste/Select All/Copy path） |
 | Sidebar / Tab 重命名 | ✅ |
 | Transfer settings 表单 | ✅（经 Context prompt） |
 | 终端 Ctrl+F 查询 | ✅ `RenameEdit` + Find 打开时 IME 绑 find 焦点 |

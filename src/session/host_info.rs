@@ -76,6 +76,13 @@ pub struct DockerVolumeMap {
     pub read_only: bool,
 }
 
+/// Attached Docker network + container IP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerNetworkMap {
+    pub name: String,
+    pub ip: String,
+}
+
 /// One-shot host metrics for display (manual refresh only).
 #[derive(Debug, Clone, Default)]
 pub struct HostSnapshot {
@@ -84,7 +91,7 @@ pub struct HostSnapshot {
     pub kernel: String,
     pub cpu_model: String,
     pub cpu_cores: u32,
-    /// 0..=100 when available (Local after a short sample).
+    /// 0..=100 when available (Local after a short sample; Docker via `docker stats`).
     pub cpu_usage_pct: Option<f32>,
     pub mem_used: u64,
     pub mem_total: u64,
@@ -102,6 +109,17 @@ pub struct HostSnapshot {
     pub docker_ports: Vec<DockerPortMap>,
     /// Mounts / volumes (Docker only).
     pub docker_volumes: Vec<DockerVolumeMap>,
+    /// `running` / `exited` / … (Docker only).
+    pub docker_status: String,
+    /// Attached networks (Docker only).
+    pub docker_networks: Vec<DockerNetworkMap>,
+    /// `Config.Env` (capped; Docker only).
+    pub docker_env: Vec<String>,
+    /// Joined entrypoint + cmd (Docker only).
+    pub docker_command: String,
+    pub docker_workdir: String,
+    pub docker_user: String,
+    pub docker_restart_count: u32,
 }
 
 impl HostSnapshot {
@@ -176,6 +194,13 @@ pub fn collect_local() -> Result<HostSnapshot> {
         is_docker: false,
         docker_ports: Vec::new(),
         docker_volumes: Vec::new(),
+        docker_status: String::new(),
+        docker_networks: Vec::new(),
+        docker_env: Vec::new(),
+        docker_command: String::new(),
+        docker_workdir: String::new(),
+        docker_user: String::new(),
+        docker_restart_count: 0,
     })
 }
 
