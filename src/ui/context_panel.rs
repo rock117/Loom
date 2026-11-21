@@ -13,6 +13,7 @@ use crate::model::{
     save_transfer_history, scope_key_from_parts, suggest_free_bind_port,
 };
 use crate::platform;
+use crate::session::docker;
 use crate::session::docker_fs;
 use crate::session::host_info::{self, HostSnapshot};
 use crate::session::local_fs;
@@ -734,6 +735,8 @@ impl ContextPanel {
                 }
             }
             FilesKind::Docker => {
+                // Prefetch inspect mounts so Files can offer “Copy host path”.
+                self.ensure_host_info(cx);
                 if let Some(cwd) = pane_cwd.filter(|p| p.starts_with('/')) {
                     self.prefetch_docker_home(cx);
                     self.home = self.home.clone().or_else(|| Some(cwd.clone()));
@@ -2936,6 +2939,38 @@ impl ContextPanel {
         }
         self.path_bar_menu = None;
         cx.notify();
+    }
+
+    fn path_bar_copy_host_path(&mut self, cx: &mut Context<Self>) {
+        let container = self
+            .cwd
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.path_edit.text.clone());
+        if let Some(host) = self.docker_host_path_for(&container) {
+            cx.write_to_clipboard(ClipboardItem::new_string(host));
+            cx.emit(ContextPanelEvent::Toast("Copied host path".into()));
+        }
+        self.path_bar_menu = None;
+        cx.notify();
+    }
+
+    /// Resolve a Docker Files path through bind mounts (Info inspect cache).
+    fn docker_host_path_for(&self, container_path: &str) -> Option<String> {
+        if self.files_kind != Some(FilesKind::Docker) {
+            return None;
+        }
+        let snap = self.host_info.as_ref()?;
+        if !snap.is_docker {
+            return None;
+        }
+        // Prefer mounts from the same pane Files is bound to.
+        if let (Some(bound), Some(info_pane)) = (self.bound_pane, self.host_info_pane) {
+            if bound != info_pane {
+                return None;
+            }
+        }
+        docker::host_path_for_container_path(container_path, &snap.docker_volumes)
     }
 
     fn cancel_path_edit(&mut self, cx: &mut Context<Self>) {
@@ -6259,6 +6294,12 @@ impl ContextPanel {
             .as_ref()
             .is_some_and(|s| !s.is_empty())
             || has_text;
+        let cwd_for_host = self
+            .cwd
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.path_edit.text.clone());
+        let host_path = self.docker_host_path_for(&cwd_for_host);
 
         Some(
             deferred(
@@ -6316,7 +6357,16 @@ impl ContextPanel {
                                 can_copy_cwd,
                                 cx,
                                 |this, _, cx| this.path_bar_copy_cwd(cx),
-                            )),
+                            ))
+                            .when(host_path.is_some(), |d| {
+                                d.child(self.transfer_menu_item(
+                                    "path-ctx-copy-host-path",
+                                    "Copy host path",
+                                    true,
+                                    cx,
+                                    |this, _, cx| this.path_bar_copy_host_path(cx),
+                                ))
+                            }),
                     ),
             )
             .into_any_element(),
@@ -6327,11 +6377,13 @@ impl ContextPanel {
         let menu = self.entry_menu.as_ref()?;
         let path = menu.path.clone();
         let path_for_copy = path.clone();
+        let path_for_host = path.clone();
         let path_for_reveal = path.clone();
         let position = menu.position;
         let entry = self.entries.iter().find(|e| e.path == path)?;
         let is_dir = entry.is_dir;
         let is_local = self.files_kind == Some(FilesKind::Local);
+        let host_path = self.docker_host_path_for(&path);
 
         Some(
             deferred(
@@ -6367,6 +6419,25 @@ impl ContextPanel {
                                     this.entry_menu = None;
                                 },
                             ))
+                            .when(host_path.is_some(), |d| {
+                                let host = host_path.clone().unwrap_or_default();
+                                d.child(self.transfer_menu_item(
+                                    "file-ctx-copy-host-path",
+                                    "Copy host path",
+                                    true,
+                                    cx,
+                                    move |this, _, cx| {
+                                        let text = this
+                                            .docker_host_path_for(&path_for_host)
+                                            .unwrap_or_else(|| host.clone());
+                                        cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                        cx.emit(ContextPanelEvent::Toast(
+                                            "Copied host path".into(),
+                                        ));
+                                        this.entry_menu = None;
+                                    },
+                                ))
+                            })
                             .when(!is_dir && is_local, |d| {
                                 d.child(self.transfer_menu_item(
                                     "file-ctx-open",

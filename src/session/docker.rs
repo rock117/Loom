@@ -797,6 +797,100 @@ pub fn host_snapshot_from_inspect(
     })
 }
 
+/// Map a container path to a host path using bind mounts (longest destination wins).
+///
+/// Named volumes / tmpfs are skipped — `source` is not a useful host filesystem path
+/// for “Copy host path”. Local Docker and Docker-over-SSH both use the same mapping
+/// (SSH: path is on the remote Docker host).
+pub fn host_path_for_container_path(
+    container_path: &str,
+    mounts: &[crate::session::host_info::DockerVolumeMap],
+) -> Option<String> {
+    let cpath = normalize_container_mount_path(container_path);
+    if cpath.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(&crate::session::host_info::DockerVolumeMap, usize)> = None;
+    for mount in mounts {
+        if !is_mappable_host_bind(mount) {
+            continue;
+        }
+        let dest = normalize_container_mount_path(&mount.destination);
+        if dest.is_empty() {
+            continue;
+        }
+        let matched = if dest == "/" {
+            cpath.starts_with('/')
+        } else {
+            cpath == dest || cpath.starts_with(&(dest.clone() + "/"))
+        };
+        if !matched {
+            continue;
+        }
+        let len = dest.len();
+        if best.is_none_or(|(_, best_len)| len >= best_len) {
+            best = Some((mount, len));
+        }
+    }
+
+    let (mount, dest_len) = best?;
+    let rest = if cpath.len() <= dest_len {
+        ""
+    } else {
+        cpath[dest_len..].trim_start_matches('/')
+    };
+    Some(join_host_mount_path(&mount.source, rest))
+}
+
+fn is_mappable_host_bind(mount: &crate::session::host_info::DockerVolumeMap) -> bool {
+    let source = mount.source.trim();
+    let dest = mount.destination.trim();
+    if source.is_empty() || dest.is_empty() {
+        return false;
+    }
+    if mount.kind.eq_ignore_ascii_case("tmpfs") || mount.kind.eq_ignore_ascii_case("volume") {
+        return false;
+    }
+    // Prefer explicit bind; also accept path-like sources when Type is missing/other.
+    mount.kind.eq_ignore_ascii_case("bind") || looks_like_host_fs_path(source)
+}
+
+fn looks_like_host_fs_path(source: &str) -> bool {
+    let s = source.trim();
+    if s.starts_with('/') || s.starts_with('\\') {
+        return true;
+    }
+    // Windows `C:\…` / `C:/…`
+    let bytes = s.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn normalize_container_mount_path(path: &str) -> String {
+    let p = path.trim();
+    if p.is_empty() {
+        return String::new();
+    }
+    // Reuse Files normalization (collapse `..`, ensure absolute).
+    crate::session::docker_fs::normalize_path(p)
+}
+
+fn join_host_mount_path(source: &str, rest: &str) -> String {
+    let source = source.trim();
+    if rest.is_empty() {
+        return source.to_string();
+    }
+    let windows = source.contains('\\')
+        || (source.len() >= 2 && source.as_bytes()[1] == b':');
+    if windows {
+        let base = source.trim_end_matches(['\\', '/']);
+        format!("{base}\\{}", rest.replace('/', "\\"))
+    } else {
+        let base = source.trim_end_matches('/');
+        format!("{base}/{rest}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +984,41 @@ mod tests {
         assert_eq!(snap.docker_volumes[1].kind, "volume");
         assert_eq!(snap.docker_volumes[1].source, "pgdata");
         assert!(snap.docker_volumes[1].read_only);
+    }
+
+    #[test]
+    fn host_path_maps_bind_longest_prefix() {
+        use crate::session::host_info::DockerVolumeMap;
+        let mounts = vec![
+            DockerVolumeMap {
+                kind: "bind".into(),
+                source: r"C:\work".into(),
+                destination: "/app".into(),
+                read_only: false,
+            },
+            DockerVolumeMap {
+                kind: "bind".into(),
+                source: r"C:\work\src".into(),
+                destination: "/app/src".into(),
+                read_only: false,
+            },
+            DockerVolumeMap {
+                kind: "volume".into(),
+                source: "pgdata".into(),
+                destination: "/data".into(),
+                read_only: false,
+            },
+        ];
+        assert_eq!(
+            host_path_for_container_path("/app/src/main.rs", &mounts).as_deref(),
+            Some(r"C:\work\src\main.rs")
+        );
+        assert_eq!(
+            host_path_for_container_path("/app/README.md", &mounts).as_deref(),
+            Some(r"C:\work\README.md")
+        );
+        assert_eq!(host_path_for_container_path("/data/x", &mounts), None);
+        assert_eq!(host_path_for_container_path("/other", &mounts), None);
     }
 
     #[test]

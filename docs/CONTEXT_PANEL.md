@@ -118,7 +118,7 @@ Compact **Host** / **Container** view (no session summary). Loads on first open 
 - **SSH:** probe + `df`; GPU via `nvidia-smi` then `lspci`; listening via remote `ss`/`netstat` (best-effort) — never blocks the UI thread
 - **Docker** (local or over SSH): `docker inspect` + optional `docker stats --no-stream`; see [DOCKER_SESSION.md](./DOCKER_SESSION.md)
 
-Path bar: left-click edits; **right-click** → Cut / Copy / Paste / Select All / Copy path (keyboard Ctrl+A/C/X/V still work while editing).
+Path bar: left-click edits; **right-click** → Cut / Copy / Paste / Select All / Copy path (keyboard Ctrl+A/C/X/V still work while editing). Docker Files: when the path sits under a **bind** mount, menus also offer **Copy host path** (maps via inspect mounts; named volumes/tmpfs omitted).
 
 
 ## Non-goals (for now)
