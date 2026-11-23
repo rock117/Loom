@@ -19,6 +19,8 @@
 
 口诀：Group 是目录，Profile 是文件，Tab 是页签，Pane 是活会话。
 
+Tab 栏：标题前显示会话类型图标（Local / SSH / WSL / Docker，取 focused Pane）；SSH / Docker（含 Docker-over-SSH）图标色随连接态——Connected 用类型色，Connecting 灰，Disconnected / Failed 红（不再单独画状态点）。
+
 ```text
 Profile（侧栏收藏）
     │  双击打开

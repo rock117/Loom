@@ -2,11 +2,11 @@ use gpui::prelude::*;
 use gpui::*;
 use uuid::Uuid;
 
-use crate::model::ConnectionState;
+use crate::model::{ConnectionState, ProfileKind};
 use crate::shared::theme;
 use crate::ui::pane_layout::SplitDirection;
 use crate::ui::rename_edit::{RenameEdit, typed_text_from_keystroke};
-use crate::ui::tab_manager::{TabManager, state_color};
+use crate::ui::tab_manager::TabManager;
 use crate::ui::tooltip::Tooltip;
 use crate::ui::workspace_store::WorkspaceStore;
 
@@ -167,6 +167,42 @@ impl TabBar {
             .size(px(size))
             .flex_shrink_0()
             .text_color(color)
+    }
+
+    /// Session-type glyph for a tab (focused pane). SSH / Docker tint by connection state.
+    fn tab_kind_icon(kind: Option<&ProfileKind>, state: ConnectionState) -> (&'static str, Hsla) {
+        let Some(kind) = kind else {
+            return ("icons/ui/terminal.svg", theme::TEXT_MUTED);
+        };
+        let (path, live) = if kind.is_docker_ssh() {
+            ("icons/ui/docker.svg", theme::ICON_DOCKER)
+        } else if matches!(kind, ProfileKind::Ssh { .. }) {
+            if kind.has_ssh_jump() {
+                ("icons/ui/remote.svg", theme::ICON_SSH_JUMP)
+            } else {
+                ("icons/ui/remote.svg", theme::ICON_REMOTE)
+            }
+        } else if kind.is_wsl_local() {
+            ("icons/ui/wsl.svg", theme::ICON_WSL)
+        } else if kind.is_docker_local() {
+            ("icons/ui/docker.svg", theme::ICON_DOCKER)
+        } else {
+            ("icons/ui/terminal.svg", theme::ICON_LOCAL)
+        };
+
+        // SSH / Docker: connected = brand color; connecting = muted; down = danger.
+        let remoteish = matches!(kind, ProfileKind::Ssh { .. }) || kind.is_docker_local();
+        let color = if remoteish {
+            match state {
+                ConnectionState::Connected => live,
+                ConnectionState::Connecting => theme::TEXT_MUTED,
+                ConnectionState::Failed | ConnectionState::Disconnected => theme::DANGER,
+                ConnectionState::Idle => theme::TEXT_MUTED,
+            }
+        } else {
+            live
+        };
+        (path, color)
     }
 
     fn menu_shell(&self) -> Div {
@@ -505,20 +541,24 @@ impl Render for TabBar {
         let has_session = active.is_some();
         let can_zoom = manager.can_zoom_active();
         let is_zoomed = manager.active_zoomed();
-        let items: Vec<(Uuid, String, ConnectionState, bool, bool)> = manager
+        let items: Vec<(Uuid, String, bool, bool, &'static str, Hsla)> = manager
             .tabs
             .iter()
             .map(|t| {
+                let state = t.display_state();
                 let via_jump = t
                     .focused_pane()
                     .map(|p| p.kind.has_ssh_jump())
                     .unwrap_or(false);
+                let (kind_icon, kind_color) =
+                    Self::tab_kind_icon(t.focused_pane().map(|p| &p.kind), state);
                 (
                     t.id,
                     t.title.clone(),
-                    t.display_state(),
                     Some(t.id) == active,
                     via_jump,
+                    kind_icon,
+                    kind_color,
                 )
             })
             .collect();
@@ -674,7 +714,8 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }
             }))
-            .children(items.into_iter().map(|(id, title, state, is_active, via_jump)| {
+            .children(items.into_iter().map(
+                |(id, title, is_active, via_jump, kind_icon, kind_color)| {
                 let is_renaming = renaming_id == Some(id);
                 let title_el: AnyElement = if is_renaming {
                     if let Some(edit) = rename_edit.as_ref() {
@@ -739,7 +780,7 @@ impl Render for TabBar {
                             .items_center()
                             .gap(px(theme::SPACE_1))
                             .cursor_pointer()
-                            .child(div().size(px(8.0)).rounded_full().bg(state_color(state)))
+                            .child(Self::svg_icon(kind_icon, ICON, kind_color))
                             .child(title_el)
                             .on_mouse_down(
                                 MouseButton::Left,
