@@ -123,7 +123,8 @@ Same pattern as the **sidebar context menu** + Zed’s deferred priority:
 
 - Need “above everything” → `deferred(...).with_priority(1)` (Zed `PopoverMenu`).
 - Need “next to this control” → **window-space** `anchored().position(...)` from a mouse event or measured trigger bounds — not `Local` offsets on a deferred child of the trigger.
-- Mirror existing in-tree proof: `src/ui/sidebar.rs` context menu.
+- Near the **bottom** of the window: estimate menu height and use `Corner::BottomLeft` (open upward); still keep `snap_to_window_with_margin`. Sidebar profile/group menus: `src/ui/sidebar.rs`.
+- Mirror existing in-tree proof: `src/ui/sidebar.rs` / `src/ui/tab_bar.rs` context menus.
 
 **Code:** `src/ui/tab_bar.rs` (split popover). Model: `src/ui/pane_layout.rs`, `src/ui/tab_manager.rs`, `src/ui/terminal_pane.rs`.
 

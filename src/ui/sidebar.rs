@@ -12,6 +12,9 @@ use crate::ui::workspace_store::{Selection, WorkspaceStore};
 const ICON_TREE: f32 = 14.0;
 const ICON_HEADER: f32 = 13.0;
 const ROW_H: f32 = 26.0;
+/// Approx. context-menu row height (`py(SPACE_1)` + label).
+const CTX_MENU_ROW_H: f32 = 26.0;
+const CTX_MENU_EDGE_MARGIN: f32 = 4.0;
 
 pub struct Sidebar {
     pub store: Entity<WorkspaceStore>,
@@ -417,6 +420,51 @@ impl Sidebar {
             ))
     }
 
+    /// Rows for height estimate (items + one divider ≈ one row).
+    fn estimate_profile_menu_height(&self, pid: Uuid, move_count: usize, cx: &App) -> f32 {
+        let store = self.store.read(cx);
+        let (is_ssh, is_local) = store
+            .workspace
+            .find_profile(pid)
+            .map(|p| {
+                (
+                    matches!(p.kind, ProfileKind::Ssh { .. }),
+                    matches!(p.kind, ProfileKind::Local { .. }),
+                )
+            })
+            .unwrap_or((false, false));
+        let in_group = store.workspace.group_id_for_profile(pid).is_some();
+        // Open + optional Edit + Rename + Duplicate + optional Move root
+        // + up to 4 Move targets + divider + Delete + Close.
+        let mut rows = 1_u32; // Open
+        if is_ssh || is_local {
+            rows += 1;
+        }
+        rows += 2; // Rename, Duplicate
+        if in_group {
+            rows += 1;
+        }
+        rows += move_count.min(4) as u32;
+        rows += 1; // divider
+        rows += 2; // Delete, Close
+        theme::SPACE_1 * 2.0 + rows as f32 * CTX_MENU_ROW_H
+    }
+
+    fn estimate_group_menu_height() -> f32 {
+        // Rename, Expand, New Shell, New SSH, divider, Delete, Close.
+        const ROWS: f32 = 7.0;
+        theme::SPACE_1 * 2.0 + ROWS * CTX_MENU_ROW_H
+    }
+
+    /// Prefer opening upward when the click is near the window bottom.
+    fn context_menu_corner(position: Point<Pixels>, menu_h: f32, window_h: Pixels) -> Corner {
+        if position.y + px(menu_h) + px(CTX_MENU_EDGE_MARGIN) > window_h {
+            Corner::BottomLeft
+        } else {
+            Corner::TopLeft
+        }
+    }
+
     fn group_context_menu(&self, gid: Uuid, cx: &mut Context<Self>) -> impl IntoElement {
         self.menu_shell()
             .child(self.menu_item(
@@ -490,7 +538,7 @@ impl Focusable for Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (renaming, selection, entries, other_groups, profile_can, group_can) = {
             let store = self.store.read(cx);
             let renaming = store.rename.clone();
@@ -952,9 +1000,17 @@ impl Render for Sidebar {
                     .text_color(theme::TEXT_DISABLED)
                     .child("↵ open · hover ↑↓ · drag · F2 · Del · right-click"),
             )
-            // Context menu — anchored to right-click point (window coords)
+            // Context menu — window coords; flip upward near the bottom (tab_bar pattern).
             .when_some(context_menu, |this, (target, position)| {
                 let moves = other_groups.clone();
+                let menu_h = match target {
+                    ContextTarget::Profile(pid) => {
+                        self.estimate_profile_menu_height(pid, moves.len(), cx)
+                    }
+                    ContextTarget::Group(_) => Self::estimate_group_menu_height(),
+                };
+                let corner =
+                    Self::context_menu_corner(position, menu_h, window.viewport_size().height);
                 let menu: AnyElement = match target {
                     ContextTarget::Profile(pid) => {
                         self.profile_context_menu(pid, moves, cx).into_any_element()
@@ -964,16 +1020,19 @@ impl Render for Sidebar {
                     }
                 };
                 this.child(
-                    anchored()
-                        .position(position)
-                        .anchor(Corner::TopLeft)
-                        .snap_to_window_with_margin(Edges {
-                            top: px(4.0),
-                            right: px(4.0),
-                            bottom: px(4.0),
-                            left: px(4.0),
-                        })
-                        .child(menu),
+                    deferred(
+                        anchored()
+                            .position(position)
+                            .anchor(corner)
+                            .snap_to_window_with_margin(Edges {
+                                top: px(CTX_MENU_EDGE_MARGIN),
+                                right: px(CTX_MENU_EDGE_MARGIN),
+                                bottom: px(CTX_MENU_EDGE_MARGIN),
+                                left: px(CTX_MENU_EDGE_MARGIN),
+                            })
+                            .child(menu),
+                    )
+                    .with_priority(1),
                 )
             })
             .on_mouse_down(
