@@ -111,7 +111,8 @@ pub fn home_dir(container: &str) -> Result<String> {
 /// List one directory level. Paths in entries are absolute Unix paths.
 pub fn list_dir(container: &str, path: &str) -> Result<Vec<RemoteEntry>> {
     let path = normalize_path(path);
-    // kind \t size \t name — names must not contain tabs/newlines.
+    // kind \t size \t mtime \t name — names must not contain tabs/newlines.
+    // mtime: GNU `stat -c %Y`, else BSD `stat -f %m`; empty if unavailable.
     let script = r#"
 path=$1
 [ -d "$path" ] || exit 1
@@ -124,8 +125,9 @@ find "$path" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r full; do
   else
     sz=0
   fi
+  mtime=$(stat -c %Y "$full" 2>/dev/null || stat -f %m "$full" 2>/dev/null || echo)
   safe=$(printf '%s' "$name" | tr '\t\n' '  ')
-  printf '%s\t%s\t%s\n' "$kind" "$sz" "$safe"
+  printf '%s\t%s\t%s\t%s\n' "$kind" "$sz" "$mtime" "$safe"
 done
 "#;
     let output = docker_cmd()
@@ -147,28 +149,39 @@ done
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut rows = Vec::new();
     for line in stdout.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
+        if let Some(entry) = parse_list_row(line, &path) {
+            rows.push(entry);
         }
-        let mut parts = line.splitn(3, '\t');
-        let kind = parts.next().unwrap_or("");
-        let size: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let name = parts.next().unwrap_or("").to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let is_dir = kind == "d";
-        let full = join_child(&path, &name);
-        rows.push(RemoteEntry {
-            name,
-            path: full,
-            is_dir,
-            size,
-            mtime: None,
-        });
     }
     Ok(rows)
+}
+
+/// Parse one `kind \t size \t mtime \t name` row from container list scripts.
+pub(crate) fn parse_list_row(line: &str, parent: &str) -> Option<RemoteEntry> {
+    let line = line.trim_end();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.splitn(4, '\t');
+    let kind = parts.next().unwrap_or("");
+    let size: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    let mtime_s = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("").to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mtime = if mtime_s.is_empty() {
+        None
+    } else {
+        mtime_s.parse::<u64>().ok()
+    };
+    Some(RemoteEntry {
+        name: name.clone(),
+        path: join_child(parent, &name),
+        is_dir: kind == "d",
+        size,
+        mtime,
+    })
 }
 
 /// Check that `path` exists and is a directory inside the container.
@@ -575,5 +588,20 @@ mod tests {
         assert_eq!(parent_path("/a/b"), Some("/a".into()));
         assert_eq!(join_child("/", "x"), "/x");
         assert_eq!(join_child("/a", "b"), "/a/b");
+    }
+
+    #[test]
+    fn parse_list_row_with_mtime() {
+        let e = parse_list_row("f\t12\t1700000000\treadme.md", "/app").unwrap();
+        assert!(!e.is_dir);
+        assert_eq!(e.size, 12);
+        assert_eq!(e.mtime, Some(1_700_000_000));
+        assert_eq!(e.path, "/app/readme.md");
+        assert_eq!(e.name, "readme.md");
+
+        let d = parse_list_row("d\t0\t\tsrc", "/app").unwrap();
+        assert!(d.is_dir);
+        assert_eq!(d.mtime, None);
+        assert_eq!(d.path, "/app/src");
     }
 }

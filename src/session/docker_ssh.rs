@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use russh::client;
 use russh::ChannelMsg;
 
-use super::docker_fs::{join_child, normalize_path};
+use super::docker_fs::normalize_path;
 use super::sftp::RemoteEntry;
 use super::ssh::{ClientHandler, shell_single_quote};
 
@@ -74,8 +74,9 @@ pub async fn list_dir(
     path: &str,
 ) -> Result<Vec<RemoteEntry>> {
     let path = normalize_path(path);
+    // kind \t size \t mtime \t name — same shape as docker_fs::list_dir.
     let inner = format!(
-        "path={}; [ -d \"$path\" ] || exit 1; find \"$path\" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r full; do [ -z \"$full\" ] && continue; name=${{full##*/}}; if [ -d \"$full\" ]; then kind=d; else kind=f; fi; if [ -f \"$full\" ]; then sz=$(wc -c <\"$full\" 2>/dev/null | tr -d ' \\n' || echo 0); else sz=0; fi; safe=$(printf '%s' \"$name\" | tr '\\t\\n' '  '); printf '%s\\t%s\\t%s\\n' \"$kind\" \"$sz\" \"$safe\"; done",
+        "path={}; [ -d \"$path\" ] || exit 1; find \"$path\" -mindepth 1 -maxdepth 1 2>/dev/null | while IFS= read -r full; do [ -z \"$full\" ] && continue; name=${{full##*/}}; if [ -d \"$full\" ]; then kind=d; else kind=f; fi; if [ -f \"$full\" ]; then sz=$(wc -c <\"$full\" 2>/dev/null | tr -d ' \\n' || echo 0); else sz=0; fi; mtime=$(stat -c %Y \"$full\" 2>/dev/null || stat -f %m \"$full\" 2>/dev/null || echo); safe=$(printf '%s' \"$name\" | tr '\\t\\n' '  '); printf '%s\\t%s\\t%s\\t%s\\n' \"$kind\" \"$sz\" \"$mtime\" \"$safe\"; done",
         shell_single_quote(&path)
     );
     let cmd = format!(
@@ -86,26 +87,9 @@ pub async fn list_dir(
     let stdout = remote_exec(session, &cmd).await?;
     let mut rows = Vec::new();
     for line in stdout.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
+        if let Some(entry) = super::docker_fs::parse_list_row(line, &path) {
+            rows.push(entry);
         }
-        let mut parts = line.splitn(3, '\t');
-        let kind = parts.next().unwrap_or("");
-        let size: u64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let name = parts.next().unwrap_or("").to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let is_dir = kind == "d";
-        let full = join_child(&path, &name);
-        rows.push(RemoteEntry {
-            name,
-            path: full,
-            is_dir,
-            size,
-            mtime: None,
-        });
     }
     Ok(rows)
 }
