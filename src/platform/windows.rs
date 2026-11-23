@@ -24,12 +24,33 @@ pub fn native_monospace_font_family() -> &'static str {
     }
 }
 
+/// Strip Win32 verbatim prefix from `canonicalize` so Explorer can open the path.
+///
+/// `\\?\C:\…` / `\\?\UNC\server\share\…` make `explorer /select,…` jump to the
+/// wrong place (Documents / This PC). ShellExecute often tolerates verbatim paths;
+/// Explorer's command-line parsing does not.
+fn path_for_explorer(path: &std::path::Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        if let Some(unc) = rest.strip_prefix(r"UNC\") {
+            PathBuf::from(format!(r"\\{unc}"))
+        } else {
+            PathBuf::from(rest)
+        }
+    } else {
+        path.to_path_buf()
+    }
+}
+
 pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if path.is_file() {
-        // Explorer is GUI — do not use CREATE_NO_WINDOW.
+    let is_file = path.is_file();
+    let path = path_for_explorer(&path);
+    // Explorer is GUI — do not use CREATE_NO_WINDOW.
+    if is_file {
+        // Quoted form so spaces survive: /select,"C:\folder\file name.txt"
         std::process::Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
+            .arg(format!("/select,\"{}\"", path.display()))
             .spawn()?;
     } else {
         std::process::Command::new("explorer")
@@ -248,4 +269,28 @@ fn find_windows_powershell() -> Option<PathBuf> {
 
 fn which_global(name: &str) -> Option<PathBuf> {
     which::which_global(name).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn strips_verbatim_drive_prefix_for_explorer() {
+        let p = path_for_explorer(Path::new(r"\\?\C:\Users\me\Downloads\a.txt"));
+        assert_eq!(p, PathBuf::from(r"C:\Users\me\Downloads\a.txt"));
+    }
+
+    #[test]
+    fn strips_verbatim_unc_prefix_for_explorer() {
+        let p = path_for_explorer(Path::new(r"\\?\UNC\server\share\file.bin"));
+        assert_eq!(p, PathBuf::from(r"\\server\share\file.bin"));
+    }
+
+    #[test]
+    fn leaves_normal_paths_unchanged() {
+        let p = path_for_explorer(Path::new(r"C:\Users\me\file.txt"));
+        assert_eq!(p, PathBuf::from(r"C:\Users\me\file.txt"));
+    }
 }
