@@ -27,6 +27,10 @@ pub struct TabBar {
     pub tabs: Entity<TabManager>,
     store: Entity<WorkspaceStore>,
     focus_handle: FocusHandle,
+    /// Horizontal scroll for the tab chip strip (left-aligned; scroll to active).
+    tab_scroll: ScrollHandle,
+    /// Last active tab we scrolled into view (skip re-scroll while user pans).
+    scrolled_active: Option<Uuid>,
     /// Zed-style split popover (open under the columns control).
     split_menu_open: bool,
     /// Window-space point for the menu's top-right corner (same pattern as sidebar).
@@ -53,6 +57,8 @@ impl TabBar {
             tabs,
             store,
             focus_handle: cx.focus_handle(),
+            tab_scroll: ScrollHandle::new(),
+            scrolled_active: None,
             split_menu_open: false,
             split_menu_anchor: None,
             tab_list_open: false,
@@ -625,19 +631,6 @@ impl Render for TabBar {
                 )
             })
             .collect();
-        // Strip is end-justified so overflow clips on the left; active chip last
-        // stays next to ▾ / actions when selected from the All Tabs menu.
-        let strip_items: Vec<_> = {
-            let mut ordered: Vec<_> = items
-                .iter()
-                .filter(|(_, _, is_active, ..)| !*is_active)
-                .cloned()
-                .collect();
-            if let Some(active_item) = items.iter().find(|(_, _, is_active, ..)| *is_active) {
-                ordered.push(active_item.clone());
-            }
-            ordered
-        };
         let menu_open = self.split_menu_open;
         let menu_anchor = self.split_menu_anchor;
         let tab_list_open = self.tab_list_open;
@@ -647,6 +640,14 @@ impl Render for TabBar {
         let renaming_id = self.rename.as_ref().map(|r| r.tab_id);
         let rename_edit = self.rename.as_ref().map(|r| r.edit.clone());
         let key_ctx = "TabBar";
+
+        // Keep order stable; bring the active chip into view when it changes.
+        if active != self.scrolled_active {
+            if let Some(ix) = items.iter().position(|(id, ..)| Some(*id) == active) {
+                self.tab_scroll.scroll_to_item(ix);
+            }
+            self.scrolled_active = active;
+        }
 
         div()
             .key_context(key_ctx)
@@ -796,19 +797,19 @@ impl Render for TabBar {
                     cx.stop_propagation();
                 }
             }))
-            // Tab chips (may clip left); active is last + justify_end so it stays visible.
+            // Left-aligned strip; scroll horizontally when crowded. Full list via ▾.
             .child(
                 div()
                     .id("tab-strip")
+                    .track_scroll(&self.tab_scroll)
                     .flex()
                     .flex_1()
                     .min_w_0()
                     .h_full()
                     .items_center()
-                    .justify_end()
                     .gap(px(theme::SPACE_1))
-                    .overflow_hidden()
-                    .children(strip_items.into_iter().map(
+                    .overflow_x_scroll()
+                    .children(items.iter().cloned().map(
                         |(id, title, is_active, via_jump, kind_icon, kind_color)| {
                         let is_renaming = renaming_id == Some(id);
                         let title_el: AnyElement = if is_renaming {

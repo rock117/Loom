@@ -43,10 +43,11 @@ Windows-style navigation:
 | ← / Up | Parent directory |
 | ⌂ Home | SSH: session home (`canonicalize(".")`). Local: terminal cwd (else user profile) |
 | + | New folder |
-| Toolbar Upload (SSH) | Pick local **file** → upload to current remote cwd (**no settings**). |
+| Toolbar Upload (SSH) | Pick local **file(s)** (multi-select) → upload to current remote cwd (**no settings**). |
 | Toolbar Upload folder (SSH) | Pick local **folder** → **modal** (remote dir / skip folders / advanced filters) → recursive upload |
 | Drag-drop (SSH) | **Files only** → upload to cwd immediately. **Folders / mixed** → transfer settings modal |
-| ↓ button (SSH) | **File** → download to last/Downloads folder (**no settings**). **Folder** → transfer settings modal |
+| File list selection | Click selects one; **Ctrl** toggles; **Shift** range. Multi-select ↓ downloads each (defaults; no per-folder modal). |
+| ↓ button (SSH) | **One file** → download to last/Downloads (**no settings**). **One folder** → transfer settings modal. **Multi** → each with defaults |
 
 Transfer settings modal (folders / mixed only): centered overlay like SSH password. Shows item summary; Save to / Remote folder + Browse; **Skip folders** two-column checklist (`node_modules`, `target`, …); **Advanced filters** (include / extra exclude) collapsed by default. Tab cycles fields; Cancel · Download/Upload bottom-right. **SSH/Docker double-click file** confirms download to last/Downloads (same as path-bar file Enter). Transfers always copy originals (no compress option — pack remotely yourself if needed).
 

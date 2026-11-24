@@ -1,6 +1,6 @@
 ﻿//! Right context panel — Files (SFTP / local FS) + Info (see docs/CONTEXT_PANEL.md).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use gpui::prelude::*;
@@ -215,7 +215,10 @@ pub struct ContextPanel {
     cwd: Option<String>,
     home: Option<String>,
     entries: Vec<RemoteEntry>,
-    selected: Option<String>,
+    /// Selected entry paths (Ctrl/Shift multi-select).
+    selected: HashSet<String>,
+    /// Anchor for Shift-range selection / primary target for single-item ops.
+    selection_anchor: Option<String>,
     listing: bool,
     error: Option<String>,
     /// Remote path that failed with Permission denied — enables Files “Retry with sudo”.
@@ -308,7 +311,8 @@ impl ContextPanel {
             cwd: None,
             home: None,
             entries: Vec::new(),
-            selected: None,
+            selected: HashSet::new(),
+            selection_anchor: None,
             listing: false,
             error: None,
             browse_sudo_path: None,
@@ -430,12 +434,73 @@ impl ContextPanel {
         )
     }
 
+    fn clear_file_selection(&mut self) {
+        self.selected.clear();
+        self.selection_anchor = None;
+    }
+
+    fn select_only_file(&mut self, path: String) {
+        self.selected.clear();
+        self.selected.insert(path.clone());
+        self.selection_anchor = Some(path);
+    }
+
+    /// Primary path for single-item ops (rename / chmod / open).
+    fn primary_selected_path(&self) -> Option<&String> {
+        if let Some(anchor) = self.selection_anchor.as_ref() {
+            if self.selected.contains(anchor) {
+                return Some(anchor);
+            }
+        }
+        self.selected.iter().next()
+    }
+
+    fn select_file_click(&mut self, path: String, mods: Modifiers) {
+        if mods.shift {
+            let visible: Vec<String> = self
+                .filtered_entries()
+                .into_iter()
+                .map(|e| e.path)
+                .collect();
+            let anchor = self
+                .selection_anchor
+                .clone()
+                .or_else(|| self.selected.iter().next().cloned())
+                .unwrap_or_else(|| path.clone());
+            let Some(a) = visible.iter().position(|p| *p == anchor) else {
+                self.select_only_file(path);
+                return;
+            };
+            let Some(b) = visible.iter().position(|p| *p == path) else {
+                self.select_only_file(path);
+                return;
+            };
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            self.selected = visible[lo..=hi].iter().cloned().collect();
+            self.selection_anchor = Some(anchor);
+            return;
+        }
+        if mods.secondary() {
+            if self.selected.contains(&path) {
+                self.selected.remove(&path);
+                if self.selection_anchor.as_ref() == Some(&path) {
+                    self.selection_anchor = self.selected.iter().next().cloned();
+                }
+            } else {
+                self.selected.insert(path.clone());
+                self.selection_anchor = Some(path);
+            }
+            return;
+        }
+        self.select_only_file(path);
+    }
+
     fn reset_files_state(&mut self) {
         self.list_gen = self.list_gen.wrapping_add(1);
         self.cwd = None;
         self.home = None;
         self.entries.clear();
-        self.selected = None;
+        self.clear_file_selection();
         self.error = None;
         self.browse_sudo_path = None;
         self.listing = false;
@@ -1057,7 +1122,7 @@ impl ContextPanel {
                         this.path_edit = RenameEdit::new(path);
                         this.editing_path = false;
                         this.entries = entries;
-                        this.selected = None;
+                        this.clear_file_selection();
                         this.error = None;
                         this.browse_sudo_path = None;
                     }
@@ -1099,7 +1164,7 @@ impl ContextPanel {
                         this.path_edit = RenameEdit::new(path);
                         this.editing_path = false;
                         this.entries = entries;
-                        this.selected = None;
+                        this.clear_file_selection();
                         this.error = None;
                     }
                     Err(err) => {
@@ -1152,7 +1217,7 @@ impl ContextPanel {
                             this.path_edit = RenameEdit::new(path);
                             this.editing_path = false;
                             this.entries = entries;
-                            this.selected = None;
+                            this.clear_file_selection();
                             this.error = None;
                         }
                         Ok(Err(err)) => {
@@ -1193,7 +1258,7 @@ impl ContextPanel {
                         this.path_edit = RenameEdit::new(path);
                         this.editing_path = false;
                         this.entries = entries;
-                        this.selected = None;
+                        this.clear_file_selection();
                         this.error = None;
                     }
                     Err(err) => {
@@ -1239,7 +1304,7 @@ impl ContextPanel {
     }
 
     fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some(path) = self.primary_selected_path().cloned() else {
             return;
         };
         let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() else {
@@ -1264,13 +1329,33 @@ impl ContextPanel {
         if !self.files_supports_transfer() {
             return;
         }
-        let Some(path) = self.selected.clone() else {
+        let entries: Vec<RemoteEntry> = self
+            .selected
+            .iter()
+            .filter_map(|path| self.entries.iter().find(|e| e.path == *path).cloned())
+            .collect();
+        if entries.is_empty() {
             return;
-        };
-        let Some(entry) = self.entries.iter().find(|e| e.path == path).cloned() else {
+        }
+        if entries.len() == 1 {
+            self.begin_transfer_download(entries.into_iter().next().unwrap(), cx);
             return;
-        };
-        self.begin_transfer_download(entry, cx);
+        }
+        // Multi-select: start each with defaults (avoid N settings modals).
+        let dest = self
+            .last_download_dir
+            .clone()
+            .unwrap_or_else(default_download_dir);
+        let dest_path = PathBuf::from(dest);
+        for entry in entries {
+            self.download_entry(
+                entry,
+                false,
+                TransferOptions::default(),
+                Some(dest_path.clone()),
+                cx,
+            );
+        }
     }
 
     fn begin_transfer_download(&mut self, entry: RemoteEntry, cx: &mut Context<Self>) {
@@ -1763,18 +1848,18 @@ impl ContextPanel {
 
         cx.spawn(async move |this, cx| {
             let picked = rfd::AsyncFileDialog::new()
-                .set_title("Upload file to remote")
-                .pick_file()
+                .set_title("Upload files to remote")
+                .pick_files()
                 .await;
-            let Some(handle) = picked else {
+            let Some(handles) = picked else {
                 return;
             };
+            if handles.is_empty() {
+                return;
+            }
+            let locals: Vec<PathBuf> = handles.into_iter().map(|h| h.path().to_path_buf()).collect();
             this.update(cx, |this, cx| {
-                this.begin_transfer_upload(
-                    pane_id,
-                    vec![handle.path().to_path_buf()],
-                    cx,
-                );
+                this.begin_transfer_upload(pane_id, locals, cx);
             })
             .ok();
         })
@@ -2524,7 +2609,7 @@ impl ContextPanel {
                         this.path_edit = RenameEdit::new(path);
                         this.editing_path = false;
                         this.entries = entries;
-                        this.selected = None;
+                        this.clear_file_selection();
                         this.error = None;
                         this.browse_sudo_path = None;
                     }
@@ -2749,7 +2834,7 @@ impl ContextPanel {
     }
 
     fn begin_rename_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some(path) = self.primary_selected_path().cloned() else {
             return;
         };
         let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
@@ -2767,7 +2852,7 @@ impl ContextPanel {
     }
 
     fn begin_chmod_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some(path) = self.primary_selected_path().cloned() else {
             return;
         };
         self.entry_menu = None;
@@ -2781,7 +2866,7 @@ impl ContextPanel {
     }
 
     fn begin_delete_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.selected.clone() else {
+        let Some(path) = self.primary_selected_path().cloned() else {
             return;
         };
         let Some(entry) = self.entries.iter().find(|e| e.path == path) else {
@@ -4734,7 +4819,7 @@ impl ContextPanel {
         let search_query = self.search_edit.text.clone();
         let entries = self.filtered_entries();
         let selected = self.selected.clone();
-        let has_sel = selected.is_some();
+        let has_sel = !selected.is_empty();
         let path_display = if self.path_edit.text.is_empty() {
             self.cwd.clone().unwrap_or_else(|| "…".into())
         } else {
@@ -4906,7 +4991,7 @@ impl ContextPanel {
                         .child(self.nav_btn(
                             "ctx-upload",
                             "↑+",
-                            "Upload file…",
+                            "Upload files…",
                             true,
                             cx,
                             |this, _, cx| this.upload_file(cx),
@@ -5668,7 +5753,7 @@ impl ContextPanel {
     fn render_files_split(
         &self,
         entries: Vec<RemoteEntry>,
-        selected: Option<String>,
+        selected: HashSet<String>,
         search_query: &str,
         accept_drops: bool,
         cx: &mut Context<Self>,
@@ -5792,7 +5877,7 @@ impl ContextPanel {
                             })
                             .children(entries.into_iter().map(|entry| {
                                 let path = entry.path.clone();
-                                let is_sel = selected.as_deref() == Some(path.as_str());
+                                let is_sel = selected.contains(&path);
                                 let icon = file_icon::entry_icon(&entry.name, entry.is_dir);
                                 let size = if entry.is_dir {
                                     String::new()
@@ -5867,7 +5952,11 @@ impl ContextPanel {
                                     .on_mouse_down(
                                         MouseButton::Right,
                                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            this.selected = Some(path.clone());
+                                            if this.selected.contains(&path) {
+                                                this.selection_anchor = Some(path.clone());
+                                            } else {
+                                                this.select_only_file(path.clone());
+                                            }
                                             this.transfer_menu = None;
                                             this.entry_menu = Some(EntryMenu {
                                                 path: path.clone(),
@@ -5879,9 +5968,14 @@ impl ContextPanel {
                                     )
                                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                         this.entry_menu = None;
-                                        this.selected = Some(entry_click.path.clone());
                                         if event.click_count() >= 2 {
+                                            this.select_only_file(entry_click.path.clone());
                                             this.enter_or_download(entry_click.clone(), cx);
+                                        } else {
+                                            this.select_file_click(
+                                                entry_click.path.clone(),
+                                                event.modifiers(),
+                                            );
                                         }
                                         cx.notify();
                                     }))
