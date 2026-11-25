@@ -1,0 +1,27 @@
+---
+description: Windows 调外部进程（Explorer Reveal / ShellExecute / Command）必须核对真实命令行
+globs: src/platform/**/*.rs
+alwaysApply: false
+---
+
+# Windows external command lines (do not guess)
+
+When changing **Reveal**, `explorer`, `ShellExecute*`, or `std::process::Command` on Windows:
+
+## Mandatory before claiming fixed
+
+1. **Ground truth = final command line**, not the Rust `.arg` list you intended.
+2. Compare to a **manual** cmd/PowerShell line that succeeds on the same path.
+3. Retest at least:
+   - plain path (`C:\rock\…\file.ext`)
+   - path with spaces (`…\api (6).log`)
+   - post-`canonicalize` verbatim (`\\?\C:\…`) — must strip before Explorer
+4. If the user still reports wrong folder (Desktop / Documents / This PC), **assume another root cause** — do not stop at the first plausible fix.
+
+## Hard bans / required patterns
+
+- **Never** `Command::arg(format!("/select,\"{path}\""))` — Win32 quoting re-escapes and Explorer misparses → Desktop.
+- **Do** `Command::raw_arg(format!("/select,\"{}\"", path))` after stripping `\\?\` / `\\?\UNC\` (`path_for_explorer`).
+- Prefer documenting the lesson in `docs/HARD_PROBLEMS.md` when a new misparse class appears.
+
+See: `docs/HARD_PROBLEMS.md` (Transfers Reveal row), `src/platform/windows.rs`.

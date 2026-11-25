@@ -29,7 +29,7 @@ std::process::Command::new("wsl.exe").args(...).output()?;
 ## Exceptions (bare `Command` OK)
 
 - User shell inside the integrated terminal (`portable-pty` / ConPTY)
-- GUI apps such as `explorer` (no console)
+- GUI apps such as `explorer` (no console) — but `/select,"…"` must use **`raw_arg`**, not `.arg` (see `windows-external-cmdline.mdc`)
 
 ## PR / self-check
 

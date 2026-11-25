@@ -20,6 +20,7 @@ Before UI / terminal / session changes, skim:
 - Sync SSH / disk / `recv` / keyring / `ShellExecuteW` (URL Ctrl+click, Reveal) on the UI thread
 - Windows **background** helpers via bare `Command::new` / `std::process::Command::new` for console apps (`wsl.exe`, `powershell`, `cmd`, `nvidia-smi`, `where`, …) — use `crate::platform::new_command` instead (sets `CREATE_NO_WINDOW`). Double-click release must not pop visible terminals.
 - Reading `TerminalView::working_directory()` / pane `kind.cwd` as **ground truth for a user Save / Copy Path / Reveal** without `refresh_working_directory()` first (OSC/`cd` often never updates the cache)
+- Windows **`explorer /select`**: never `Command::arg("/select,\"…\"")` — use **`raw_arg`** + strip `\\?\` (`path_for_explorer`). Truth = final cmdline vs a manual Explorer line; retest plain / spaces / verbatim paths. See `windows-external-cmdline.mdc`.
 
 **Live cwd (two clocks):**
 | Need | Do |
