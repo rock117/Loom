@@ -57,7 +57,7 @@ GPUI runs layout → prepaint → paint and input dispatch on the **window / UI 
 | Per-chunk `cx.notify()` on PTY flood (`yes` / huge `cat`) | UI drown in updates; soft freeze | Drain pending chunks, one `process_bytes` + one notify — see [PTY_OUTPUT_COALESCE.md](./PTY_OUTPUT_COALESCE.md). **Never drop bytes** |
 | Lock order inversion (e.g. store lock then term lock vs reverse) | Cross-thread or same-thread deadlock | Document order: prefer **no nested locks**; if needed, fixed global order |
 | Ctrl+click URL / Reveal / Open via sync `ShellExecuteW` on UI thread | Cold browser, missing association, or shell dialog blocks the click path → frozen / “hung” window | [`platform::open_url_detached`](../src/platform.rs) / `open_path_detached` (same class as path open) |
-| Transfers **Reveal** opens wrong folder (Documents / This PC) | `canonicalize()` → `\\?\C:\…`; `explorer /select` ignores verbatim prefixes | Strip `\\?\` / `\\?\UNC\` before Explorer; quote `/select,"…"`. [`platform/windows.rs`](../src/platform/windows.rs) |
+| Transfers **Reveal** opens wrong folder (Desktop / Documents / This PC) | (1) `canonicalize()` → `\\?\C:\…` breaks Explorer. (2) `Command::arg("/select,\"…\"")` re-escapes quotes so Explorer misparses `/select` | Strip `\\?\` / `\\?\UNC\`; pass `/select,"…"` via **`raw_arg`** (not `.arg`). [`platform/windows.rs`](../src/platform/windows.rs) |
 
 **Loom rules of thumb:**
 

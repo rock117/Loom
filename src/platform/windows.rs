@@ -43,14 +43,18 @@ fn path_for_explorer(path: &std::path::Path) -> PathBuf {
 }
 
 pub fn native_reveal_in_file_manager(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let is_file = path.is_file();
     let path = path_for_explorer(&path);
     // Explorer is GUI — do not use CREATE_NO_WINDOW.
     if is_file {
-        // Quoted form so spaces survive: /select,"C:\folder\file name.txt"
+        // Command line must be literally: explorer.exe /select,"C:\folder\file.txt"
+        // Do NOT use `.arg(...)` — Windows Command re-quotes/escapes and Explorer then
+        // misparses `/select` and often opens Desktop / Documents instead.
         std::process::Command::new("explorer")
-            .arg(format!("/select,\"{}\"", path.display()))
+            .raw_arg(format!("/select,\"{}\"", path.display()))
             .spawn()?;
     } else {
         std::process::Command::new("explorer")
